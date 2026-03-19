@@ -65,7 +65,7 @@ class Hyperparameters:
     num_loop_iters = int(os.environ.get("NUM_LOOP_ITERS", 9))
     min_loop_iters = int(os.environ.get("MIN_LOOP_ITERS", 3))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 1024))
+    model_dim = int(os.environ.get("MODEL_DIM", 2048))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
