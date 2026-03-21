@@ -753,7 +753,7 @@ class GPT(nn.Module):
             bg = self.bigram_emb(bg_ids)
             if self.bigram_dim != x.size(-1):
                 bg = self.bigram_proj(bg.to(x.dtype))
-            x = x + bg.to(x.dtype)
+            x = x + 0.1 * bg.to(x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
