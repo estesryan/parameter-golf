@@ -93,6 +93,7 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -956,7 +957,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"weight_decay:{args.weight_decay} mlp_mult:{args.mlp_mult}")
+    log0(f"weight_decay:{args.weight_decay} mlp_mult:{args.mlp_mult} ema_decay:{args.ema_decay}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1010,6 +1011,12 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    # EMA of model weights — created after warmup so it starts from the true initial weights.
+    # Each entry mirrors the corresponding parameter's dtype and device.
+    ema_params: dict[str, torch.Tensor] | None = None
+    if args.ema_decay > 0.0:
+        ema_params = {name: p.detach().clone() for name, p in base_model.named_parameters()}
+
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
@@ -1027,6 +1034,12 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            if ema_params is not None:
+                # Swap live weights out, load EMA weights for evaluation.
+                live_params = {name: p.detach().clone() for name, p in base_model.named_parameters()}
+                with torch.no_grad():
+                    for name, p in base_model.named_parameters():
+                        p.copy_(ema_params[name])
             val_loss, val_bpb = eval_val(
                 args,
                 model,
@@ -1039,6 +1052,11 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            if ema_params is not None:
+                # Restore live weights so training continues from the correct state.
+                with torch.no_grad():
+                    for name, p in base_model.named_parameters():
+                        p.copy_(live_params[name])
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1082,6 +1100,12 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+
+        if ema_params is not None:
+            # Decoupled EMA update: ema = decay * ema + (1 - decay) * param
+            with torch.no_grad():
+                for name, p in base_model.named_parameters():
+                    ema_params[name].lerp_(p, 1.0 - args.ema_decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
