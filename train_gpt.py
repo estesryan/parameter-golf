@@ -92,6 +92,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -117,10 +118,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -142,6 +143,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            weight_decay = group.get("weight_decay", 0.0)
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -169,6 +171,8 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                if weight_decay > 0.0:
+                    p.mul_(1.0 - lr * weight_decay)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -916,6 +920,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -931,6 +936,7 @@ def main() -> None:
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.weight_decay,
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
@@ -950,6 +956,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"weight_decay:{args.weight_decay} mlp_mult:{args.mlp_mult}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
