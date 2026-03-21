@@ -77,6 +77,10 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # Bigram feature path (disabled when either is 0).
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 0))
+    bigram_hash_size = int(os.environ.get("BIGRAM_HASH_SIZE", 0))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -698,6 +702,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        bigram_dim: int = 0,
+        bigram_hash_size: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -708,6 +714,12 @@ class GPT(nn.Module):
         self.num_loop_iters = num_loop_iters
         self.min_loop_iters = min_loop_iters
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram_dim = bigram_dim
+        self.bigram_hash_size = bigram_hash_size
+        if bigram_dim > 0 and bigram_hash_size > 0:
+            self.bigram_emb = nn.Embedding(bigram_hash_size, bigram_dim)
+            if bigram_dim != model_dim:
+                self.bigram_proj = CastedLinear(bigram_dim, model_dim, bias=False)
         self.skip_weights = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
         self.shared_block = Block(
             model_dim,
@@ -733,6 +745,15 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, reduction: str = "mean") -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram_hash_size > 0 and self.bigram_dim > 0:
+            B = input_ids.shape[0]
+            # Hashed bigram IDs: position 0 uses bucket 0 (no prior token).
+            bg_ids = (input_ids[:, :-1] * 40507 + input_ids[:, 1:]) % self.bigram_hash_size
+            bg_ids = torch.cat([bg_ids.new_zeros(B, 1), bg_ids], dim=1)
+            bg = self.bigram_emb(bg_ids)
+            if self.bigram_dim != x.size(-1):
+                bg = self.bigram_proj(bg.to(x.dtype))
+            x = x + bg.to(x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
@@ -881,6 +902,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        bigram_dim=args.bigram_dim,
+        bigram_hash_size=args.bigram_hash_size,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -900,6 +923,9 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    # Bigram projection is a 2D non-control matrix: use Muon with weight decay.
+    if base_model.bigram_hash_size > 0 and base_model.bigram_dim > 0 and base_model.bigram_dim != args.model_dim:
+        matrix_params.append(base_model.bigram_proj.weight)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -909,8 +935,12 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.iter_scales)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    _tok_params = [base_model.tok_emb.weight]
+    # Bigram embedding is an embedding table: use Adam alongside tok_emb (no weight decay).
+    if base_model.bigram_hash_size > 0 and base_model.bigram_dim > 0:
+        _tok_params.append(base_model.bigram_emb.weight)
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": _tok_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
