@@ -98,6 +98,10 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.0))
 
+    # Stochastic Weight Averaging (disabled when SWA_START == 0).
+    swa_start = int(os.environ.get("SWA_START", 0))
+    swa_freq = int(os.environ.get("SWA_FREQ", 1))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -989,6 +993,13 @@ def main() -> None:
     log0(f"weight_decay:{args.weight_decay} mlp_mult:{args.mlp_mult}")
     log0(f"seed:{args.seed}")
 
+    # SWA state: swa_weights holds running-average params; swa_count tracks how many snapshots.
+    swa_active = args.swa_start > 0
+    swa_weights: dict[str, Tensor] | None = None
+    swa_count = 0
+    if swa_active:
+        log0(f"swa:enabled swa_start:{args.swa_start} swa_freq:{args.swa_freq}")
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1057,18 +1068,32 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
+            if swa_active and swa_weights is not None:
+                # Temporarily swap model weights to SWA average, eval, then restore.
+                live_weights = {n: p.data.clone() for n, p in base_model.named_parameters()}
+                with torch.no_grad():
+                    for n, p in base_model.named_parameters():
+                        p.data.copy_(swa_weights[n])
+                val_loss, val_bpb = eval_val(
+                    args, model, rank, world_size, device, grad_accum_steps,
+                    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                )
+                with torch.no_grad():
+                    for n, p in base_model.named_parameters():
+                        p.data.copy_(live_weights[n])
+            else:
+                val_loss, val_bpb = eval_val(
+                    args,
+                    model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1114,6 +1139,17 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+
+        if swa_active and step >= args.swa_start and (step - args.swa_start) % args.swa_freq == 0:
+            with torch.no_grad():
+                if swa_weights is None:
+                    swa_weights = {n: p.data.clone() for n, p in base_model.named_parameters()}
+                    swa_count = 1
+                else:
+                    swa_count += 1
+                    for n, p in base_model.named_parameters():
+                        swa_weights[n].add_(p.data - swa_weights[n], alpha=1.0 / swa_count)
+
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1145,6 +1181,12 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8 artifact (zstd if available, else zlib) and validate the round-tripped weights.
     _compress_label = "zstd(level=22)" if USE_ZSTD else "zlib(level=9)"
+
+    if swa_active and swa_weights is not None:
+        log0(f"swa:applying swa_count:{swa_count} snapshots to final export")
+        with torch.no_grad():
+            for n, p in base_model.named_parameters():
+                p.data.copy_(swa_weights[n])
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
