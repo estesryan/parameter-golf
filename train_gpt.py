@@ -1064,14 +1064,12 @@ def evaluate_ttt(
 ) -> tuple[float, float]:
     """Sliding-window TTT evaluation with persistent state. Returns (val_loss, val_bpb)."""
     window = 512
-    stride = 64
+    stride = 256
 
-    # Unwrap DDP and torch.compile wrappers to get raw RecurrentLM
+    # Unwrap DDP wrapper only; keep torch.compile active for eval
     raw = model
     while hasattr(raw, "module"):
         raw = raw.module
-    if hasattr(raw, "_orig_mod"):
-        raw = raw._orig_mod
 
     raw.eval()
     # state=None on first call; model initialises zeros(B, dim, dtype=x.dtype, device=x.device)
