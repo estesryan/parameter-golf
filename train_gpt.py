@@ -66,9 +66,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_loop_iters = int(os.environ.get("NUM_LOOP_ITERS", 3))
-    min_loop_iters = int(os.environ.get("MIN_LOOP_ITERS", 1))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -344,6 +342,10 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_MAX_VAL = 127
+INT6_MAX_VAL = 63
+# MLP and attention weight matrices get int6; everything else stays int8.
+INT6_NAME_PATTERNS = ("attn.c_q", "attn.c_k", "attn.c_v", "attn.proj", "mlp.fc", "mlp.proj")
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -356,7 +358,7 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor(t: Tensor, max_val: int = INT8_MAX_VAL) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
@@ -367,14 +369,14 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / max_val).clamp_min(1.0 / max_val)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -max_val, max_val).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / max_val if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
@@ -422,7 +424,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
+        mv = INT6_MAX_VAL if any(pat in name for pat in INT6_NAME_PATTERNS) else INT8_MAX_VAL
+        q, s = quantize_float_tensor(t, max_val=mv)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -431,7 +434,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "int6_mlp_attn_int8_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -695,8 +698,6 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
-        num_loop_iters: int,
-        min_loop_iters: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -715,8 +716,6 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.num_loop_iters = num_loop_iters
-        self.min_loop_iters = min_loop_iters
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_dim = bigram_dim
         self.bigram_hash_size = bigram_hash_size
@@ -724,16 +723,10 @@ class GPT(nn.Module):
             self.bigram_emb = nn.Embedding(bigram_hash_size, bigram_dim)
             if bigram_dim != model_dim:
                 self.bigram_proj = CastedLinear(bigram_dim, model_dim, bias=False)
-        self.skip_weights = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
-        self.shared_block = Block(
-            model_dim,
-            num_heads,
-            num_kv_heads,
-            mlp_mult,
-            rope_base,
-            qk_gain_init,
-        )
-        self.iter_scales = nn.Parameter(torch.ones(num_loop_iters, model_dim, dtype=torch.float32))
+        self.blocks = nn.ModuleList([
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            for _ in range(num_layers)
+        ])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -761,25 +754,8 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        if self.training:
-            depth = torch.randint(self.min_loop_iters, self.num_loop_iters + 1, (), device=x.device)
-            active = torch.arange(self.num_loop_iters, device=x.device) < depth
-        else:
-            active = x.new_ones(self.num_loop_iters, dtype=torch.bool)
-
-        # U-Net skip reinterpreted across loop iterations:
-        # store at the midpoint iteration, reinject in the second half.
-        mid = self.num_loop_iters // 2
-        skip = x  # initialised to a valid tensor; overwritten at i == mid
-        for i in range(self.num_loop_iters):
-            x_in = x  # full-iteration checkpoint: inactive iterations are true no-ops
-            x = x * self.iter_scales[i].to(dtype=x.dtype)[None, None, :]
-            if i > mid:
-                x = x + self.skip_weights.to(dtype=x.dtype)[None, None, :] * skip
-            x_new = self.shared_block(x, x0)
-            x = torch.where(active[i].view(1, 1, 1), x_new, x_in)
-            if i == mid:
-                skip = x
+        for block in self.blocks:
+            x = block(x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -895,8 +871,6 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
-        num_loop_iters=args.num_loop_iters,
-        min_loop_iters=args.min_loop_iters,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -921,7 +895,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.shared_block.named_parameters())
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -935,9 +909,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
-    scalar_params.append(base_model.iter_scales)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     _tok_params = [base_model.tok_emb.weight]
     # Bigram embedding is an embedding table: use Adam alongside tok_emb (no weight decay).
