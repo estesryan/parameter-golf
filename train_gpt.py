@@ -90,6 +90,8 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    ortho_init = bool(int(os.environ.get("ORTHO_INIT", "0")))
+    smear_gate = bool(int(os.environ.get("SMEARGATE", "0")))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -325,7 +327,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear_gate",
     ).split(",")
     if pattern
 )
@@ -674,6 +676,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        smear_gate: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -683,13 +686,23 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # SmearGate: per-channel sigmoid gate on residual updates. Init to 5.0 → sigmoid ≈ 0.993 (near identity).
+        if smear_gate:
+            self.smear_gate = nn.Parameter(torch.full((dim,), 5.0, dtype=torch.float32))
+        else:
+            self.smear_gate = None
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if self.smear_gate is not None:
+            gate = torch.sigmoid(self.smear_gate).to(dtype=x.dtype)[None, None, :]
+            x = x + gate * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + gate * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        else:
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -709,6 +722,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_dim: int = 0,
         bigram_hash_size: int = 0,
+        ortho_init: bool = False,
+        smear_gate: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -716,6 +731,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.ortho_init = ortho_init
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_dim = bigram_dim
         self.bigram_hash_size = bigram_hash_size
@@ -724,7 +740,7 @@ class GPT(nn.Module):
             if bigram_dim != model_dim:
                 self.bigram_proj = CastedLinear(bigram_dim, model_dim, bias=False)
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, smear_gate=smear_gate)
             for _ in range(num_layers)
         ])
         self.final_norm = RMSNorm()
@@ -739,6 +755,11 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        # OrthoInit: apply orthogonal init to projection/linear weights, skipping zero-init outputs.
+        if self.ortho_init:
+            for module in self.modules():
+                if isinstance(module, nn.Linear) and not getattr(module, "_zero_init", False):
+                    nn.init.orthogonal_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, reduction: str = "mean") -> Tensor:
         x = self.tok_emb(input_ids)
@@ -882,6 +903,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_dim=args.bigram_dim,
         bigram_hash_size=args.bigram_hash_size,
+        ortho_init=args.ortho_init,
+        smear_gate=args.smear_gate,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -963,6 +986,14 @@ def main() -> None:
     )
     log0(f"weight_decay:{args.weight_decay} mlp_mult:{args.mlp_mult}")
     log0(f"seed:{args.seed}")
+    log0(
+        f"muon_momentum:{args.muon_momentum} warmup_start:{args.muon_momentum_warmup_start} "
+        f"warmup_steps:{args.muon_momentum_warmup_steps}"
+    )
+    if args.ortho_init:
+        log0("ortho_init:enabled")
+    if args.smear_gate:
+        log0("smear_gate:enabled")
 
     # SWA state: swa_weights holds running-average params; swa_count tracks how many snapshots.
     swa_active = args.swa_start > 0
@@ -1129,6 +1160,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"muon_mom:{muon_momentum:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
