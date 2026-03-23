@@ -86,6 +86,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Recurrent TTT hyperparameters.
+    num_loop_iters = int(os.environ.get("NUM_LOOP_ITERS", 4))
+    eval_loop_mult = int(os.environ.get("EVAL_LOOP_MULT", 2))
+
     # Test-time training (LoRA) hyperparameters.
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.01))
@@ -744,6 +748,98 @@ class GPT(nn.Module):
 
 
 # -----------------------------
+# RECURRENT ARCHITECTURE WITH TTT
+# -----------------------------
+
+class RecurrentBlock(nn.Module):
+    """Single shared transformer block iterated N times with GRU-style hidden state."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, 3)  # 3x MLP width as specified
+        self.gate_linear = CastedLinear(2 * dim, dim, bias=False)
+        self.candidate_linear = CastedLinear(2 * dim, dim, bias=False)
+        self.scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x: Tensor, state: Tensor, n_iters: int) -> tuple[Tensor, Tensor]:
+        state = state.to(dtype=x.dtype, device=x.device)
+        for _ in range(n_iters):
+            # State injection
+            x = x + self.scale.to(dtype=x.dtype) * state.unsqueeze(1)
+            # Attention sub-layer
+            x = x + self.attn(self.attn_norm(x))
+            # MLP sub-layer
+            x = x + self.mlp(self.mlp_norm(x))
+            # GRU-style state update
+            seq_summary = x.mean(dim=1)
+            gate_input = torch.cat([state, seq_summary], dim=-1)
+            gate = torch.sigmoid(self.gate_linear(gate_input))
+            candidate = torch.tanh(self.candidate_linear(gate_input))
+            state = gate * state + (1 - gate) * candidate
+        return x, state
+
+
+class RecurrentLM(nn.Module):
+    """Language model built on a single shared RecurrentBlock iterated N times."""
+    def __init__(
+        self,
+        vocab_size: int,
+        model_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        tie_embeddings: bool,
+        tied_embed_init_std: float,
+        logit_softcap: float,
+        rope_base: float,
+        qk_gain_init: float,
+        train_iters: int,
+        eval_iters: int,
+    ):
+        super().__init__()
+        if logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.tie_embeddings = tie_embeddings
+        self.tied_embed_init_std = tied_embed_init_std
+        self.logit_softcap = logit_softcap
+        self.model_dim = model_dim
+        self.train_iters = train_iters
+        self.eval_iters = eval_iters
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.block = RecurrentBlock(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.final_norm = RMSNorm()
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        if self.lm_head is not None:
+            self.lm_head._zero_init = True
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        if self.tie_embeddings:
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.weight)
+
+    def forward(self, tokens: Tensor, target_ids: Tensor | None = None, state: Tensor | None = None, train: bool = True) -> Tensor | tuple[Tensor, Tensor]:
+        x = self.tok_emb(tokens)
+        x = F.rms_norm(x, (x.size(-1),))
+        if state is None:
+            state = torch.zeros(tokens.shape[0], self.model_dim, device=x.device, dtype=x.dtype)
+        n_iters = self.train_iters if train else self.eval_iters
+        x, state = self.block(x, state, n_iters)
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits = F.linear(x, self.tok_emb.weight)
+        else:
+            logits = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        if target_ids is not None:
+            return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), target_ids.reshape(-1), reduction="mean")
+        return logits, state
+
+
+# -----------------------------
 # TEST-TIME TRAINING (LoRA)
 # -----------------------------
 #
@@ -954,6 +1050,76 @@ def eval_val_ttt_lora(
     val_bpb = float((loss_sum.item() / math.log(2.0)) / byte_sum.item())
     return val_loss, val_bpb
 
+def evaluate_ttt(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Sliding-window TTT evaluation with persistent state. Returns (val_loss, val_bpb)."""
+    window = 512
+    stride = 64
+
+    # Unwrap DDP and torch.compile wrappers to get raw RecurrentLM
+    raw = model
+    while hasattr(raw, "module"):
+        raw = raw.module
+    if hasattr(raw, "_orig_mod"):
+        raw = raw._orig_mod
+
+    raw.eval()
+    # state=None on first call; model initialises zeros(B, dim, dtype=x.dtype, device=x.device)
+    state: Tensor | None = None
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    tokens_dev = val_tokens.to(device=device, dtype=torch.int64)
+    n = tokens_dev.numel()
+
+    with torch.inference_mode():
+        pos = 0
+        while pos + window + 1 <= n:
+            chunk = tokens_dev[pos : pos + window].unsqueeze(0)       # (1, window)
+            tgts = tokens_dev[pos + 1 : pos + window + 1].unsqueeze(0)  # (1, window)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits, state = raw(chunk, state=state, train=False)
+            assert logits.shape == (1, window, args.vocab_size), f"logits shape {logits.shape}"
+            assert state.shape == (1, args.model_dim), f"state shape {state.shape}"
+            assert state.device == chunk.device, f"state device {state.device} != {chunk.device}"
+            state = state.detach()
+            sl = min(stride, window)
+            scored_logits = logits[:, -sl:].float()   # (1, sl, vocab)
+            scored_tgt = tgts[:, -sl:]                # (1, sl)
+            loss = F.cross_entropy(
+                scored_logits.reshape(-1, scored_logits.size(-1)),
+                scored_tgt.reshape(-1),
+                reduction="sum",
+            )
+            loss_sum += loss.to(torch.float64)
+            token_count += sl
+            prev_ids = chunk[0, -sl:]
+            tgt_ids = scored_tgt[0]
+            tok_bytes = base_bytes_lut[tgt_ids].to(torch.float64)
+            tok_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
+            byte_count += tok_bytes.sum()
+            pos += stride
+
+    # All ranks compute identical results (same val_tokens, same sliding window).
+    # No all_reduce needed; return direct result.
+    val_loss = float(loss_sum.item() / token_count.item())
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = float(token_count.item() / byte_count.item())
+    raw.train()
+    return val_loss, float(bits_per_token * tokens_per_byte)
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -1053,18 +1219,18 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
+    base_model = RecurrentLM(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        train_iters=args.num_loop_iters,
+        eval_iters=args.num_loop_iters * args.eval_loop_mult,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1080,7 +1246,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.block.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1091,8 +1257,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1209,7 +1373,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
+            val_loss, val_bpb = evaluate_ttt(
                 args,
                 model,
                 rank,
@@ -1331,9 +1495,9 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
+    q_val_loss, q_val_bpb = evaluate_ttt(
         args,
-        model,
+        base_model,
         rank,
         world_size,
         device,
@@ -1350,17 +1514,17 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
-    # LoRA test-time training evaluation (the competition score)
+    # Recurrent TTT evaluation (the competition score)
     torch._dynamo.reset()
     torch.cuda.synchronize()
     t_ttt = time.perf_counter()
-    ttt_val_loss, ttt_val_bpb = eval_val_ttt_lora(
-        args, base_model, rank, world_size, device,
+    ttt_val_loss, ttt_val_bpb = evaluate_ttt(
+        args, base_model, rank, world_size, device, grad_accum_steps, val_tokens,
         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_ttt_lora val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
+        f"final_int8_ttt_recurrent val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
     )
 
