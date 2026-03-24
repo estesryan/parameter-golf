@@ -766,18 +766,24 @@ class RecurrentBlock(nn.Module):
     def forward(self, x: Tensor, state: Tensor, n_iters: int) -> tuple[Tensor, Tensor]:
         state = state.to(dtype=x.dtype, device=x.device)
         for _ in range(n_iters):
-            # State injection
-            x = x + self.scale.to(dtype=x.dtype) * state.unsqueeze(1)
             # Attention sub-layer
             x = x + self.attn(self.attn_norm(x))
             # MLP sub-layer
             x = x + self.mlp(self.mlp_norm(x))
-            # GRU-style state update
-            seq_summary = x.mean(dim=1)
+            # GRU-style state update.
+            # Normalise seq_summary before the gate: the residual stream x can grow large
+            # as attn_scale/mlp_scale evolve, which would saturate sigmoid/tanh and kill
+            # gradients through the GRU update. F.rms_norm has no learnable parameters here.
+            seq_summary = F.rms_norm(x.mean(dim=1), (x.size(-1),))
             gate_input = torch.cat([state, seq_summary], dim=-1)
             gate = torch.sigmoid(self.gate_linear(gate_input))
             candidate = torch.tanh(self.candidate_linear(gate_input))
             state = gate * state + (1 - gate) * candidate
+            # Inject state AFTER attention, MLP, and state update so that the block forms
+            # clean token representations first, then the updated state modulates them.
+            # Injecting before (the previous order) corrupted x with stale/zero state before
+            # attention could run, preventing meaningful feature formation on the first pass.
+            x = x + self.scale.to(dtype=x.dtype) * state.unsqueeze(1)
         return x, state
 
 
