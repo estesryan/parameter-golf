@@ -535,9 +535,17 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # _bank_param / _bank_idx: set by GPT parameter banking to index a 3D bank live in forward,
+    # ensuring the bank nn.Parameter participates in the autograd graph every step (DDP compat).
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__(in_features, out_features, bias=bias)
+        self._bank_param: nn.Parameter | None = None
+        self._bank_idx: int = 0
+
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        w = self._bank_param[self._bank_idx] if self._bank_param is not None else self.weight
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -743,7 +751,8 @@ class GPT(nn.Module):
                 (block.mlp.proj,   self.bank_mlp_dn,  i),
             ):
                 del lin._parameters['weight']
-                lin.register_buffer('weight', bank[idx], persistent=False)
+                lin._bank_param = bank
+                lin._bank_idx = idx
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -751,7 +760,10 @@ class GPT(nn.Module):
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+                if getattr(module, '_bank_param', None) is not None:
+                    module._bank_param[module._bank_idx].zero_()
+                else:
+                    nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
