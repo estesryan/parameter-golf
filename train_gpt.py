@@ -85,6 +85,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    use_wallclock_warmdown = "ITERATIONS" not in os.environ and "WARMDOWN_ITERS" not in os.environ
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -924,6 +925,12 @@ def main() -> None:
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
+        if args.use_wallclock_warmdown and max_wallclock_ms is not None:
+            warmdown_start_ms = 0.8 * max_wallclock_ms
+            if elapsed_ms < warmdown_start_ms:
+                return 1.0
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            return remaining_ms / max(0.2 * max_wallclock_ms, 1e-9)
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
