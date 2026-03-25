@@ -153,21 +153,44 @@ class Muon(torch.optim.Optimizer):
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
             curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    # Use size(-2)/size(-1) to work for both 2D and 3D (banked) params.
-                    g *= max(1, g.size(-2) / g.size(-1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+            k = 0  # work-item counter: 2D param = 1 item, 3D param = N items (leading dim)
+            for p in params:
+                n_items = p.shape[0] if p.ndim == 3 else 1
+                if p.grad is not None:
+                    if p.ndim == 3:
+                        N, rows, cols = p.shape
+                        slice_numel = rows * cols
+                        state = self.state[p]
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(p.grad)
+                        buf = state["momentum_buffer"]
+                        # All ranks update buf so momentum state stays in sync across ranks.
+                        buf.mul_(momentum).add_(p.grad)
+                        my_slices = [b for b in range(N) if (k + b) % world_size == rank]
+                        if my_slices:
+                            g = p.grad[my_slices]
+                            if nesterov:
+                                g = g.add(buf[my_slices], alpha=momentum)
+                            # Still uses the batched 3D Newton-Schulz path when len(my_slices) > 1.
+                            g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                            g *= max(1, rows / cols) ** 0.5
+                            for j, b in enumerate(my_slices):
+                                updates_flat[curr + b * slice_numel : curr + (b + 1) * slice_numel] = g[j].reshape(-1)
+                    else:
+                        if k % world_size == rank:
+                            g = p.grad
+                            state = self.state[p]
+                            if "momentum_buffer" not in state:
+                                state["momentum_buffer"] = torch.zeros_like(g)
+                            buf = state["momentum_buffer"]
+                            buf.mul_(momentum).add_(g)
+                            if nesterov:
+                                g = g.add(buf, alpha=momentum)
+                            g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                            # Scale correction from Muon reference implementations.
+                            g *= max(1, g.size(-2) / g.size(-1)) ** 0.5
+                            updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                k += n_items
                 curr += p.numel()
 
             if distributed:
