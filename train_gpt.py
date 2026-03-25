@@ -761,7 +761,8 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 if getattr(module, '_bank_param', None) is not None:
-                    module._bank_param[module._bank_idx].zero_()
+                    with torch.no_grad():
+                        module._bank_param[module._bank_idx].zero_()
                 else:
                     nn.init.zeros_(module.weight)
 
