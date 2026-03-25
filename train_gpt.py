@@ -774,7 +774,7 @@ class GPT(nn.Module):
                 (block.mlp.proj,   self.bank_mlp_dn,  i),
             ):
                 del lin._parameters['weight']
-                lin._bank_param = bank
+                object.__setattr__(lin, '_bank_param', bank)
                 lin._bank_idx = idx
         self._init_weights()
 
