@@ -97,8 +97,20 @@ class Hyperparameters:
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
+    # Also handles 3D (N, rows, cols) parameter banks via a batched path.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
+    if X.ndim == 3:
+        # Batched path for parameter banks: normalize each matrix independently.
+        X /= X.norm(dim=(-2, -1), keepdim=True) + eps
+        transposed = G.size(-2) > G.size(-1)
+        if transposed:
+            X = X.transpose(-2, -1)
+        for _ in range(steps):
+            A = X @ X.transpose(-2, -1)
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        return X.transpose(-2, -1) if transposed else X
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -153,7 +165,8 @@ class Muon(torch.optim.Optimizer):
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    # Use size(-2)/size(-1) to work for both 2D and 3D (banked) params.
+                    g *= max(1, g.size(-2) / g.size(-1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -346,12 +359,15 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # - per-tensor int8 for other float tensors
     # - exact passthrough for non-floats
     # - passthrough for small float tensors, stored as fp16 to save bytes
+    # 3D parameter banks (shape N×rows×cols) are reshaped to (N*rows, cols)
+    # before quantization; orig_shapes records how to restore them.
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
+    orig_shapes: dict[str, list] = {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
         0,
@@ -378,6 +394,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
+        # 3D banks: reshape to 2D for per-row quantization, record original shape.
+        if t.ndim > 2:
+            orig_shapes[name] = list(t.shape)
+            t = t.reshape(-1, t.shape[-1])
         q, s = quantize_float_tensor(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
@@ -397,6 +417,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         obj["qmeta"] = qmeta
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    if orig_shapes:
+        obj["orig_shapes"] = orig_shapes
     return obj, stats
 
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
@@ -420,6 +442,10 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         if isinstance(orig_dtype, str):
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
+    # Restore 3D shapes for parameter banks that were flattened for quantization.
+    for name, shape in obj.get("orig_shapes", {}).items():
+        if name in out:
+            out[name] = out[name].reshape(shape)
     return out
 
 
@@ -689,6 +715,35 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        # --- Parameter Banking ---
+        # Group same-shape weight matrices into contiguous 3D banks so Muon
+        # can orthogonalize them in a single batched Newton-Schulz pass.
+        kv_dim = num_kv_heads * (model_dim // num_heads)
+        mlp_hidden = mlp_mult * model_dim
+        self.bank_attn_sq = nn.Parameter(torch.empty(num_layers * 2, model_dim, model_dim))
+        self.bank_attn_kv = nn.Parameter(torch.empty(num_layers * 2, kv_dim, model_dim))
+        self.bank_mlp_up  = nn.Parameter(torch.empty(num_layers * 2, mlp_hidden, model_dim))
+        self.bank_mlp_dn  = nn.Parameter(torch.empty(num_layers, model_dim, mlp_hidden))
+        nn.init.normal_(self.bank_attn_sq, std=0.02)
+        nn.init.normal_(self.bank_attn_kv, std=0.02)
+        nn.init.normal_(self.bank_mlp_up,  std=0.02)
+        nn.init.zeros_(self.bank_mlp_dn)
+        # Replace each block's individual weight nn.Parameters with views into
+        # the bank, registered as non-persistent buffers so torch.compile sees
+        # them as live state (not compile-time constants) while the bank
+        # parameter on GPT remains the single source of truth for state_dict.
+        for i, block in enumerate(self.blocks):
+            for lin, bank, idx in (
+                (block.attn.c_q,   self.bank_attn_sq, i * 2),
+                (block.attn.proj,  self.bank_attn_sq, i * 2 + 1),
+                (block.attn.c_k,   self.bank_attn_kv, i * 2),
+                (block.attn.c_v,   self.bank_attn_kv, i * 2 + 1),
+                (block.mlp.fc,     self.bank_mlp_up,  i * 2),
+                (block.mlp.fc_gate,self.bank_mlp_up,  i * 2 + 1),
+                (block.mlp.proj,   self.bank_mlp_dn,  i),
+            ):
+                del lin._parameters['weight']
+                lin.register_buffer('weight', bank[idx], persistent=False)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -850,9 +905,14 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    # 3D parameter banks live directly on base_model; include them for Muon.
+    # Any residual 2D block weights (none expected after banking) fall through
+    # to the existing serial Newton-Schulz path unchanged.
     matrix_params = [
-        p
-        for name, p in block_named_params
+        p for name, p in base_model.named_parameters(recurse=False)
+        if name.startswith("bank_")
+    ] + [
+        p for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
