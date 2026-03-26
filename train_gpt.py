@@ -57,6 +57,10 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    progressive_seq_len = bool(int(os.environ.get("PROGRESSIVE_SEQ_LEN", "0")))
+    progressive_seq_start = int(os.environ.get("PROGRESSIVE_SEQ_START", 1024))
+    progressive_seq_end = int(os.environ.get("PROGRESSIVE_SEQ_END", 2048))
+    progressive_seq_switch_frac = float(os.environ.get("PROGRESSIVE_SEQ_SWITCH_FRAC", "0.60"))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
@@ -1013,6 +1017,8 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    active_seq_len = args.progressive_seq_start if args.progressive_seq_len else args.train_seq_len
+    seq_switched = False
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1048,13 +1054,17 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if args.progressive_seq_len and not seq_switched and elapsed_ms / (args.max_wallclock_seconds * 1000.0) >= args.progressive_seq_switch_frac:
+            active_seq_len = args.progressive_seq_end
+            seq_switched = True
+            log0(f"progressive_seq_switch: {args.progressive_seq_start} -> {args.progressive_seq_end} at train_time:{elapsed_ms:.0f}ms")
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, active_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
