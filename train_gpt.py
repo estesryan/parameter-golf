@@ -65,7 +65,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -610,9 +610,9 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = int(round(mlp_mult * dim))
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -628,7 +628,7 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         rope_base: float,
         qk_gain_init: float,
         scalar_control: bool = False,
@@ -671,7 +671,7 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
