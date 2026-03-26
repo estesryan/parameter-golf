@@ -247,7 +247,7 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
