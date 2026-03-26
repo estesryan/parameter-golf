@@ -77,6 +77,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    use_muon = bool(int(os.environ.get("USE_MUON", "1")))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -85,6 +86,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    lr_warmup_frac = float(os.environ.get("LR_WARMUP_FRAC", "0.02"))
+    lr_cooldown_start_frac = float(os.environ.get("LR_COOLDOWN_START_FRAC", "0.8"))
+    lr_cooldown_floor = float(os.environ.get("LR_COOLDOWN_FLOOR", "0.1"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -868,21 +872,34 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if args.use_muon:
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizer_scalar = torch.optim.Adam(
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    else:
+        optimizer_muon = None
+        optimizer_scalar = torch.optim.Adam(
+            [
+                {"params": matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr},
+                {"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr},
+            ],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -922,15 +939,17 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
+        elapsed = elapsed_ms / (args.max_wallclock_seconds * 1000.0)
+        t = min(elapsed, 1.0)
+
+        if t < args.lr_warmup_frac:
+            return t / args.lr_warmup_frac
+
+        if t < args.lr_cooldown_start_frac:
             return 1.0
-        if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+        cooldown_progress = (t - args.lr_cooldown_start_frac) / (1.0 - args.lr_cooldown_start_frac)
+        return 1.0 - (1.0 - args.lr_cooldown_floor) * cooldown_progress
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1018,10 +1037,11 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        if optimizer_muon is not None:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
