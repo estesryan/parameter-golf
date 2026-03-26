@@ -89,6 +89,7 @@ class Hyperparameters:
     lr_warmup_frac = float(os.environ.get("LR_WARMUP_FRAC", "0.02"))
     lr_cooldown_start_frac = float(os.environ.get("LR_COOLDOWN_START_FRAC", "0.8"))
     lr_cooldown_floor = float(os.environ.get("LR_COOLDOWN_FLOOR", "0.1"))
+    scalar_control = bool(int(os.environ.get("SCALAR_CONTROL", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -630,22 +631,35 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        scalar_control: bool = False,
     ):
         super().__init__()
+        self.scalar_control = scalar_control
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        if scalar_control:
+            self.attn_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+            self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+        else:
+            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if self.scalar_control:
+            x = mix[0] * x + mix[1] * x0
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
+        else:
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -663,6 +677,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        scalar_control: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -674,7 +689,11 @@ class GPT(nn.Module):
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        if scalar_control:
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, dtype=torch.float32))
+        else:
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.scalar_control = scalar_control
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -684,6 +703,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    scalar_control=scalar_control,
                 )
                 for i in range(num_layers)
             ]
@@ -713,7 +733,10 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                if self.scalar_control:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype) * skips.pop()
+                else:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -839,6 +862,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        scalar_control=args.scalar_control,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
