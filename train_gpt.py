@@ -794,8 +794,9 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
+    use_cudnn_sdp = bool(int(os.environ.get("USE_CUDNN_SDP", "0")))
+    enable_cudnn_sdp(use_cudnn_sdp)
+    enable_flash_sdp(not use_cudnn_sdp)
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
 
