@@ -730,16 +730,28 @@ class Block(nn.Module):
         return x
 
 
-def get_mlp_mult(i: int, _n: int, base: int) -> int:
-    # stronger late-heavy asymmetry for 9 layers
-    if i < 2:
-        return max(1, base - 1)   # layers 0-1
-    elif i < 6:
-        return base               # layers 2-5
-    elif i < 8:
-        return base + 1           # layers 6-7
-    else:
-        return base + 2           # layer 8
+def get_mlp_mult(i: int, n: int, base: int) -> int:
+    # Smooth asymmetric MLP schedule based on layer depth.
+    #
+    # low: early-layer multiplier (reduced capacity)
+    # high: late-layer multiplier (increased capacity)
+    low = max(1, base - 1)
+    high = base + 2
+
+    # p controls how aggressively capacity is shifted to later layers:
+    # p = 0 → uniform max capacity everywhere (equivalent to MLP_MULT = high)
+    # p = 1 → linear ramp from low → high
+    # p = 2 → late-heavy allocation (more capacity concentrated at top layers)
+    p = 2.0
+
+    # normalized layer position in [0, 1]
+    t = i / max(n - 1, 1)
+
+    # compute interpolated multiplier
+    mult = low + (high - low) * (t ** p)
+
+    # return integer multiplier (keep behavior consistent with existing code)
+    return int(round(mult))
 
 
 class GPT(nn.Module):
