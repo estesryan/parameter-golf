@@ -1088,7 +1088,7 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
+    enable_flash_sdp(False)
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
 
