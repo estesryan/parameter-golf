@@ -730,6 +730,16 @@ class Block(nn.Module):
         return x
 
 
+def get_mlp_mult(i: int, _n: int, base: int) -> int:
+    # Asymmetric schedule: early < mid < late
+    if i < 4:
+        return max(1, base - 1)
+    elif i < 8:
+        return base
+    else:
+        return base + 1
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -762,7 +772,7 @@ class GPT(nn.Module):
                     model_dim,
                     num_heads,
                     num_kv_heads,
-                    mlp_mult,
+                    get_mlp_mult(i, num_layers, mlp_mult),
                     rope_base,
                     qk_gain_init,
                 )
