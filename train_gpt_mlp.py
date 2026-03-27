@@ -70,6 +70,9 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_low = float(os.environ.get("MLP_LOW", "0"))
+    mlp_high = float(os.environ.get("MLP_HIGH", "0"))
+    mlp_p = float(os.environ.get("MLP_P", "2.0"))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     fp16_embed_export = bool(int(os.environ.get("FP16_EMBED_EXPORT", "0")))
@@ -730,27 +733,22 @@ class Block(nn.Module):
         return x
 
 
-def get_mlp_mult(i: int, n: int, base: int) -> int:
+def get_mlp_mult(i: int, n: int, base: int, mlp_low: float, mlp_high: float, mlp_p: float) -> int:
     # Smooth asymmetric MLP schedule based on layer depth.
     #
-    # low: early-layer multiplier (reduced capacity)
-    # high: late-layer multiplier (increased capacity)
-    low = max(1, base - 1)
-    high = base + 1
+    # p controls shape:
+    # p = 0 → uniform max capacity
+    # p = 1 → linear ramp
+    # p = 2 → late-heavy allocation
 
-    # p controls how aggressively capacity is shifted to later layers:
-    # p = 0 → uniform max capacity everywhere (equivalent to MLP_MULT = high)
-    # p = 1 → linear ramp from low → high
-    # p = 2 → late-heavy allocation (more capacity concentrated at top layers)
-    p = 2.0
+    # 0 → auto-derive from base
+    low = mlp_low if mlp_low > 0 else max(1, base - 1)
+    high = mlp_high if mlp_high > 0 else base + 1
+    p = mlp_p
 
-    # normalized layer position in [0, 1]
     t = i / max(n - 1, 1)
-
-    # compute interpolated multiplier
     mult = low + (high - low) * (t ** p)
 
-    # return integer multiplier (keep behavior consistent with existing code)
     return int(round(mult))
 
 
@@ -763,6 +761,9 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_low: float,
+        mlp_high: float,
+        mlp_p: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -786,7 +787,7 @@ class GPT(nn.Module):
                     model_dim,
                     num_heads,
                     num_kv_heads,
-                    get_mlp_mult(i, num_layers, mlp_mult),
+                    get_mlp_mult(i, num_layers, mlp_mult, mlp_low, mlp_high, mlp_p),
                     rope_base,
                     qk_gain_init,
                 )
@@ -1075,6 +1076,9 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_low=args.mlp_low,
+        mlp_high=args.mlp_high,
+        mlp_p=args.mlp_p,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
