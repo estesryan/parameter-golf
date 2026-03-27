@@ -731,13 +731,13 @@ class Block(nn.Module):
 
 
 def get_mlp_mult(i: int, _n: int, base: int) -> int:
-    # Asymmetric schedule: early < mid < late
-    if i < 4:
-        return max(1, base - 1)
+    # milder asymmetry for 9 layers
+    if i < 2:
+        return max(1, base - 1)   # layers 0–1
     elif i < 8:
-        return base
+        return base               # layers 2–7
     else:
-        return base + 1
+        return base + 1           # layer 8
 
 
 class GPT(nn.Module):
