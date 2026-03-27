@@ -736,7 +736,7 @@ def get_mlp_mult(i: int, n: int, base: int) -> int:
     # low: early-layer multiplier (reduced capacity)
     # high: late-layer multiplier (increased capacity)
     low = max(1, base - 1)
-    high = base + 2
+    high = base + 1
 
     # p controls how aggressively capacity is shifted to later layers:
     # p = 0 → uniform max capacity everywhere (equivalent to MLP_MULT = high)
