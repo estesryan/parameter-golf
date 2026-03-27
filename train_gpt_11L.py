@@ -32,7 +32,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    _flash_attn_available = True
+except Exception:
+    flash_attn_3_func = None
+    _flash_attn_available = False
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -646,7 +651,18 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        if _flash_attn_available:
+            try:
+                y = flash_attn_3_func(q, k, v, causal=True)
+            except Exception:
+                # Fall back to PyTorch SDPA (e.g. unsupported GPU arch like sm_120)
+                y = F.scaled_dot_product_attention(
+                    q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
+                ).transpose(1, 2)
+        else:
+            y = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
+            ).transpose(1, 2)
         # XSA: subtract self-value projection (deep layers only)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
