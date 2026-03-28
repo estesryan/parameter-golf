@@ -612,9 +612,10 @@ class MLP(nn.Module):
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.prelu = nn.PReLU(num_parameters=1, init=0.01)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), negative_slope=0.01)
+        x = self.prelu(self.fc(x))
         return self.proj(x.square())
 
 
