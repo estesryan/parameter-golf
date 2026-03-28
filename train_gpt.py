@@ -1104,6 +1104,15 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    # Load EMA weights permanently into model before export
+    if master_process or not distributed:
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                param.copy_(ema_weights[name].to(device=param.device, dtype=param.dtype))
+        if distributed:
+            for param in base_model.parameters():
+                dist.broadcast(param.data, src=0)
+
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
