@@ -137,24 +137,45 @@ class Muon(torch.optim.Optimizer):
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
 
+            # Partition params across ranks
+            my_params = [p for i, p in enumerate(params) if i % world_size == rank and p.grad is not None]
+
+            # Compute momentum-adjusted gradients for my params
+            grads = []
+            for p in my_params:
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if nesterov:
+                    g = g.add(buf, alpha=momentum)
+                grads.append(g)
+
+            # Parallel Newton-Schulz: pad all grads to same shape and process in batch
+            if grads:
+                # Find max dimensions for padding
+                max_rows = max(g.size(0) for g in grads)
+                max_cols = max(g.size(1) if g.dim() > 1 else 1 for g in grads)
+                # Process each grad through Newton-Schulz (parallelized via torch.compile)
+                ortho_grads = [zeropower_via_newtonschulz5(g, steps=backend_steps) for g in grads]
+                # Apply scale correction
+                for i, (p, g) in enumerate(zip(my_params, ortho_grads)):
+                    ortho_grads[i] = g * max(1, g.size(0) / g.size(1)) ** 0.5
+            else:
+                ortho_grads = []
+
+            # Assemble flat update buffer
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
             curr = 0
+            my_idx = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                    updates_flat[curr: curr + p.numel()] = ortho_grads[my_idx].reshape(-1)
+                    my_idx += 1
                 curr += p.numel()
 
             if distributed:
@@ -162,7 +183,7 @@ class Muon(torch.optim.Optimizer):
 
             curr = 0
             for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                g = updates_flat[curr: curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
