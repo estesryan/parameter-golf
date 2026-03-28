@@ -633,7 +633,7 @@ class MLP(nn.Module):
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
-        self.prelu = nn.PReLU(num_parameters=1, init=0.01)
+        self.prelu = nn.PReLU(num_parameters=1, init=0.1)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.prelu(self.fc(x))
