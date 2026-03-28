@@ -923,8 +923,8 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     # EMA shadow weights stored on CPU to save GPU memory
-    ema_weights = {name: param.detach().cpu().clone() for name, param in base_model.named_parameters()}
-    ema_step = [0]  # mutable counter for bias correction
+    ema_weights: dict | None = None
+    ema_step = [0]
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -994,8 +994,11 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def eval_with_ema():
+        # If EMA not yet initialized (before warmdown), use live weights
+        if ema_weights is None or ema_step[0] == 0:
+            return eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
         # Swap in bias-corrected EMA weights, eval, swap back
-        bias_correction = 1.0 - args.ema_decay ** ema_step[0] if ema_step[0] > 0 else 1.0
+        bias_correction = 1.0 - args.ema_decay ** ema_step[0]
         live_weights = {name: param.detach().cpu().clone() for name, param in base_model.named_parameters()}
         with torch.no_grad():
             for name, param in base_model.named_parameters():
@@ -1068,11 +1071,15 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
 
-        # Update EMA shadow weights with bias correction
-        ema_step[0] += 1
-        with torch.no_grad():
-            for name, param in base_model.named_parameters():
-                ema_weights[name].mul_(args.ema_decay).add_(param.detach().cpu(), alpha=1.0 - args.ema_decay)
+        # Only accumulate EMA during warmdown (when LR is decaying)
+        if scale < 1.0 and args.ema_decay > 0.0:
+            if ema_weights is None:
+                # Initialize EMA from current live weights at warmdown start
+                ema_weights = {name: param.detach().cpu().clone() for name, param in base_model.named_parameters()}
+            ema_step[0] += 1
+            with torch.no_grad():
+                for name, param in base_model.named_parameters():
+                    ema_weights[name].mul_(args.ema_decay).add_(param.detach().cpu(), alpha=1.0 - args.ema_decay)
 
         zero_grad_all()
 
@@ -1108,13 +1115,14 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    # Load EMA weights permanently into model before export
-    if master_process or not distributed:
-        bias_correction = 1.0 - args.ema_decay ** ema_step[0] if ema_step[0] > 0 else 1.0
-        with torch.no_grad():
-            for name, param in base_model.named_parameters():
-                corrected = ema_weights[name] / bias_correction
-                param.copy_(corrected.to(device=param.device, dtype=param.dtype))
+    # Load EMA weights permanently into model before export (if EMA was active)
+    if ema_weights is not None and ema_step[0] > 0:
+        if master_process or not distributed:
+            bias_correction = 1.0 - args.ema_decay ** ema_step[0]
+            with torch.no_grad():
+                for name, param in base_model.named_parameters():
+                    corrected = ema_weights[name] / bias_correction
+                    param.copy_(corrected.to(device=param.device, dtype=param.dtype))
         if distributed:
             for param in base_model.parameters():
                 dist.broadcast(param.data, src=0)
