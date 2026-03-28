@@ -53,6 +53,7 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.35))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -925,10 +926,11 @@ def main() -> None:
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
+            # Fallback for uncapped runs: step-count based (unchanged)
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
+        # Wall-clock aware: warmdown occupies the last warmdown_frac of total budget
+        warmdown_ms = args.warmdown_frac * max_wallclock_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
