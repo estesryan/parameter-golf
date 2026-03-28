@@ -19,6 +19,18 @@ import uuid
 import zlib
 from pathlib import Path
 
+# Import zstandard for better compression than zlib, installing if needed
+try:
+    import zstandard as zstd
+    HAS_ZSTD = True
+except ImportError:
+    subprocess.run(["pip", "install", "zstandard", "-q"], check=False)
+    try:
+        import zstandard as zstd
+        HAS_ZSTD = True
+    except ImportError:
+        HAS_ZSTD = False
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -88,6 +100,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     use_int6 = bool(int(os.environ.get("USE_INT6", "0")))
+    use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1141,7 +1154,11 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    if args.use_zstd and HAS_ZSTD:
+        cctx = zstd.ZstdCompressor(level=22)
+        quant_blob = cctx.compress(quant_raw)
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1159,7 +1176,12 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    try:
+        quant_blob_decompressed = zlib.decompress(quant_blob_disk)
+    except zlib.error:
+        dctx = zstd.ZstdDecompressor()
+        quant_blob_decompressed = dctx.decompress(quant_blob_disk)
+    quant_state = torch.load(io.BytesIO(quant_blob_decompressed), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
