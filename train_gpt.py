@@ -924,6 +924,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     # EMA shadow weights stored on CPU to save GPU memory
     ema_weights = {name: param.detach().cpu().clone() for name, param in base_model.named_parameters()}
+    ema_step = [0]  # mutable counter for bias correction
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -993,11 +994,13 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def eval_with_ema():
-        # Swap in EMA weights, eval, swap back
+        # Swap in bias-corrected EMA weights, eval, swap back
+        bias_correction = 1.0 - args.ema_decay ** ema_step[0] if ema_step[0] > 0 else 1.0
         live_weights = {name: param.detach().cpu().clone() for name, param in base_model.named_parameters()}
         with torch.no_grad():
             for name, param in base_model.named_parameters():
-                param.copy_(ema_weights[name].to(device=param.device, dtype=param.dtype))
+                corrected = ema_weights[name] / bias_correction
+                param.copy_(corrected.to(device=param.device, dtype=param.dtype))
         result = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
         with torch.no_grad():
             for name, param in base_model.named_parameters():
@@ -1065,7 +1068,8 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
 
-        # Update EMA shadow weights
+        # Update EMA shadow weights with bias correction
+        ema_step[0] += 1
         with torch.no_grad():
             for name, param in base_model.named_parameters():
                 ema_weights[name].mul_(args.ema_decay).add_(param.detach().cpu(), alpha=1.0 - args.ema_decay)
@@ -1106,16 +1110,11 @@ def main() -> None:
 
     # Load EMA weights permanently into model before export
     if master_process or not distributed:
-        # Debug: check EMA weights are sane before export
-        sample_name, sample_ema = next(iter(ema_weights.items()))
-        sample_live = dict(base_model.named_parameters())[sample_name]
-        log0(f"ema_export_debug: name={sample_name} ema_dtype={sample_ema.dtype} live_dtype={sample_live.dtype} ema_mean={sample_ema.float().mean().item():.6f} live_mean={sample_live.float().mean().item():.6f} ema_std={sample_ema.float().std().item():.6f}")
+        bias_correction = 1.0 - args.ema_decay ** ema_step[0] if ema_step[0] > 0 else 1.0
         with torch.no_grad():
             for name, param in base_model.named_parameters():
-                param.copy_(ema_weights[name].to(device=param.device, dtype=param.dtype))
-        # Debug: confirm copy worked
-        sample_live_after = dict(base_model.named_parameters())[sample_name]
-        log0(f"ema_export_debug_after: mean={sample_live_after.float().mean().item():.6f} std={sample_live_after.float().mean().item():.6f}")
+                corrected = ema_weights[name] / bias_correction
+                param.copy_(corrected.to(device=param.device, dtype=param.dtype))
         if distributed:
             for param in base_model.parameters():
                 dist.broadcast(param.data, src=0)
