@@ -1106,9 +1106,16 @@ def main() -> None:
 
     # Load EMA weights permanently into model before export
     if master_process or not distributed:
+        # Debug: check EMA weights are sane before export
+        sample_name, sample_ema = next(iter(ema_weights.items()))
+        sample_live = dict(base_model.named_parameters())[sample_name]
+        log0(f"ema_export_debug: name={sample_name} ema_dtype={sample_ema.dtype} live_dtype={sample_live.dtype} ema_mean={sample_ema.float().mean().item():.6f} live_mean={sample_live.float().mean().item():.6f} ema_std={sample_ema.float().std().item():.6f}")
         with torch.no_grad():
             for name, param in base_model.named_parameters():
                 param.copy_(ema_weights[name].to(device=param.device, dtype=param.dtype))
+        # Debug: confirm copy worked
+        sample_live_after = dict(base_model.named_parameters())[sample_name]
+        log0(f"ema_export_debug_after: mean={sample_live_after.float().mean().item():.6f} std={sample_live_after.float().mean().item():.6f}")
         if distributed:
             for param in base_model.parameters():
                 dist.broadcast(param.data, src=0)
