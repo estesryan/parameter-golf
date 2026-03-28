@@ -923,8 +923,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     # EMA shadow weights stored on CPU to save GPU memory
-    ema_weights: dict | None = None
-    ema_step = [0]
+    ema_model: nn.Module | None = None
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -993,26 +992,6 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    def eval_with_ema():
-        # If EMA not yet initialized (before warmdown), use live weights
-        if ema_weights is None or ema_step[0] == 0:
-            return eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
-        # Create a temporary copy of base_model with EMA weights for eval
-        # Do NOT swap params in the compiled model — that corrupts the compiled graph
-        bias_correction = 1.0 - args.ema_decay ** ema_step[0]
-        live_state = {name: param.detach().clone() for name, param in base_model.named_parameters()}
-        with torch.no_grad():
-            for name, param in base_model.named_parameters():
-                corrected = (ema_weights[name] / bias_correction).to(device=param.device, dtype=param.dtype)
-                param.data.copy_(corrected)
-        # Reset compiled graph cache by calling _reset_parameters if available
-        if hasattr(compiled_model, '_reset_compiled_autograd_function'):
-            compiled_model._reset_compiled_autograd_function()
-        result = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
-        with torch.no_grad():
-            for name, param in base_model.named_parameters():
-                param.data.copy_(live_state[name])
-        return result
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1031,7 +1010,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_with_ema()
+            val_loss, val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1077,13 +1056,12 @@ def main() -> None:
 
         # Only accumulate EMA during warmdown (when LR is decaying)
         if scale < 1.0 and args.ema_decay > 0.0:
-            if ema_weights is None:
-                # Initialize EMA from current live weights at warmdown start
-                ema_weights = {name: param.detach().cpu().clone() for name, param in base_model.named_parameters()}
-            ema_step[0] += 1
+            if ema_model is None:
+                # Deep copy base_model into a separate CPU model for EMA
+                ema_model = copy.deepcopy(base_model).cpu()
             with torch.no_grad():
-                for name, param in base_model.named_parameters():
-                    ema_weights[name].mul_(args.ema_decay).add_(param.detach().cpu(), alpha=1.0 - args.ema_decay)
+                for ema_p, live_p in zip(ema_model.parameters(), base_model.parameters()):
+                    ema_p.data.mul_(args.ema_decay).add_(live_p.detach().cpu(), alpha=1.0 - args.ema_decay)
 
         zero_grad_all()
 
@@ -1119,14 +1097,11 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    # Load EMA weights permanently into model before export (if EMA was active)
-    if ema_weights is not None and ema_step[0] > 0:
-        if master_process or not distributed:
-            bias_correction = 1.0 - args.ema_decay ** ema_step[0]
-            with torch.no_grad():
-                for name, param in base_model.named_parameters():
-                    corrected = ema_weights[name] / bias_correction
-                    param.copy_(corrected.to(device=param.device, dtype=param.dtype))
+    # Load EMA weights into model before export (if EMA was active)
+    if ema_model is not None:
+        with torch.no_grad():
+            for base_p, ema_p in zip(base_model.parameters(), ema_model.parameters()):
+                base_p.data.copy_(ema_p.data.to(device=base_p.device, dtype=base_p.dtype))
         if distributed:
             for param in base_model.parameters():
                 dist.broadcast(param.data, src=0)
