@@ -997,17 +997,21 @@ def main() -> None:
         # If EMA not yet initialized (before warmdown), use live weights
         if ema_weights is None or ema_step[0] == 0:
             return eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
-        # Swap in bias-corrected EMA weights, eval, swap back
+        # Create a temporary copy of base_model with EMA weights for eval
+        # Do NOT swap params in the compiled model — that corrupts the compiled graph
         bias_correction = 1.0 - args.ema_decay ** ema_step[0]
-        live_weights = {name: param.detach().cpu().clone() for name, param in base_model.named_parameters()}
+        live_state = {name: param.detach().clone() for name, param in base_model.named_parameters()}
         with torch.no_grad():
             for name, param in base_model.named_parameters():
-                corrected = ema_weights[name] / bias_correction
-                param.copy_(corrected.to(device=param.device, dtype=param.dtype))
+                corrected = (ema_weights[name] / bias_correction).to(device=param.device, dtype=param.dtype)
+                param.data.copy_(corrected)
+        # Reset compiled graph cache by calling _reset_parameters if available
+        if hasattr(compiled_model, '_reset_compiled_autograd_function'):
+            compiled_model._reset_compiled_autograd_function()
         result = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
         with torch.no_grad():
             for name, param in base_model.named_parameters():
-                param.copy_(live_weights[name].to(device=param.device, dtype=param.dtype))
+                param.data.copy_(live_state[name])
         return result
 
     # -----------------------------
