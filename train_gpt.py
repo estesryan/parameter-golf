@@ -86,6 +86,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -921,6 +922,8 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    # EMA shadow weights stored on CPU to save GPU memory
+    ema_weights = {name: param.detach().cpu().clone() for name, param in base_model.named_parameters()}
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -989,6 +992,18 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    def eval_with_ema():
+        # Swap in EMA weights, eval, swap back
+        live_weights = {name: param.detach().cpu().clone() for name, param in base_model.named_parameters()}
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                param.copy_(ema_weights[name].to(device=param.device, dtype=param.dtype))
+        result = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                param.copy_(live_weights[name].to(device=param.device, dtype=param.dtype))
+        return result
+
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
@@ -1006,18 +1021,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
+            val_loss, val_bpb = eval_with_ema()
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1060,6 +1064,12 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+
+        # Update EMA shadow weights
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                ema_weights[name].mul_(args.ema_decay).add_(param.detach().cpu(), alpha=1.0 - args.ema_decay)
+
         zero_grad_all()
 
         step += 1
