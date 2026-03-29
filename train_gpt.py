@@ -79,6 +79,9 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult_low = int(os.environ.get("MLP_MULT_LOW", 0))
+    mlp_mult_high = int(os.environ.get("MLP_MULT_HIGH", 0))
+    mlp_asymm_split = float(os.environ.get("MLP_ASYMM_SPLIT", 0.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -719,6 +722,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mlp_mult_low: int = 0,
+        mlp_mult_high: int = 0,
+        mlp_asymm_split: float = 0.5,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -732,13 +738,21 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        # Asymmetric MLP: use low mult for early layers, high mult for late layers.
+        # Falls back to uniform mlp_mult when mlp_mult_low/high are 0.
+        if mlp_mult_low > 0 and mlp_mult_high > 0:
+            num_low_layers = int(round(num_layers * mlp_asymm_split))
+            mlp_mults = [mlp_mult_low if i < num_low_layers else mlp_mult_high for i in range(num_layers)]
+        else:
+            mlp_mults = [mlp_mult] * num_layers
+
         self.blocks = nn.ModuleList(
             [
                 Block(
                     model_dim,
                     num_heads,
                     num_kv_heads,
-                    mlp_mult,
+                    mlp_mults[i],
                     rope_base,
                     qk_gain_init,
                 )
@@ -900,6 +914,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        mlp_mult_low=args.mlp_mult_low,
+        mlp_mult_high=args.mlp_mult_high,
+        mlp_asymm_split=args.mlp_asymm_split,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
