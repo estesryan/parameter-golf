@@ -103,6 +103,8 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     use_int6 = bool(int(os.environ.get("USE_INT6", "0")))
+    late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
 
 # -----------------------------
@@ -400,6 +402,24 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     scale = torch.tensor(clip_abs / INT6_MAX if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT6_MAX, INT6_MAX).to(torch.int8).contiguous()
     return q, scale
+
+def fake_quantize_int6(t: Tensor) -> Tensor:
+    """Straight-Through Estimator (STE) fake int6 quantization.
+    Forward: quantize to int6 range and dequantize back to float.
+    Backward: gradients pass through unchanged (straight-through).
+    Makes weights naturally more compressible during training."""
+    with torch.no_grad():
+        t32 = t.float()
+        if t32.ndim == 2:
+            clip_abs = torch.quantile(t32.abs(), INT6_CLIP_Q, dim=1).clamp_min(1.0 / INT6_MAX)
+            scale = clip_abs / INT6_MAX
+            t_clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+            t_q = torch.round(t_clipped / scale[:, None]) * scale[:, None]
+        else:
+            clip_abs = float(torch.quantile(t32.abs().flatten(), INT6_CLIP_Q).item()) if t32.numel() else 0.0
+            scale = clip_abs / INT6_MAX if clip_abs > 0 else 1.0
+            t_q = torch.round(t32.clamp(-clip_abs, clip_abs) / scale) * scale
+        return t_q.to(dtype=t.dtype)
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], use_int6: bool = False):
     # Single supported clean-script export format:
@@ -1106,6 +1126,13 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+
+        # Late QAT: apply fake int6 quantization when LR scale is below threshold
+        if args.late_qat and args.use_int6 and scale < args.late_qat_threshold:
+            with torch.no_grad():
+                for name, param in base_model.named_parameters():
+                    if param.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                        param.data.copy_(fake_quantize_int6(param.data))
 
         # Only accumulate EMA during warmdown (when LR is decaying)
         if scale < 1.0 and args.ema_decay > 0.0:
