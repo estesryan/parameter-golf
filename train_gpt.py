@@ -1140,7 +1140,7 @@ def main() -> None:
                         param.data.copy_(fake_quantize_int6(param.data))
 
         # Only accumulate EMA during warmdown (when LR is decaying)
-        if scale < 1.0 and args.ema_decay > 0.0:
+        if scale < 0.5 and args.ema_decay > 0.0:
             if ema_model is None:
                 # Deep copy base_model into a separate CPU model for EMA
                 ema_model = copy.deepcopy(base_model).cpu()
