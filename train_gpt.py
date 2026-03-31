@@ -754,10 +754,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = n_blocks - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        if n_blocks == 11:
-            mlp_mults = [1,1,1,1,1,2,2,2,2,2,2]
-        else:
-            mlp_mults = [mlp_mult] * n_blocks
+        mlp_mults = [mlp_mult] * n_blocks
 
         self.blocks = nn.ModuleList(
             [
