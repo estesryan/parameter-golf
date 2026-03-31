@@ -296,7 +296,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y, eval_mode=True).detach()
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -779,7 +779,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, eval_mode: bool = False) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = x.transpose(1, 2)
         x = self.token_mixer(x)
@@ -803,12 +803,7 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        if eval_mode:
-            loss = -target_logp.mean()
-        else:
-            p = target_logp.exp()
-            weights = ((1.0 - p) ** 2).detach()
-            loss = -(weights * target_logp).mean()
+        loss = -target_logp.mean()
         return loss
 
 
