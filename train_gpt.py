@@ -747,7 +747,6 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.logit_sharpen = logit_sharpen
-        self.use_p2_loss = False  # toggled on at 90% wallclock
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
         n_blocks = num_layers
@@ -804,11 +803,7 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        if self.use_p2_loss:
-            weights = ((1.0 - target_logp.exp()) ** 2).detach()
-            loss = -(weights * target_logp).mean()
-        else:
-            loss = -target_logp.mean()
+        loss = -target_logp.mean()
         return loss
 
 
@@ -1061,10 +1056,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            p2_state = base_model.use_p2_loss
-            base_model.use_p2_loss = False  # eval must always use standard CE
             val_loss, val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
-            base_model.use_p2_loss = p2_state  # restore
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1081,8 +1073,6 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        if max_wallclock_ms is not None and elapsed_ms >= 0.9 * max_wallclock_ms:
-            base_model.use_p2_loss = True
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
