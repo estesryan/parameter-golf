@@ -806,9 +806,10 @@ class GPT(nn.Module):
         if eval_mode:
             loss = -target_logp.mean()
         else:
-            p = target_logp.exp()
-            weights = ((1.0 - p) ** 2).detach()
-            loss = -(weights * target_logp).mean()
+            loss = -target_logp.mean()
+            #p = target_logp.exp()
+            #weights = ((1.0 - p) ** 2).detach()
+            #loss = -(weights * target_logp).mean()
         return loss
 
 
