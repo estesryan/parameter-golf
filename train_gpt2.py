@@ -803,7 +803,13 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        loss = -target_logp.mean()
+        if not self.training:
+            loss = -target_logp.mean()
+        else:
+            epsilon = 0.05
+            nll = -target_logp
+            smooth_loss = -log_probs.mean(dim=-1)
+            loss = ((1 - epsilon) * nll + epsilon * smooth_loss).mean()
         return loss
 
 
