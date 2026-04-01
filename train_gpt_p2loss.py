@@ -803,14 +803,14 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return logits
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, step: int | None = None, total_steps: int | None = None) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, loss_override: str | None = None) -> Tensor:
         logits = self._logits(input_ids)
         targets = target_ids.reshape(-1)
 
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
-        loss_type = os.environ.get("LOSS_TYPE", "p2")
+        loss_type = loss_override or os.environ.get("LOSS_TYPE", "p2")
 
         # --- CE ---
         if loss_type == "ce":
@@ -826,13 +826,9 @@ class GPT(nn.Module):
         elif loss_type == "soft_p2":
             weights = 0.5 + 0.5 * (1.0 - p)  # softer weighting
 
-        # --- Hybrid: CE early → P2 late ---
+        # --- Hybrid: schedule is resolved outside; treat as p2 here ---
         elif loss_type == "hybrid_p2":
-            frac = step / total_steps if (step is not None and total_steps is not None) else 1.0
-            if frac < 0.5:
-                return -target_logp.mean()
-            else:
-                weights = (1.0 - p) ** 2
+            weights = (1.0 - p) ** 2
 
         else:
             raise ValueError(f"Unknown LOSS_TYPE={loss_type}")
@@ -1121,7 +1117,12 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, step=step, total_steps=args.iterations)
+                base_loss_type = os.environ.get("LOSS_TYPE", "p2")
+                if base_loss_type == "hybrid_p2":
+                    effective_loss_type = "ce" if step / args.iterations < 0.5 else "p2"
+                else:
+                    effective_loss_type = base_loss_type
+                loss = model(x, y, loss_override=effective_loss_type)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
