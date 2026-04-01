@@ -347,7 +347,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,skip_weights",
+        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,skip_weights,logit_temp",
     ).split(",")
     if pattern
 )
@@ -876,8 +876,9 @@ class GPT(nn.Module):
         logits_proj = F.linear(x, self.tok_emb.weight)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-        # Change 3: Scale logits by learned per-target-token temperature before softmax.
-        temp = self.logit_temp[targets].to(torch.float32).unsqueeze(-1)  # [N, 1]
+        # Change 3: Scale logits by learned per-input-token temperature before softmax.
+        input_flat = input_ids.reshape(-1)
+        temp = self.logit_temp[input_flat].to(torch.float32).unsqueeze(-1)  # [N, 1]
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen * temp, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         loss = -target_logp.mean()
