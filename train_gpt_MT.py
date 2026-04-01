@@ -630,7 +630,7 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 class CausalConvEncoder(nn.Module):
     def __init__(self, dim: int, num_layers: int = 3):
         super().__init__()
-        assert 1 <= num_layers <= 3, "num_layers must be 1, 2, or 3"
+        assert 0 <= num_layers <= 3, "num_layers must be 0, 1, 2, or 3"
         # kernel_sizes: bigram(2), trigram(3), pointwise(1)
         kernel_sizes = [2, 3, 1][:num_layers]
         self.kernel_sizes: list[int] = kernel_sizes
