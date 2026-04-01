@@ -1059,7 +1059,9 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    _base = os.environ.get("LOSS_TYPE", "p2")
+                    _warmup_loss_type = "ce" if _base == "hybrid_p2" else _base
+                    warmup_loss = model(x, y, loss_override=_warmup_loss_type)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
