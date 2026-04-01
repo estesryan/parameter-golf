@@ -628,7 +628,7 @@ class TrigramHead(nn.Module):
         self.bucket_emb = nn.Embedding(num_buckets, rank)
         self.out_proj = CastedLinear(rank, vocab_size, bias=False)
         nn.init.normal_(self.bucket_emb.weight, std=0.01)
-        nn.init.zeros_(self.out_proj.weight)
+        nn.init.normal_(self.out_proj.weight, std=0.02)
 
     def forward(self, input_ids: Tensor) -> Tensor:
         _, seqlen = input_ids.shape
@@ -815,7 +815,7 @@ class GPT(nn.Module):
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.trigram_head = TrigramHead(vocab_size, trigram_num_buckets, trigram_rank)
-        self.trigram_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        self.trigram_scale = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
 
         # Change 4: Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
@@ -872,10 +872,11 @@ class GPT(nn.Module):
         targets = target_ids.reshape(-1)
 
         logits_proj = F.linear(x, self.tok_emb.weight)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
         trigram_logits = self.trigram_head(input_ids)
-        logits = logits + self.trigram_scale * trigram_logits
+        logits_proj = logits_proj + self.trigram_scale * trigram_logits
+
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
         input_flat = input_ids.reshape(-1)
         temp = self.logit_temp[input_flat].to(torch.float32).unsqueeze(-1)
