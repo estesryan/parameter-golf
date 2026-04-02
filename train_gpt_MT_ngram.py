@@ -889,8 +889,6 @@ class GPT(nn.Module):
         # Per-token logit temperature applied before softmax.
         input_flat = input_ids.reshape(-1)
         temp = torch.clamp(self.logit_temp[input_flat], 0.8, 1.2).unsqueeze(-1)  # [N, 1]
-        if self.training and getattr(self, 'current_step', 0) < 100:
-            temp = torch.ones_like(temp)
         scaled_logits = logits.float() * self.logit_sharpen
         scaled_logits = scaled_logits * temp
         log_probs = F.log_softmax(scaled_logits, dim=-1)
