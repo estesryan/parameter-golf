@@ -800,6 +800,10 @@ class GPT(nn.Module):
         # Learned scalar gate for bigram contribution.
         self.alpha_bigram = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
+        # Low-rank latent context path: approximates trigram + topic signal.
+        self.context_proj = nn.Linear(model_dim, 32, bias=False)
+        self.context_to_vocab = nn.Linear(32, vocab_size, bias=False)
+
 
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
@@ -835,6 +839,8 @@ class GPT(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        nn.init.normal_(self.context_proj.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.context_to_vocab.weight, mean=0.0, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -865,7 +871,10 @@ class GPT(nn.Module):
         alpha = torch.clamp(self.alpha_bigram, 0.0, 2.0)
         bigram_term = alpha * bigram_flat
 
-        logits = bigram_term + transformer_logits
+        z = self.context_proj(x_flat)
+        context_logits = self.context_to_vocab(z)
+
+        logits = transformer_logits + bigram_term + context_logits
 
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
