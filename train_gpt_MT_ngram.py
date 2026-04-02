@@ -10,8 +10,8 @@ Architecture:
   - Exact bigram logits table: initialized from corpus counts, frozen after initialization,
     serves as the fixed Markov backoff base added directly to final logits
   - Hashed trigram correction: embedding → low-rank projection (64 → 32 → vocab) gates a
-    context delta via sigmoid-gated backoff — lambda_context = 0.9 * sigmoid(4*(log1p(count)/5 - 0.6));
-    threshold behavior: near-zero for rare contexts, sharp rise once evidence is sufficient, saturates for frequent ones
+    context delta via count-based backoff gate — lambda_context = 0.35 * (clamp(log1p(count)/8, 0, 1) ** 0.7);
+    hash size 16384 reduces collisions; power law gives gradual increase in trigram trust with observed frequency
   - Transformer residual: small learned correction (scale ~0.3) on top of the n-gram base
   - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
   - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
@@ -805,8 +805,7 @@ class GPT(nn.Module):
         # Low-rank projection 64 → 32 → vocab produces a context delta per (prev2, prev1) pair.
         # Reliability of each hash bucket is tracked in trigram_hash_counts and used as the
         # frequency-based smoothing signal for count-based backoff of the trigram correction.
-        # Larger hash size (16384 vs 4096) reduces collisions, restores meaningful count variance,
-        # and enables sigmoid gating to actually distinguish rare vs frequent contexts.
+        # Larger hash size (16384 vs 4096) reduces collisions and restores meaningful count variance.
         self.trigram_hash_size = 16384
         self.register_buffer("trigram_hash_counts", torch.zeros(self.trigram_hash_size, dtype=torch.float32))
         self.trigram_hash_emb = nn.Embedding(self.trigram_hash_size, 64)
@@ -901,23 +900,15 @@ class GPT(nn.Module):
         # Scale up trigram logits so the correction can strongly dominate bigram for frequent contexts.
         context_delta = 1.5 * self.trigram_to_bigram(hidden)
 
-        # Sigmoid-gated backoff: trigram correction is gated by how frequently this hashed
-        # (prev2, prev1) context has been observed. log1p smooths raw counts; dividing by 5.0
-        # sets the activation scale. A sigmoid with shift 0.6 and steepness 4.0 introduces
-        # threshold behavior — near-zero for rare contexts, rapid increase once counts are
-        # meaningful, saturation for frequent contexts. This avoids early noise injection while
-        # still allowing strong trigram influence once sufficient evidence exists.
+        # Count-based backoff gate: trigram correction is gated by how frequently this hashed
+        # (prev2, prev1) context has been observed. log1p smooths raw counts; dividing by 8.0
+        # normalizes to a bounded range. The power law gives a gradual increase in trigram trust
+        # with observed frequency. This is the original simpler count-based smoothing rule.
         hash_count = self.trigram_hash_counts[trigram_hash.reshape(-1)]
         log_count = torch.log1p(hash_count)
+        log_count = torch.clamp(log_count / 8.0, 0.0, 1.0)
 
-        # Normalize to rough scale (no clamp yet)
-        scaled = log_count / 5.0
-
-        # Sigmoid gate: delayed activation + sharp transition
-        lambda_context = torch.sigmoid(4.0 * (scaled - 0.6))
-
-        # Scale and cap
-        lambda_context = 0.9 * lambda_context
+        lambda_context = 0.35 * (log_count ** 0.7)
 
         adjusted_bigram = bigram_flat + lambda_context.unsqueeze(-1) * context_delta
 
