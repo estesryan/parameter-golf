@@ -799,6 +799,9 @@ class GPT(nn.Module):
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
         # Learned scalar gate for bigram contribution.
         self.alpha_bigram = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        # Learned scalar gate for context path; starts at 0 to prevent early disruption.
+        self.alpha_context = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.context_decay = nn.Parameter(torch.tensor(0.9))
 
         # Low-rank latent context path: approximates trigram + topic signal.
         self.context_proj = nn.Linear(model_dim, 32, bias=False)
@@ -871,10 +874,16 @@ class GPT(nn.Module):
         alpha = torch.clamp(self.alpha_bigram, 0.0, 2.0)
         bigram_term = alpha * bigram_flat
 
-        z = self.context_proj(x_flat)
-        context_logits = self.context_to_vocab(z)
+        proj = self.context_proj(self.final_norm(x))  # (B, T, 32)
+        decay = torch.clamp(self.context_decay, 0.0, 0.999)
+        T = proj.size(1)
+        powers = decay ** torch.arange(T, device=proj.device, dtype=proj.dtype)
+        z = torch.flip(torch.cumsum(torch.flip(proj * powers.view(1, T, 1), dims=[1]), dim=1), dims=[1])
+        z = z / powers.view(1, T, 1).clamp_min(1e-6)
+        context_logits = self.context_to_vocab(z.reshape(-1, 32))
 
-        logits = transformer_logits + bigram_term + context_logits
+        alpha_c = torch.clamp(self.alpha_context, 0.0, 1.0)
+        logits = transformer_logits + bigram_term + alpha_c * context_logits
 
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
