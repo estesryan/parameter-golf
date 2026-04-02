@@ -804,6 +804,8 @@ class GPT(nn.Module):
         nn.init.normal_(self.context_to_bigram.weight, mean=0.0, std=1e-4)
 
 
+        self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
+
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
         self.register_buffer("is_boundary_token_lut", torch.zeros(vocab_size, dtype=torch.bool))
@@ -884,7 +886,7 @@ class GPT(nn.Module):
 
         adjusted_bigram = bigram_flat + alpha_c * context_delta
 
-        logits = transformer_logits + alpha * adjusted_bigram
+        logits = self.transformer_scale * transformer_logits + alpha * adjusted_bigram
 
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
