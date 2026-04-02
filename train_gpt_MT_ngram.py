@@ -795,8 +795,8 @@ class GPT(nn.Module):
 
         # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
-        # Learned scalar gate for context path; starts at 0.1.
-        self.alpha_context = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        # Learned scalar gate for context path
+        self.alpha_context = nn.Parameter(torch.tensor(0.02, dtype=torch.float32))
 
         # Low-rank latent context path: approximates trigram + topic signal.
         self.context_proj = nn.Linear(model_dim, 128, bias=False)
