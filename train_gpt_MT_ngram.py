@@ -796,7 +796,7 @@ class GPT(nn.Module):
         # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
         # Learned scalar gate for context path
-        self.alpha_context = nn.Parameter(torch.tensor(0.02, dtype=torch.float32))
+        self.alpha_context = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
         # Low-rank latent context path: approximates trigram + topic signal.
         self.context_proj = nn.Linear(model_dim, 128, bias=False)
@@ -804,7 +804,7 @@ class GPT(nn.Module):
         nn.init.normal_(self.context_to_bigram.weight, mean=0.0, std=1e-4)
 
 
-        self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
+        self.transformer_scale = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
 
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
