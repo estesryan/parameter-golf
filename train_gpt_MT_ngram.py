@@ -877,8 +877,6 @@ class GPT(nn.Module):
             entropy = -(p_bigram * torch.log(p_bigram + 1e-9)).sum(dim=-1)
             entropy = entropy / math.log(V)   # normalize to [0,1]
 
-        lambda_context = torch.sigmoid(3.0 * (0.5 - entropy))
-
         prev1 = input_ids
         prev2 = torch.roll(input_ids, shifts=1, dims=1)
         prev2[:, 0] = 0
@@ -887,6 +885,14 @@ class GPT(nn.Module):
         trigram_emb = self.trigram_hash_emb(trigram_hash)
         hidden = self.trigram_hidden(trigram_emb.reshape(-1, 64))
         context_delta = self.trigram_to_bigram(hidden)
+
+        delta_norm = context_delta.norm(dim=-1)
+        delta_norm = delta_norm / (delta_norm.mean().detach() + 1e-6)
+        delta_norm = torch.clamp(delta_norm, 0.0, 3.0)
+
+        # Gate is high only when bigram is confident (low entropy) AND
+        # the trigram correction is meaningfully large (high delta_norm).
+        lambda_context = torch.sigmoid(3.0 * (0.5 - entropy) + 0.5 * delta_norm - 2.0)
 
         adjusted_bigram = bigram_flat + lambda_context.unsqueeze(-1) * context_delta
 
