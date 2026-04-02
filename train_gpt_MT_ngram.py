@@ -798,7 +798,7 @@ class GPT(nn.Module):
         # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
         # Learned scalar gate for bigram contribution.
-        self.alpha_bigram = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        self.alpha_bigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         # Learned scalar gate for context path; starts at 0 to prevent early disruption.
         self.alpha_context = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
@@ -871,7 +871,7 @@ class GPT(nn.Module):
         # Bigram logits: index bigram_logits by input token → [B, T, V], then flatten.
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
 
-        alpha = torch.clamp(self.alpha_bigram, 0.0, 2.0)
+        alpha = 1.0
 
         proj = self.context_proj(x_norm)  # (B, T, 32)
         # explicit trigram-style context
