@@ -806,6 +806,9 @@ class GPT(nn.Module):
 
         self.transformer_scale = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
 
+        self.bigram_conf_proj = nn.Linear(1, 1, bias=False)
+        nn.init.constant_(self.bigram_conf_proj.weight, -5.0)
+
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
         self.register_buffer("is_boundary_token_lut", torch.zeros(vocab_size, dtype=torch.bool))
@@ -869,6 +872,11 @@ class GPT(nn.Module):
         # Bigram logits: index bigram_logits by input token → [B, T, V], then flatten.
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
 
+        bigram_probs = torch.softmax(bigram_flat, dim=-1)
+        max_bigram_prob, _ = bigram_probs.max(dim=-1, keepdim=True)
+
+        gate = torch.sigmoid(self.bigram_conf_proj(max_bigram_prob))
+
         alpha = 1.0
 
         proj = self.context_proj(x_norm)  # (B, T, 128)
@@ -886,7 +894,8 @@ class GPT(nn.Module):
 
         adjusted_bigram = bigram_flat + alpha_c * context_delta
 
-        logits = self.transformer_scale * transformer_logits + alpha * adjusted_bigram
+        correction = self.transformer_scale * transformer_logits + (adjusted_bigram - bigram_flat)
+        logits = bigram_flat + gate * correction
 
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
@@ -1028,19 +1037,23 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     # - bigram_logits table uses scalar_lr * 0.01 via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    named_params = list(base_model.named_parameters())
+
     matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        p for name, p in named_params
+        if p.ndim == 2
+        and name != "tok_emb.weight"
+        and name != "bigram_logits"
+        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+
     scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        p for name, p in named_params
+        if (
+            (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+            and name != "bigram_logits"
+        )
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
