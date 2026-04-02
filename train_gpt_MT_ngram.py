@@ -8,7 +8,7 @@ Motivating data analysis:
 
 Architecture:
   - Exact bigram logits table: nn.Parameter [vocab_size, vocab_size] added to final logits
-  - Learned scalar gate alpha_context gates the context delta added on top of the bigram logits
+  - Per-token adaptive gate lambda_context (based on bigram entropy) gates the context delta
   - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
   - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
   - LeakyReLU(0.5)² activation
@@ -795,14 +795,14 @@ class GPT(nn.Module):
 
         # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
-        # Learned scalar gate for context path; starts at 0.1.
-        self.alpha_context = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
-        # Hashed discrete trigram correction.
-        self.trigram_hash_size = 8192
+        # Hashed discrete trigram correction (low-rank projection).
+        self.trigram_hash_size = 4096
         self.trigram_hash_emb = nn.Embedding(self.trigram_hash_size, 64)
-        self.trigram_to_bigram = nn.Linear(64, vocab_size, bias=False)
+        self.trigram_hidden = nn.Linear(64, 32, bias=False)
+        self.trigram_to_bigram = nn.Linear(32, vocab_size, bias=False)
         nn.init.normal_(self.trigram_hash_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.trigram_hidden.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.trigram_to_bigram.weight, mean=0.0, std=1e-4)
 
 
@@ -870,7 +870,14 @@ class GPT(nn.Module):
 
         # Bigram logits: index bigram_logits by input token → [B, T, V], then flatten.
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
-        alpha = 1.0
+
+        V = bigram_flat.size(-1)
+        with torch.no_grad():
+            p_bigram = F.softmax(bigram_flat, dim=-1)
+            entropy = -(p_bigram * torch.log(p_bigram + 1e-9)).sum(dim=-1)
+            entropy = entropy / math.log(V)   # normalize to [0,1]
+
+        lambda_context = torch.sigmoid(3.0 * (1.0 - entropy) - 2.0)
 
         prev1 = input_ids
         prev2 = torch.roll(input_ids, shifts=1, dims=1)
@@ -878,11 +885,9 @@ class GPT(nn.Module):
 
         trigram_hash = ((prev2.to(torch.int64) * 1315423911 + prev1.to(torch.int64)) & (self.trigram_hash_size - 1))
         trigram_hidden = self.trigram_hash_emb(trigram_hash)
-        context_delta = self.trigram_to_bigram(trigram_hidden.reshape(-1, 64))
+        context_delta = self.trigram_to_bigram(self.trigram_hidden(trigram_hidden.reshape(-1, 64)))
 
-        alpha_c = torch.clamp(self.alpha_context, 0.0, 1.0)
-
-        adjusted_bigram = bigram_flat + alpha_c * context_delta
+        adjusted_bigram = bigram_flat + lambda_context.unsqueeze(-1) * context_delta
 
         logits = self.transformer_scale * transformer_logits + adjusted_bigram
 
