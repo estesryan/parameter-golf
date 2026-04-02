@@ -100,6 +100,11 @@ class Hyperparameters:
     rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
     # Fraction of transformer blocks used as encoder in the U-Net. 0.35 → 3 enc / 6 dec for 9 layers.
     encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
+    # Sparse boundary-memory path.
+    memory_dim = int(os.environ.get("MEMORY_DIM", 128))
+    memory_layers = int(os.environ.get("MEMORY_LAYERS", 2))
+    memory_heads = int(os.environ.get("MEMORY_HEADS", 4))
+    memory_max_tokens = int(os.environ.get("MEMORY_MAX_TOKENS", 128))
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
@@ -787,6 +792,10 @@ class GPT(nn.Module):
         logit_sharpen: float = 1.1,
         rope_partial_dims: int = 8,
         encoder_layer_frac: float = 0.35,
+        memory_dim: int = 128,
+        memory_layers: int = 2,
+        memory_heads: int = 4,
+        memory_max_tokens: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -794,12 +803,34 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.logit_sharpen = logit_sharpen
+        self.memory_max_tokens = memory_max_tokens
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
         # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
         # Learned scalar gate for bigram contribution.
         self.alpha_bigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
+        # Sparse boundary-memory path.
+        self.memory_in = CastedLinear(model_dim, memory_dim, bias=False)
+        self.memory_out = CastedLinear(memory_dim, model_dim, bias=False)
+        _mem_heads = min(4, memory_heads)
+        self.memory_blocks = nn.ModuleList([
+            Block(
+                memory_dim,
+                num_heads=_mem_heads,
+                num_kv_heads=_mem_heads,
+                mlp_mult=1.0,
+                rope_base=rope_base,
+                qk_gain_init=qk_gain_init,
+                rope_partial_dims=min(8, memory_dim // _mem_heads),
+            )
+            for _ in range(memory_layers)
+        ])
+        self.memory_gate = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        # LUTs registered as buffers so forward() can use them without passing as args.
+        self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
+        self.register_buffer("is_boundary_token_lut", torch.zeros(vocab_size, dtype=torch.bool))
 
         # Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
@@ -837,11 +868,54 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        nn.init.normal_(self.memory_in.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.memory_out.weight, mean=0.0, std=0.02)
 
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x0 = x
+
+        # Sparse boundary-memory path.
+        B, T = input_ids.shape
+        k = min(self.memory_max_tokens, T)
+        # tokenizer-aware boundary signal (much better than raw ID threshold)
+        boundary_mask = self.has_leading_space_lut[input_ids] | self.is_boundary_token_lut[input_ids]
+
+        # Strided sampling over full sequence
+        stride = max(T // k, 1)
+        base_idx = torch.arange(0, T, stride, device=input_ids.device)[:k]
+        base_idx = base_idx.unsqueeze(0).expand(B, -1)  # [B, k]
+
+        # Prefer boundary tokens locally without sorting
+        # For each stride bucket, snap to nearest boundary if present
+        window = stride
+        offsets = torch.arange(window, device=input_ids.device)
+
+        candidate_idx = (base_idx.unsqueeze(-1) + offsets).clamp(max=T-1)  # [B, k, window]
+        flat_idx = candidate_idx.reshape(B, -1)                                   # [B, k*window]
+        candidate_mask = boundary_mask.gather(1, flat_idx).reshape(B, k, window)  # [B, k, window]
+
+        # pick first boundary in each window, else fallback to base_idx
+        first_boundary = candidate_mask.float().argmax(dim=-1)
+        has_boundary = candidate_mask.any(dim=-1)
+
+        topk_idx = torch.where(
+            has_boundary,
+            candidate_idx.gather(-1, first_boundary.unsqueeze(-1)).squeeze(-1),
+            base_idx
+        )
+        gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, x.size(-1))          # [B, k, D]
+        mem_x = x.gather(1, gather_idx)                                          # [B, k, D]
+        mem = self.memory_in(mem_x)
+        mem0 = mem
+        for blk in self.memory_blocks:
+            mem = blk(mem, mem0)
+        mem_out = self.memory_out(mem)                                           # [B, k, D]
+        dense_mem = torch.zeros_like(x)
+        dense_mem.scatter_add_(1, gather_idx, mem_out)
+        x = x + self.memory_gate.to(dtype=x.dtype) * dense_mem
+
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
@@ -986,6 +1060,10 @@ def main() -> None:
         logit_sharpen=args.logit_sharpen,
         rope_partial_dims=args.rope_partial_dims,
         encoder_layer_frac=args.encoder_layer_frac,
+        memory_dim=args.memory_dim,
+        memory_layers=args.memory_layers,
+        memory_heads=args.memory_heads,
+        memory_max_tokens=args.memory_max_tokens,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -997,6 +1075,8 @@ def main() -> None:
     bigram_init = bigram_init.to(device=device, dtype=base_model.bigram_logits.dtype)
     base_model.bigram_logits.data.copy_(bigram_init)
     base_model.bigram_logits.requires_grad = False
+    base_model.has_leading_space_lut.copy_(has_leading_space_lut)
+    base_model.is_boundary_token_lut.copy_(is_boundary_token_lut)
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
@@ -1020,7 +1100,21 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     # N-gram params: bigram gate goes to Adam scalar group; bigram table gets its own optimizer.
     scalar_params.append(base_model.alpha_bigram)
-
+    # Memory path scalars.
+    scalar_params.append(base_model.memory_gate)
+    # Memory path matrices.
+    matrix_params.append(base_model.memory_in.weight)
+    matrix_params.append(base_model.memory_out.weight)
+    # Memory block params — same bucketing logic as main blocks.
+    mem_named_params = list(base_model.memory_blocks.named_parameters())
+    matrix_params.extend([
+        p for name, p in mem_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ])
+    scalar_params.extend([
+        p for name, p in mem_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ])
 
     # Per-token logit temperature: 1D, trained with Adam at scalar_lr.
     scalar_params.append(base_model.logit_temp)
