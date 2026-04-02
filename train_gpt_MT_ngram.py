@@ -804,7 +804,7 @@ class GPT(nn.Module):
         self.trigram_proj = nn.Linear(16, vocab_size, bias=False)
         # Learned scalar gates for n-gram contributions.
         self.alpha_bigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.beta_trigram = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.beta_trigram = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
         # Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
@@ -1016,7 +1016,7 @@ def main() -> None:
     with torch.no_grad():
         nn.init.normal_(base_model.trigram_proj.weight, std=0.01)
         nn.init.normal_(base_model.trigram_buckets.weight, std=0.01)
-        base_model.beta_trigram.data.fill_(0.1)
+        base_model.beta_trigram.data.fill_(0.5)
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
