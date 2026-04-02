@@ -887,7 +887,7 @@ class GPT(nn.Module):
         context_delta = self.trigram_to_bigram(hidden)
 
         delta_norm = context_delta.norm(dim=-1)
-        delta_norm = delta_norm / (delta_norm.mean().detach() + 1e-6)
+        delta_norm = torch.log1p(delta_norm)   # log stabilizes magnitude; removes batch-dependent scaling; preserves relative trigram correction strength
         delta_norm = torch.clamp(delta_norm, 0.0, 3.0)
 
         # Gate is high only when bigram is confident (low entropy) AND
