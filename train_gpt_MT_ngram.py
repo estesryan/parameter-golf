@@ -799,7 +799,7 @@ class GPT(nn.Module):
         self.alpha_context = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
         # Hashed discrete trigram correction.
-        self.trigram_hash_size = 4096
+        self.trigram_hash_size = 8192
         self.trigram_hash_emb = nn.Embedding(self.trigram_hash_size, 64)
         self.trigram_to_bigram = nn.Linear(64, vocab_size, bias=False)
         nn.init.normal_(self.trigram_hash_emb.weight, mean=0.0, std=0.02)
