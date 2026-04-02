@@ -805,7 +805,7 @@ class GPT(nn.Module):
 
         # Low-rank latent context path: approximates trigram + topic signal.
         self.context_proj = nn.Linear(model_dim, 32, bias=False)
-        self.context_to_vocab = nn.Linear(32, vocab_size, bias=False)
+        self.context_to_bigram = nn.Linear(32, vocab_size, bias=False)
 
 
         # LUTs registered as buffers so forward() can use them without passing as args.
@@ -843,7 +843,7 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         nn.init.normal_(self.context_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.context_to_vocab.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.context_to_bigram.weight, mean=0.0, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -873,7 +873,6 @@ class GPT(nn.Module):
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
 
         alpha = torch.clamp(self.alpha_bigram, 0.0, 2.0)
-        bigram_term = alpha * bigram_flat
 
         proj = self.context_proj(x_norm)  # (B, T, 32)
         decay = torch.clamp(self.context_decay, 0.0, 0.999)
@@ -881,10 +880,13 @@ class GPT(nn.Module):
         powers = decay ** torch.arange(T, device=proj.device, dtype=proj.dtype)
         z = torch.flip(torch.cumsum(torch.flip(proj * powers.view(1, T, 1), dims=[1]), dim=1), dims=[1])
         z = z / powers.view(1, T, 1).clamp_min(1e-6)
-        context_logits = self.context_to_vocab(z.reshape(-1, 32))
+        context_delta = self.context_to_bigram(z.reshape(-1, 32))
 
         alpha_c = torch.clamp(self.alpha_context, 0.0, 1.0)
-        logits = transformer_logits + bigram_term + alpha_c * context_logits
+
+        adjusted_bigram = bigram_flat + alpha_c * context_delta
+
+        logits = transformer_logits + alpha * adjusted_bigram
 
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
