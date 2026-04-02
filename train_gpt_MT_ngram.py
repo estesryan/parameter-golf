@@ -940,7 +940,9 @@ class GPT(nn.Module):
 
         # Per-token logit temperature applied before softmax.
         input_flat = input_ids.reshape(-1)
-        temp = torch.clamp(self.logit_temp[input_flat], 0.5, 2.0).unsqueeze(-1)  # [N, 1]
+        temp = torch.clamp(self.logit_temp[input_flat], 0.8, 1.2).unsqueeze(-1)  # [N, 1]
+        if self.training and getattr(self, 'current_step', 0) < 100:
+            temp = torch.ones_like(temp)
         scaled_logits = logits.float() * self.logit_sharpen
         scaled_logits = scaled_logits * temp
         log_probs = F.log_softmax(scaled_logits, dim=-1)
@@ -1143,8 +1145,8 @@ def main() -> None:
     )
     optimizer_scalar.add_param_group({
         "params": [base_model.logit_temp],
-        "lr": args.scalar_lr * 2.0,
-        "base_lr": args.scalar_lr * 2.0
+        "lr": args.scalar_lr * 0.5,
+        "base_lr": args.scalar_lr * 0.5
     })
     bigram_params = [base_model.bigram_logits]
     optimizer_bigram = torch.optim.Adam(
@@ -1262,6 +1264,7 @@ def main() -> None:
                 )
             break
 
+        base_model.current_step = step
         if step == 200:
             base_model.bigram_logits.requires_grad = True
 
