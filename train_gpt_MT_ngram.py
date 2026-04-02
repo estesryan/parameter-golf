@@ -798,7 +798,7 @@ class GPT(nn.Module):
         # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
         # Learned scalar gate for bigram contribution.
-        self.alpha_bigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.alpha_bigram = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
 
         # LUTs registered as buffers so forward() can use them without passing as args.
@@ -1022,7 +1022,6 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     # N-gram params: bigram gate goes to Adam scalar group; bigram table gets its own optimizer.
     scalar_params.append(base_model.alpha_bigram)
-    # Per-token logit temperature: gets its own higher-lr group below.
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
