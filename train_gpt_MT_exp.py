@@ -819,6 +819,7 @@ class GPT(nn.Module):
 
         # Change 1: 3-layer causal conv encoder replacing single token_mixer conv.
         self.conv_encoder = CausalConvEncoder(model_dim, num_conv_layers)
+        self.doc_proj = CastedLinear(model_dim, model_dim, bias=False)
 
         # Change 4: Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
@@ -860,6 +861,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         # Change 1: Stacked causal conv encoder (handles transpose/norm internally).
         x = self.conv_encoder(self.tok_emb(input_ids))
+        doc = x.mean(dim=1, keepdim=True)   # [B, 1, D]
+        x = x + self.doc_proj(doc)
         x0 = x
         skips: list[Tensor] = []
 
