@@ -805,7 +805,9 @@ class GPT(nn.Module):
         # Low-rank projection 64 → 32 → vocab produces a context delta per (prev2, prev1) pair.
         # Reliability of each hash bucket is tracked in trigram_hash_counts and used as the
         # frequency-based smoothing signal for count-based backoff of the trigram correction.
-        self.trigram_hash_size = 4096
+        # Larger hash size (16384 vs 4096) reduces collisions, restores meaningful count variance,
+        # and enables sigmoid gating to actually distinguish rare vs frequent contexts.
+        self.trigram_hash_size = 16384
         self.register_buffer("trigram_hash_counts", torch.zeros(self.trigram_hash_size, dtype=torch.float32))
         self.trigram_hash_emb = nn.Embedding(self.trigram_hash_size, 64)
         self.trigram_hidden = nn.Linear(64, 32, bias=False)
