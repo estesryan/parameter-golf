@@ -884,8 +884,9 @@ class GPT(nn.Module):
         logits_proj = F.linear(x_flat, self.tok_emb.weight)
         transformer_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-        # Bigram logits: fixed Markov base indexed by previous token → [BT, V].
+        # Bigram log-probabilities: fixed Markov base indexed by previous token → [BT, V].
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
+        bigram_logits_mixed = bigram_flat  # treated as logits for linear mixture
 
         # Dense local Markov learner: causal depthwise conv over embedding input (not transformer output).
         # Operating on x0 gives independent fast-local signal decoupled from attention.
@@ -897,6 +898,8 @@ class GPT(nn.Module):
         # Conv is the primary early-learning path; bigram remains the stable backoff base.
         conv_logits = 1.5 * conv_logits
         conv_logits = self.logit_softcap * torch.tanh(conv_logits / self.logit_softcap)
+        # Keep as logits for linear mixture — more aggressive than probability-space interpolation.
+        conv_logits_mixed = conv_logits
 
         prev1 = input_ids
         prev2 = torch.roll(input_ids, shifts=1, dims=1)
@@ -914,9 +917,11 @@ class GPT(nn.Module):
         trigram_emb = self.trigram_hash_emb(trigram_hash)
         trigram_hidden = self.trigram_hidden(trigram_emb.reshape(-1, 64))
         trigram_logits = self.trigram_to_bigram(trigram_hidden)  # [BT, V]
-        # Scale then softcap trigram logits for calibration against bigram before mixture.
+        # Scale then softcap trigram logits for calibration before mixture.
         trigram_logits = 0.5 * trigram_logits
         trigram_logits = self.logit_softcap * torch.tanh(trigram_logits / self.logit_softcap)
+        # Keep as logits for linear mixture — improves early learning dynamics.
+        trigram_logits_mixed = trigram_logits
 
         # Mixture weights: trigram count drives how much to trust the sparse trigram path.
         # lambda_bigram is the backoff base; lambda_conv is constant; lambda_trigram rises with frequency.
@@ -938,12 +943,14 @@ class GPT(nn.Module):
         lambda_conv = lambda_conv / weight_sum
         lambda_trigram = lambda_trigram / weight_sum
 
-        # logsumexp implements proper log-space interpolation of the three Markov components.
-        base_logits = torch.logsumexp(torch.stack([
-            torch.log(lambda_bigram.unsqueeze(-1) + 1e-9) + bigram_flat,
-            torch.log(lambda_conv.unsqueeze(-1) + 1e-9) + conv_logits,
-            torch.log(lambda_trigram.unsqueeze(-1) + 1e-9) + trigram_logits,
-        ], dim=0), dim=0)
+        # Linear combination of logits — intentionally more aggressive than probability-space interpolation.
+        # Allows conv/trigram to strongly override bigram early in training.
+        # transformer_logits is a learned residual logit correction added on top.
+        base_logits = (
+            lambda_bigram.unsqueeze(-1) * bigram_logits_mixed +
+            lambda_conv.unsqueeze(-1) * conv_logits_mixed +
+            lambda_trigram.unsqueeze(-1) * trigram_logits_mixed
+        )
 
         logits = base_logits + self.transformer_scale * transformer_logits
 
