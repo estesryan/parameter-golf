@@ -804,7 +804,8 @@ class GPT(nn.Module):
 
         # Low-rank latent context path: approximates trigram + topic signal.
         self.context_proj = nn.Linear(model_dim, 32, bias=False)
-        self.context_to_bigram = nn.Linear(32, vocab_size, bias=False)
+        self.context_to_bigram = nn.Linear(64, vocab_size, bias=False)
+        nn.init.normal_(self.context_to_bigram.weight, mean=0.0, std=1e-4)
 
 
         # LUTs registered as buffers so forward() can use them without passing as args.
@@ -842,7 +843,6 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         nn.init.normal_(self.context_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.context_to_bigram.weight, mean=0.0, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -881,8 +881,8 @@ class GPT(nn.Module):
         proj_prev1[:, 0] = 0
         proj_prev2[:, :2] = 0
 
-        z = proj_prev1 + proj_prev2
-        context_delta = self.context_to_bigram(z.reshape(-1, 32))
+        z = torch.cat([proj_prev1, proj_prev2], dim=-1)
+        context_delta = self.context_to_bigram(z.reshape(-1, 64))
 
         alpha_c = torch.clamp(self.alpha_context, 0.0, 1.0)
 
