@@ -10,8 +10,8 @@ Architecture:
   - Exact bigram logits table: initialized from corpus counts, frozen after initialization,
     serves as the fixed Markov backoff base added directly to final logits
   - Hashed trigram correction: embedding → low-rank projection (64 → 32 → vocab) gates a
-    context delta via count-based backoff — lambda_context = 0.35 * (log1p(count)/8)^0.7,
-    closer to interpolated n-gram smoothing than a heuristic gate
+    context delta via count-based backoff — lambda_context = clamp(0.8 * (log1p(count)/5)^0.7, max=1.0);
+    trigram activates earlier and transitions faster from bigram; bigram is fallback for rare contexts
   - Transformer residual: small learned correction (scale ~0.3) on top of the n-gram base
   - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
   - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
@@ -896,18 +896,21 @@ class GPT(nn.Module):
 
         trigram_emb = self.trigram_hash_emb(trigram_hash)
         hidden = self.trigram_hidden(trigram_emb.reshape(-1, 64))
-        context_delta = self.trigram_to_bigram(hidden)
+        # Scale up trigram logits so the correction can strongly dominate bigram for frequent contexts.
+        context_delta = 1.5 * self.trigram_to_bigram(hidden)
 
         # Count-based backoff: lambda_context scales the trigram correction by how frequently
         # this hashed (prev2, prev1) context has been observed during training.
-        # log1p smooths the count; dividing by 8.0 maps it to [0, 1]; the 0.7 exponent gives
-        # a concave ramp so low-count buckets get very little weight. This is frequency-based
-        # smoothing — analogous to interpolated n-gram backoff, not a heuristic confidence gate.
+        # log1p smooths the count; dividing by 5.0 (down from 8.0) maps it to [0, 1] faster so
+        # trigram activates earlier in training with a faster bigram→trigram transition.
+        # The 0.7 exponent (up from 0.8) increases curvature for quicker ramp-up on frequent contexts.
+        # Clamp at 1.0 prevents explosion from hash collisions inflating counts.
         hash_count = self.trigram_hash_counts[trigram_hash.reshape(-1)]
         log_count = torch.log1p(hash_count)
-        log_count = torch.clamp(log_count / 8.0, 0.0, 1.0)
+        log_count = torch.clamp(log_count / 5.0, 0.0, 1.0)
 
-        lambda_context = 0.35 * (log_count ** 0.7)
+        lambda_context = 0.8 * (log_count ** 0.7)
+        lambda_context = torch.clamp(lambda_context, max=1.0)
 
         adjusted_bigram = bigram_flat + lambda_context.unsqueeze(-1) * context_delta
 
