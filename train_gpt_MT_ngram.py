@@ -859,7 +859,7 @@ class GPT(nn.Module):
 
         # Change 3: Per-token logit temperature, shape (vocab_size,), initialized to 1.0.
         # Stored as fp16 in the artifact (2 KB for vocab_size=1024).
-        self.logit_temp = nn.Parameter(torch.ones(vocab_size, dtype=torch.float16))
+        self.logit_temp = nn.Parameter(torch.ones(vocab_size, dtype=torch.float32))
 
         self._init_weights()
 
@@ -935,13 +935,15 @@ class GPT(nn.Module):
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
 
         alpha = torch.clamp(self.alpha_bigram, 0.5, 2.0)
-        bigram_term = (alpha * bigram_flat).detach()
+        bigram_term = alpha * bigram_flat
         logits = bigram_term + transformer_logits
 
         # Per-token logit temperature applied before softmax.
         input_flat = input_ids.reshape(-1)
-        temp = self.logit_temp[input_flat].to(torch.float32).unsqueeze(-1)  # [N, 1]
-        log_probs = F.log_softmax(logits.float() * self.logit_sharpen * temp, dim=-1)
+        temp = torch.clamp(self.logit_temp[input_flat], 0.5, 2.0).unsqueeze(-1)  # [N, 1]
+        scaled_logits = logits.float() * self.logit_sharpen
+        scaled_logits = scaled_logits * temp
+        log_probs = F.log_softmax(scaled_logits, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         loss = -target_logp.mean()
         return loss
@@ -1116,8 +1118,7 @@ def main() -> None:
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ])
 
-    # Per-token logit temperature: 1D, trained with Adam at scalar_lr.
-    scalar_params.append(base_model.logit_temp)
+    # Per-token logit temperature: gets its own higher-lr group below.
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1140,6 +1141,11 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
+    optimizer_scalar.add_param_group({
+        "params": [base_model.logit_temp],
+        "lr": args.scalar_lr * 2.0,
+        "base_lr": args.scalar_lr * 2.0
+    })
     bigram_params = [base_model.bigram_logits]
     optimizer_bigram = torch.optim.Adam(
         [{"params": bigram_params, "lr": args.scalar_lr * 0.01, "base_lr": args.scalar_lr * 0.01}],
