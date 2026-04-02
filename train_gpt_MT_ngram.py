@@ -10,7 +10,7 @@ Architecture changes vs train_gpt_MT.py:
   1. Exact bigram logits table: nn.Parameter [vocab_size, vocab_size] added to final logits
   2. Learned scalar gate alpha_bigram scales the explicit bigram prior
   3. Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
-  4. Learned per-token logit temperature table: (vocab_size,) fp16, 2 KB artifact cost
+  4. Learned per-token logit temperature table: (vocab_size,) fp32 during training
   5. Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
   6. LeakyReLU(0.5)² activation instead of PReLU²
 """
@@ -858,7 +858,7 @@ class GPT(nn.Module):
         self.lm_head = None
 
         # Change 3: Per-token logit temperature, shape (vocab_size,), initialized to 1.0.
-        # Stored as fp16 in the artifact (2 KB for vocab_size=1024).
+        # Stored as fp32 during training; quantization handles artifact compression later.
         self.logit_temp = nn.Parameter(torch.ones(vocab_size, dtype=torch.float32))
 
         self._init_weights()
