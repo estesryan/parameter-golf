@@ -631,8 +631,8 @@ class CausalConvEncoder(nn.Module):
     def __init__(self, dim: int, num_layers: int = 3):
         super().__init__()
         assert 0 <= num_layers <= 3, "num_layers must be 0–3"
-        # kernel_sizes: bigram(2), trigram(3), 4-gram(4)
-        kernel_sizes = [2, 3, 4][:num_layers]
+        # kernel_sizes: bigram(2), trigram(3), pointwise(1)
+        kernel_sizes = [2, 3, 1][:num_layers]
         self.kernel_sizes: list[int] = kernel_sizes
         self.convs = nn.ModuleList([
             # Depthwise for k>1 (local context per channel), pointwise for k=1 (channel mix)
