@@ -7,8 +7,12 @@ Motivating data analysis:
   - Position-level entropy is completely flat across all 1024 positions (variance < 0.01 bits)
 
 Architecture:
-  - Exact bigram logits table: nn.Parameter [vocab_size, vocab_size] added to final logits
-  - Per-token adaptive gate lambda_context (based on bigram entropy) gates the context delta
+  - Exact bigram logits table: initialized from corpus counts, frozen after initialization,
+    serves as the fixed Markov backoff base added directly to final logits
+  - Hashed trigram correction: embedding → low-rank projection (64 → 32 → vocab) gates a
+    context delta via count-based backoff — lambda_context = 0.35 * (log1p(count)/8)^0.7,
+    closer to interpolated n-gram smoothing than a heuristic gate
+  - Transformer residual: small learned correction (scale ~0.3) on top of the n-gram base
   - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
   - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
   - LeakyReLU(0.5)² activation
@@ -793,11 +797,16 @@ class GPT(nn.Module):
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
-        # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
+        # Bigram logit table: initialized from corpus counts, frozen after initialization.
+        # Acts as a fixed Markov backoff base — bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
 
-        # Hashed discrete trigram correction (low-rank projection).
+        # Hashed trigram correction: trades exactness for parameter efficiency.
+        # Low-rank projection 64 → 32 → vocab produces a context delta per (prev2, prev1) pair.
+        # Reliability of each hash bucket is tracked in trigram_hash_counts and used as the
+        # frequency-based smoothing signal for count-based backoff of the trigram correction.
         self.trigram_hash_size = 4096
+        self.register_buffer("trigram_hash_counts", torch.zeros(self.trigram_hash_size, dtype=torch.float32))
         self.trigram_hash_emb = nn.Embedding(self.trigram_hash_size, 64)
         self.trigram_hidden = nn.Linear(64, 32, bias=False)
         self.trigram_to_bigram = nn.Linear(32, vocab_size, bias=False)
@@ -868,31 +877,37 @@ class GPT(nn.Module):
         logits_proj = F.linear(x_flat, self.tok_emb.weight)
         transformer_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-        # Bigram logits: index bigram_logits by input token → [B, T, V], then flatten.
+        # Fixed Markov base: look up frozen bigram_logits by the current input token → [B, T, V], flatten.
+        # This is the backoff distribution; it does not change during training.
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
-
-        V = bigram_flat.size(-1)
-        with torch.no_grad():
-            p_bigram = F.softmax(bigram_flat, dim=-1)
-            entropy = -(p_bigram * torch.log(p_bigram + 1e-9)).sum(dim=-1)
-            entropy = entropy / math.log(V)   # normalize to [0,1]
 
         prev1 = input_ids
         prev2 = torch.roll(input_ids, shifts=1, dims=1)
         prev2[:, 0] = 0
 
         trigram_hash = ((prev2.to(torch.int64) * 1315423911 + prev1.to(torch.int64)) & (self.trigram_hash_size - 1))
+
+        # Update observation counts during training — drives count-based trigram trust.
+        if self.training:
+            with torch.no_grad():
+                flat_hash = trigram_hash.reshape(-1)
+                ones = torch.ones_like(flat_hash, dtype=self.trigram_hash_counts.dtype)
+                self.trigram_hash_counts.index_add_(0, flat_hash, ones)
+
         trigram_emb = self.trigram_hash_emb(trigram_hash)
         hidden = self.trigram_hidden(trigram_emb.reshape(-1, 64))
         context_delta = self.trigram_to_bigram(hidden)
 
-        delta_norm = context_delta.norm(dim=-1)
-        delta_norm = torch.log1p(delta_norm)   # log stabilizes magnitude; removes batch-dependent scaling; preserves relative trigram correction strength
-        delta_norm = torch.clamp(delta_norm, 0.0, 3.0)
+        # Count-based backoff: lambda_context scales the trigram correction by how frequently
+        # this hashed (prev2, prev1) context has been observed during training.
+        # log1p smooths the count; dividing by 8.0 maps it to [0, 1]; the 0.7 exponent gives
+        # a concave ramp so low-count buckets get very little weight. This is frequency-based
+        # smoothing — analogous to interpolated n-gram backoff, not a heuristic confidence gate.
+        hash_count = self.trigram_hash_counts[trigram_hash.reshape(-1)]
+        log_count = torch.log1p(hash_count)
+        log_count = torch.clamp(log_count / 8.0, 0.0, 1.0)
 
-        # Gate is high only when bigram is confident (low entropy) AND
-        # the trigram correction is meaningfully large (high delta_norm).
-        lambda_context = torch.sigmoid(3.0 * (0.5 - entropy) + 0.5 * delta_norm - 2.0)
+        lambda_context = 0.35 * (log_count ** 0.7)
 
         adjusted_bigram = bigram_flat + lambda_context.unsqueeze(-1) * context_delta
 
@@ -1027,6 +1042,7 @@ def main() -> None:
     bigram_init = build_bigram_logits(args.train_files, args.vocab_size)
     bigram_init = bigram_init.to(device=device, dtype=base_model.bigram_logits.dtype)
     base_model.bigram_logits.data.copy_(bigram_init)
+    base_model.bigram_logits.requires_grad_(False)  # frozen fixed Markov base — not a learned parameter
     base_model.has_leading_space_lut.copy_(has_leading_space_lut)
     base_model.is_boundary_token_lut.copy_(is_boundary_token_lut)
 
@@ -1037,7 +1053,7 @@ def main() -> None:
     # - token embedding uses TIED_EMBED_LR via Adam
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    # - bigram_logits table uses scalar_lr * 0.01 via Adam
+    # - bigram_logits is frozen after initialization and excluded from all optimizers
     named_params = list(base_model.named_parameters())
 
     matrix_params = [
@@ -1078,14 +1094,7 @@ def main() -> None:
         fused=True,
     )
 
-    bigram_params = [base_model.bigram_logits]
-    optimizer_bigram = torch.optim.Adam(
-        [{"params": bigram_params, "lr": args.scalar_lr * 0.01, "base_lr": args.scalar_lr * 0.01}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_bigram]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
     n_params = sum(p.numel() for p in base_model.parameters())
     n_enc = base_model.num_encoder_layers
