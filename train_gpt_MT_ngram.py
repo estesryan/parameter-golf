@@ -345,7 +345,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,skip_weights,logit_temp",
+        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -830,9 +830,6 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm()
         self.lm_head = None
 
-        # Change 3: Per-token logit temperature, shape (vocab_size,), initialized to 1.0.
-        # Stored as fp32 during training; quantization handles artifact compression later.
-        self.logit_temp = nn.Parameter(torch.ones(vocab_size, dtype=torch.float32))
 
         self._init_weights()
 
@@ -870,12 +867,7 @@ class GPT(nn.Module):
 
         logits = bigram_term + transformer_logits
 
-        # Per-token logit temperature applied before softmax.
-        input_flat = input_ids.reshape(-1)
-        temp = torch.clamp(self.logit_temp[input_flat], 0.8, 1.2).unsqueeze(-1)  # [N, 1]
-        scaled_logits = logits.float() * self.logit_sharpen
-        scaled_logits = scaled_logits * temp
-        log_probs = F.log_softmax(scaled_logits, dim=-1)
+        log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         loss = -target_logp.mean()
         return loss
@@ -1053,11 +1045,7 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_scalar.add_param_group({
-        "params": [base_model.logit_temp],
-        "lr": args.scalar_lr * 0.5,
-        "base_lr": args.scalar_lr * 0.5
-    })
+
     bigram_params = [base_model.bigram_logits]
     optimizer_bigram = torch.optim.Adam(
         [{"params": bigram_params, "lr": args.scalar_lr * 0.01, "base_lr": args.scalar_lr * 0.01}],
