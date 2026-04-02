@@ -8,7 +8,8 @@ Motivating data analysis:
 
 Architecture changes vs train_gpt_MT.py:
   1. Exact bigram logits table: nn.Parameter [vocab_size, vocab_size] added to final logits
-  2. Hashed trigram residual: 131072-bucket embedding projected to vocab, added to final logits
+  2. Low-rank full trigram residual: tri_proj( tri_A(prev2) * tri_B(prev1) ), exact token interactions without hashing
+     - Uses rank-32 factorization (two embeddings + linear projection) for efficient full trigram modeling
   3. Learned scalar gates alpha_bigram, beta_trigram scale each n-gram contribution
   4. Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
   5. Learned per-token logit temperature table: (vocab_size,) fp16, 2 KB artifact cost
@@ -801,9 +802,12 @@ class GPT(nn.Module):
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
         # Learned scalar gate for bigram contribution.
         self.alpha_bigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        # Unigram bias: global token frequency table + scalar gate.
-        self.unigram_logits = nn.Parameter(torch.zeros(vocab_size))
-        self.gamma_unigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        # Low-rank full trigram factorization:
+        # trigram(prev2, prev1) = tri_proj( tri_A(prev2) * tri_B(prev1) )
+        self.tri_A = nn.Embedding(vocab_size, 32)
+        self.tri_B = nn.Embedding(vocab_size, 32)
+        self.tri_proj = nn.Linear(32, vocab_size, bias=False)
+        self.beta_trigram = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
         # Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
@@ -841,6 +845,9 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        nn.init.normal_(self.tri_A.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.tri_B.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.tri_proj.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -863,11 +870,18 @@ class GPT(nn.Module):
         # Bigram logits: index bigram_logits by input token → [B, T, V], then flatten.
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
 
+        B, T = input_ids.shape
+        pad1 = torch.zeros(B, 1, dtype=input_ids.dtype, device=input_ids.device)
+        pad2 = torch.zeros(B, 2, dtype=input_ids.dtype, device=input_ids.device)
+        prev1 = torch.cat([pad1, input_ids[:, :-1]], dim=1)
+        prev2 = torch.cat([pad2, input_ids[:, :-2]], dim=1)
+        tri_h = self.tri_A(prev2) * self.tri_B(prev1)          # [B, T, 32]
+        trigram_flat = self.tri_proj(tri_h).reshape(-1, self.bigram_logits.size(-1))
+
         alpha = torch.clamp(self.alpha_bigram, 0.5, 2.0)
         bigram_term = (alpha * bigram_flat).detach()
-        unigram_flat = self.unigram_logits.unsqueeze(0).expand_as(bigram_flat)
-        unigram_term = self.gamma_unigram * unigram_flat
-        logits = bigram_term + unigram_term + transformer_logits
+        trigram_term = self.beta_trigram * trigram_flat
+        logits = bigram_term + trigram_term + transformer_logits
 
         # Per-token logit temperature applied before softmax.
         input_flat = input_ids.reshape(-1)
@@ -1025,8 +1039,11 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     # N-gram params: bigram gate goes to Adam scalar group; bigram table gets its own optimizer.
     scalar_params.append(base_model.alpha_bigram)
-    scalar_params.append(base_model.unigram_logits)
-    scalar_params.append(base_model.gamma_unigram)
+    scalar_params.append(base_model.beta_trigram)
+    scalar_params.append(base_model.tri_A.weight)
+    scalar_params.append(base_model.tri_B.weight)
+    scalar_params.append(base_model.tri_proj.weight)
+
     # Per-token logit temperature: 1D, trained with Adam at scalar_lr.
     scalar_params.append(base_model.logit_temp)
     token_lr = args.tied_embed_lr
