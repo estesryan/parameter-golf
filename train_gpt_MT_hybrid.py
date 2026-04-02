@@ -1077,7 +1077,14 @@ def main() -> None:
     base_model.is_boundary_token_lut.copy_(is_boundary_token_lut)
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
+    # Hybrid mixture model may not use all parameters every forward pass
+    # (e.g., trigram / conv paths under certain conditions), so enable unused param detection.
+    model: nn.Module = DDP(
+        compiled_model,
+        device_ids=[local_rank],
+        broadcast_buffers=False,
+        find_unused_parameters=True,
+    ) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding uses TIED_EMBED_LR via Adam
