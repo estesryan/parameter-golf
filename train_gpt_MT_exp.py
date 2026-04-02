@@ -636,7 +636,7 @@ class CausalConvEncoder(nn.Module):
         self.kernel_sizes: list[int] = kernel_sizes
         self.convs = nn.ModuleList([
             # Depthwise for k>1 (local context per channel), pointwise for k=1 (channel mix)
-            nn.Conv1d(dim, dim, kernel_size=k, groups=(dim if k > 1 else 1), bias=False)
+            nn.Conv1d(dim, dim, kernel_size=k, groups=(dim // 4 if k > 1 else 1), bias=False)
             for k in kernel_sizes
         ])
         self.norms = nn.ModuleList([RMSNorm() for _ in kernel_sizes])
