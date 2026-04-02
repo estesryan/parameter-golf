@@ -877,15 +877,16 @@ class GPT(nn.Module):
             entropy = -(p_bigram * torch.log(p_bigram + 1e-9)).sum(dim=-1)
             entropy = entropy / math.log(V)   # normalize to [0,1]
 
-        lambda_context = torch.sigmoid(3.0 * (1.0 - entropy) - 2.0)
+        lambda_context = torch.sigmoid(3.0 * (0.5 - entropy))
 
         prev1 = input_ids
         prev2 = torch.roll(input_ids, shifts=1, dims=1)
         prev2[:, 0] = 0
 
         trigram_hash = ((prev2.to(torch.int64) * 1315423911 + prev1.to(torch.int64)) & (self.trigram_hash_size - 1))
-        trigram_hidden = self.trigram_hash_emb(trigram_hash)
-        context_delta = self.trigram_to_bigram(self.trigram_hidden(trigram_hidden.reshape(-1, 64)))
+        trigram_emb = self.trigram_hash_emb(trigram_hash)
+        hidden = self.trigram_hidden(trigram_emb.reshape(-1, 64))
+        context_delta = self.trigram_to_bigram(hidden)
 
         adjusted_bigram = bigram_flat + lambda_context.unsqueeze(-1) * context_delta
 
