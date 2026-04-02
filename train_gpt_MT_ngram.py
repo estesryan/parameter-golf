@@ -868,6 +868,10 @@ class GPT(nn.Module):
 
         # Bigram logits: index bigram_logits by input token → [B, T, V], then flatten.
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
+        bigram_log_probs = F.log_softmax(bigram_flat.float(), dim=-1)
+        bigram_probs = bigram_log_probs.exp()
+        bigram_entropy = -(bigram_probs * bigram_log_probs).sum(dim=-1, keepdim=True)
+        entropy_scale = (bigram_entropy / math.log(self.bigram_logits.size(-1))).to(bigram_flat.dtype)
 
         alpha = 1.0
 
@@ -886,7 +890,8 @@ class GPT(nn.Module):
 
         adjusted_bigram = bigram_flat + alpha_c * context_delta
 
-        logits = self.transformer_scale * transformer_logits + alpha * adjusted_bigram
+        correction = self.transformer_scale * transformer_logits + (adjusted_bigram - bigram_flat)
+        logits = bigram_flat + entropy_scale * correction
 
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
