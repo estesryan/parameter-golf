@@ -800,11 +800,6 @@ class GPT(nn.Module):
         # Learned scalar gate for bigram contribution.
         self.alpha_bigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
-        # Low-rank trigram head: (prev2, prev) → vocab via rank-64 factorization.
-        self.trigram_A = nn.Parameter(torch.randn(vocab_size, 64) * 0.01)
-        self.trigram_B = nn.Parameter(torch.randn(vocab_size, 64) * 0.01)
-        self.trigram_C = nn.Parameter(torch.randn(64, vocab_size) * 0.01)
-        self.alpha_trigram = nn.Parameter(torch.tensor(0.1))
 
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
@@ -873,18 +868,7 @@ class GPT(nn.Module):
         alpha = torch.clamp(self.alpha_bigram, 0.5, 2.0)
         bigram_term = alpha * bigram_flat
 
-        flat = input_ids.reshape(-1)
-        prev = flat
-        prev2 = torch.zeros_like(flat)
-        prev2[1:] = flat[:-1]
-        A = self.trigram_A[prev2]        # [N, 64]
-        B = self.trigram_B[prev]         # [N, 64]
-        trigram_hidden = A * B
-        trigram_logits = trigram_hidden @ self.trigram_C   # [N, V]
-        alpha_tri = torch.clamp(self.alpha_trigram, 0.0, 2.0)
-        trigram_term = 0.25 * alpha_tri * trigram_logits
-
-        logits = bigram_term + trigram_term + transformer_logits
+        logits = bigram_term + transformer_logits
 
         # Per-token logit temperature applied before softmax.
         input_flat = input_ids.reshape(-1)
@@ -1046,13 +1030,6 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     # N-gram params: bigram gate goes to Adam scalar group; bigram table gets its own optimizer.
     scalar_params.append(base_model.alpha_bigram)
-    # Trigram low-rank matrices → Muon; gate → Adam scalar.
-    matrix_params.extend([
-        base_model.trigram_A,
-        base_model.trigram_B,
-        base_model.trigram_C,
-    ])
-    scalar_params.append(base_model.alpha_trigram)
     # Per-token logit temperature: gets its own higher-lr group below.
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
