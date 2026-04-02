@@ -804,7 +804,7 @@ class GPT(nn.Module):
         self.trigram_A = nn.Parameter(torch.randn(vocab_size, 64) * 0.01)
         self.trigram_B = nn.Parameter(torch.randn(vocab_size, 64) * 0.01)
         self.trigram_C = nn.Parameter(torch.randn(64, vocab_size) * 0.01)
-        self.alpha_trigram = nn.Parameter(torch.tensor(0.5))
+        self.alpha_trigram = nn.Parameter(torch.tensor(0.1))
 
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
@@ -882,7 +882,7 @@ class GPT(nn.Module):
         trigram_hidden = A * B
         trigram_logits = trigram_hidden @ self.trigram_C   # [N, V]
         alpha_tri = torch.clamp(self.alpha_trigram, 0.0, 2.0)
-        trigram_term = alpha_tri * trigram_logits
+        trigram_term = 0.25 * alpha_tri * trigram_logits
 
         logits = bigram_term + trigram_term + transformer_logits
 
