@@ -801,7 +801,6 @@ class GPT(nn.Module):
         self.alpha_bigram = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
         # Learned scalar gate for context path; starts at 0 to prevent early disruption.
         self.alpha_context = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        self.context_decay = nn.Parameter(torch.tensor(0.9))
 
         # Low-rank latent context path: approximates trigram + topic signal.
         self.context_proj = nn.Linear(model_dim, 32, bias=False)
