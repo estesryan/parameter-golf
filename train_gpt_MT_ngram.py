@@ -863,7 +863,8 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x_flat = self.final_norm(x).reshape(-1, x.size(-1))
+        x_norm = self.final_norm(x)
+        x_flat = x_norm.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         logits_proj = F.linear(x_flat, self.tok_emb.weight)
         transformer_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
@@ -874,7 +875,7 @@ class GPT(nn.Module):
         alpha = torch.clamp(self.alpha_bigram, 0.0, 2.0)
         bigram_term = alpha * bigram_flat
 
-        proj = self.context_proj(self.final_norm(x))  # (B, T, 32)
+        proj = self.context_proj(x_norm)  # (B, T, 32)
         decay = torch.clamp(self.context_decay, 0.0, 0.999)
         T = proj.size(1)
         powers = decay ** torch.arange(T, device=proj.device, dtype=proj.dtype)
