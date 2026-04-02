@@ -799,12 +799,8 @@ class GPT(nn.Module):
 
         # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
-        # Hashed trigram residual: bucket embedding + linear projection to vocab.
-        self.trigram_buckets = nn.Embedding(131072, 16)
-        self.trigram_proj = nn.Linear(16, vocab_size, bias=False)
-        # Learned scalar gates for n-gram contributions.
+        # Learned scalar gate for bigram contribution.
         self.alpha_bigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.beta_trigram = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
         # Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
@@ -864,20 +860,9 @@ class GPT(nn.Module):
         # Bigram logits: index bigram_logits by input token → [B, T, V], then flatten.
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
 
-        # Hashed trigram residual: bucket = hash(prev2, prev1) mod 131072.
-        B = input_ids.size(0)
-        pad1 = torch.zeros(B, 1, dtype=input_ids.dtype, device=input_ids.device)
-        pad2 = torch.zeros(B, 2, dtype=input_ids.dtype, device=input_ids.device)
-        prev1 = torch.cat([pad1, input_ids[:, :-1]], dim=1)
-        prev2 = torch.cat([pad2, input_ids[:, :-2]], dim=1)
-        bucket = ((prev2 * 1319 + prev1 * 1543) % 131072).long()
-        trigram_flat = self.trigram_proj(self.trigram_buckets(bucket)).reshape(-1, self.bigram_logits.size(-1))
-
         alpha = torch.clamp(self.alpha_bigram, 0.5, 2.0)
         bigram_term = (alpha * bigram_flat).detach()
-        trigram_term = self.beta_trigram * trigram_flat
-
-        logits = bigram_term + trigram_term + transformer_logits
+        logits = bigram_term + transformer_logits
 
         # Per-token logit temperature applied before softmax.
         input_flat = input_ids.reshape(-1)
@@ -1013,11 +998,6 @@ def main() -> None:
     base_model.bigram_logits.data.copy_(bigram_init)
     base_model.bigram_logits.requires_grad = False
 
-    with torch.no_grad():
-        nn.init.normal_(base_model.trigram_proj.weight, std=0.01)
-        nn.init.normal_(base_model.trigram_buckets.weight, std=0.01)
-        base_model.beta_trigram.data.fill_(0.5)
-
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
 
@@ -1038,10 +1018,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    # N-gram params: trigram/gates go to Adam scalar group; bigram gets its own optimizer.
-    scalar_params.append(base_model.trigram_proj.weight)
-    scalar_params.append(base_model.trigram_buckets.weight)
-    scalar_params.extend([base_model.alpha_bigram, base_model.beta_trigram])
+    # N-gram params: bigram gate goes to Adam scalar group; bigram table gets its own optimizer.
+    scalar_params.append(base_model.alpha_bigram)
     # Per-token logit temperature: 1D, trained with Adam at scalar_lr.
     scalar_params.append(base_model.logit_temp)
     token_lr = args.tied_embed_lr
