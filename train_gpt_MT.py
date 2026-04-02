@@ -636,7 +636,7 @@ class CausalConvEncoder(nn.Module):
         self.kernel_sizes: list[int] = kernel_sizes
         self.convs = nn.ModuleList([
             # Depthwise for k>1 (local context per channel), pointwise for k=1 (channel mix)
-            nn.Conv1d(dim, dim, kernel_size=k, groups=(dim if k > 1 else 1), bias=False)
+            nn.Conv1d(dim, dim, kernel_size=k, groups=(dim // 4 if k > 1 else 1), bias=False)
             for k in kernel_sizes
         ])
         self.norms = nn.ModuleList([RMSNorm() for _ in kernel_sizes])
@@ -645,12 +645,12 @@ class CausalConvEncoder(nn.Module):
         # x: [B, T, D]
         x = x.transpose(1, 2)  # → [B, D, T]
         for conv, norm, k in zip(self.convs, self.norms, self.kernel_sizes):
-            # Causal left-padding: position i sees only i-(k-1)..i
+            residual = x
             if k > 1:
                 x = F.pad(x, (k - 1, 0))
-            x = conv(x)  # → [B, D, T]
-            # Norm operates on the last dim, so transpose in/out
+            x = conv(x)
             x = norm(x.transpose(1, 2)).transpose(1, 2)
+            x = x + residual
         return x.transpose(1, 2)  # → [B, T, D]
 
 
