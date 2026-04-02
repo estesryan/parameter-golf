@@ -6,13 +6,12 @@ Motivating data analysis:
   - Trigram adds another 4.44 bits on top of bigram
   - Position-level entropy is completely flat across all 1024 positions (variance < 0.01 bits)
 
-Architecture changes vs train_gpt_MT.py:
-  1. Exact bigram logits table: nn.Parameter [vocab_size, vocab_size] added to final logits
-  2. Learned scalar gate alpha_bigram scales the explicit bigram prior
-  3. Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
-  4. Learned per-token logit temperature table: (vocab_size,) fp32 during training
-  5. Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
-  6. LeakyReLU(0.5)² activation instead of PReLU²
+Architecture:
+  - Exact bigram logits table: nn.Parameter [vocab_size, vocab_size] added to final logits
+  - Learned scalar gate alpha_context gates the context delta added on top of the bigram logits
+  - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
+  - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
+  - LeakyReLU(0.5)² activation
 """
 
 from __future__ import annotations
@@ -728,7 +727,6 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # LeakyReLU(0.5)² activation — removes the per-layer PReLU parameter (Change 5).
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         hidden = int(round(mlp_mult * dim / 8)) * 8
@@ -797,12 +795,12 @@ class GPT(nn.Module):
 
         # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
-        # Learned scalar gate for context path; starts at 0 to prevent early disruption.
-        self.alpha_context = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        # Learned scalar gate for context path; starts at 0.1.
+        self.alpha_context = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
         # Low-rank latent context path: approximates trigram + topic signal.
-        self.context_proj = nn.Linear(model_dim, 32, bias=False)
-        self.context_to_bigram = nn.Linear(64, vocab_size, bias=False)
+        self.context_proj = nn.Linear(model_dim, 128, bias=False)
+        self.context_to_bigram = nn.Linear(256, vocab_size, bias=False)
         nn.init.normal_(self.context_to_bigram.weight, mean=0.0, std=1e-4)
 
 
@@ -871,7 +869,7 @@ class GPT(nn.Module):
 
         alpha = 1.0
 
-        proj = self.context_proj(x_norm)  # (B, T, 32)
+        proj = self.context_proj(x_norm)  # (B, T, 128)
         # explicit trigram-style context
         proj_prev1 = torch.roll(proj, shifts=1, dims=1)
         proj_prev2 = torch.roll(proj, shifts=2, dims=1)
@@ -880,7 +878,7 @@ class GPT(nn.Module):
         proj_prev2[:, :2] = 0
 
         z = torch.cat([proj_prev1, proj_prev2], dim=-1)
-        context_delta = self.context_to_bigram(z.reshape(-1, 64))
+        context_delta = self.context_to_bigram(z.reshape(-1, 256))
 
         alpha_c = torch.clamp(self.alpha_context, 0.0, 1.0)
 
@@ -1017,7 +1015,6 @@ def main() -> None:
     bigram_init = build_bigram_logits(args.train_files, args.vocab_size)
     bigram_init = bigram_init.to(device=device, dtype=base_model.bigram_logits.dtype)
     base_model.bigram_logits.data.copy_(bigram_init)
-    base_model.bigram_logits.requires_grad = False
     base_model.has_leading_space_lut.copy_(has_leading_space_lut)
     base_model.is_boundary_token_lut.copy_(is_boundary_token_lut)
 
@@ -1025,9 +1022,10 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
 
     # Optimizer split:
-    # - token embedding (Adam) uses TIED_EMBED_LR
+    # - token embedding uses TIED_EMBED_LR via Adam
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
+    # - bigram_logits table uses scalar_lr * 0.01 via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -1181,8 +1179,6 @@ def main() -> None:
             break
 
         base_model.current_step = step
-        if step == 200:
-            base_model.bigram_logits.requires_grad = True
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
