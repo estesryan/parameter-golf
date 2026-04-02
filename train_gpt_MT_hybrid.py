@@ -893,7 +893,9 @@ class GPT(nn.Module):
         x_conv = F.pad(x_conv, (2, 0))                                         # causal left-pad for kernel_size=3
         x_conv = self.local_conv(x_conv).transpose(1, 2)                       # [B, T, D]
         conv_logits = self.local_conv_proj(x_conv.reshape(-1, x_conv.size(-1)))  # [BT, V]
-        # Softcap conv logits to keep them on the same scale as bigram before mixture.
+        # Scale conv logits up before softcap so the conv path has stronger early signal.
+        # Conv is the primary early-learning path; bigram remains the stable backoff base.
+        conv_logits = 1.5 * conv_logits
         conv_logits = self.logit_softcap * torch.tanh(conv_logits / self.logit_softcap)
 
         prev1 = input_ids
@@ -922,10 +924,11 @@ class GPT(nn.Module):
         log_count = torch.log1p(hash_count)
         log_count = torch.clamp(log_count / 8.0, 0.0, 1.0)
 
-        # Conservative trigram trust — grows slowly, stays below 0.3 even at saturation.
-        lambda_trigram = 0.3 * (log_count ** 0.7)
-        # Modest conv weight; bigram remains the dominant backoff base.
-        lambda_conv = torch.full_like(lambda_trigram, 0.15)
+        # Conservative trigram trust — grows slowly, stays below 0.25 even at saturation.
+        # Trigram remains conservative until counts build up.
+        lambda_trigram = 0.25 * (log_count ** 0.7)
+        # Conv is now the primary early-learning path; bigram is stable backoff but no longer dominates as heavily.
+        lambda_conv = torch.full_like(lambda_trigram, 0.30)
         lambda_bigram = 1.0 - lambda_trigram - lambda_conv
         lambda_bigram = torch.clamp(lambda_bigram, min=0.05)
 
