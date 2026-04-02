@@ -875,11 +875,14 @@ class GPT(nn.Module):
         alpha = torch.clamp(self.alpha_bigram, 0.0, 2.0)
 
         proj = self.context_proj(x_norm)  # (B, T, 32)
-        decay = torch.clamp(self.context_decay, 0.0, 0.999)
-        T = proj.size(1)
-        powers = decay ** torch.arange(T, device=proj.device, dtype=proj.dtype)
-        z = torch.flip(torch.cumsum(torch.flip(proj * powers.view(1, T, 1), dims=[1]), dim=1), dims=[1])
-        z = z / powers.view(1, T, 1).clamp_min(1e-6)
+        # explicit trigram-style context
+        proj_prev1 = torch.roll(proj, shifts=1, dims=1)
+        proj_prev2 = torch.roll(proj, shifts=2, dims=1)
+
+        proj_prev1[:, 0] = 0
+        proj_prev2[:, :2] = 0
+
+        z = proj_prev1 + proj_prev2
         context_delta = self.context_to_bigram(z.reshape(-1, 32))
 
         alpha_c = torch.clamp(self.alpha_context, 0.0, 1.0)
