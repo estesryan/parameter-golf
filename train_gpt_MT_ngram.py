@@ -801,6 +801,9 @@ class GPT(nn.Module):
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
         # Learned scalar gate for bigram contribution.
         self.alpha_bigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        # Unigram bias: global token frequency table + scalar gate.
+        self.unigram_logits = nn.Parameter(torch.zeros(vocab_size))
+        self.gamma_unigram = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
         # Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
@@ -862,7 +865,9 @@ class GPT(nn.Module):
 
         alpha = torch.clamp(self.alpha_bigram, 0.5, 2.0)
         bigram_term = (alpha * bigram_flat).detach()
-        logits = bigram_term + transformer_logits
+        unigram_flat = self.unigram_logits.unsqueeze(0).expand_as(bigram_flat)
+        unigram_term = self.gamma_unigram * unigram_flat
+        logits = bigram_term + unigram_term + transformer_logits
 
         # Per-token logit temperature applied before softmax.
         input_flat = input_ids.reshape(-1)
@@ -1020,6 +1025,8 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     # N-gram params: bigram gate goes to Adam scalar group; bigram table gets its own optimizer.
     scalar_params.append(base_model.alpha_bigram)
+    scalar_params.append(base_model.unigram_logits)
+    scalar_params.append(base_model.gamma_unigram)
     # Per-token logit temperature: 1D, trained with Adam at scalar_lr.
     scalar_params.append(base_model.logit_temp)
     token_lr = args.tied_embed_lr
