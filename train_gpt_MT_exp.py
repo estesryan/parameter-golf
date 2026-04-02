@@ -630,9 +630,9 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 class CausalConvEncoder(nn.Module):
     def __init__(self, dim: int, num_layers: int = 3):
         super().__init__()
-        assert 0 <= num_layers <= 5, "num_layers must be 0–5"
-        # kernel_sizes: bigram(2), trigram(3), 4-gram(4), 5-gram(5), pointwise(1)
-        kernel_sizes = [2, 3, 4, 5, 1][:num_layers]
+        assert 0 <= num_layers <= 3, "num_layers must be 0–3"
+        # kernel_sizes: bigram(2), trigram(3), 4-gram(4)
+        kernel_sizes = [2, 3, 4][:num_layers]
         self.kernel_sizes: list[int] = kernel_sizes
         self.convs = nn.ModuleList([
             # Depthwise for k>1 (local context per channel), pointwise for k=1 (channel mix)
@@ -645,12 +645,14 @@ class CausalConvEncoder(nn.Module):
         # x: [B, T, D]
         x = x.transpose(1, 2)  # → [B, D, T]
         for conv, norm, k in zip(self.convs, self.norms, self.kernel_sizes):
+            residual = x
             # Causal left-padding: position i sees only i-(k-1)..i
             if k > 1:
                 x = F.pad(x, (k - 1, 0))
             x = conv(x)  # → [B, D, T]
             # Norm operates on the last dim, so transpose in/out
             x = norm(x.transpose(1, 2)).transpose(1, 2)
+            x = x + residual
         return x.transpose(1, 2)  # → [B, T, D]
 
 
