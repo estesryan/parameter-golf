@@ -800,6 +800,7 @@ class DilatedConvBranch(nn.Module):
 
         self.proj = nn.Linear(dim, dim, bias=False)
         self.scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
+        self.mix = nn.Parameter(torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         # x: [B, T, D]
@@ -810,7 +811,8 @@ class DilatedConvBranch(nn.Module):
         y2 = self.conv2(F.pad(x_t, (4, 0)))
         y3 = self.conv3(F.pad(x_t, (8, 0)))
 
-        y = y1 + y2 + y3
+        m = self.mix.to(dtype=x.dtype)
+        y = m[0] * y1 + m[1] * y2 + m[2] * y3
         y = y.transpose(1, 2)  # [B, T, D]
 
         y = self.proj(y)
