@@ -152,6 +152,9 @@ class Hyperparameters:
     use_trigram_logit = bool(int(os.environ.get("USE_TRIGRAM_LOGIT_CORRECTION", "1")))
     trigram_logit_hash_size = int(os.environ.get("TRIGRAM_LOGIT_HASH_SIZE", "4096"))
     trigram_logit_rank = int(os.environ.get("TRIGRAM_LOGIT_RANK", "16"))
+    trigram_init_scale = float(os.environ.get("TRIGRAM_INIT_SCALE", "0.0"))
+    trigram_ramp_frac = float(os.environ.get("TRIGRAM_RAMP_FRAC", "0.2"))
+    trigram_lr = float(os.environ.get("TRIGRAM_LR", "0.01"))
 
     # --- Distillation: CE on full logits + KL on residual logits (residual = full − bigram_base − trigram_correction) ---
     use_distillation = bool(int(os.environ.get("USE_DISTILLATION", "0")))
@@ -845,6 +848,7 @@ class GPT(nn.Module):
         use_trigram_logit: bool = True,
         trigram_logit_hash_size: int = 4096,
         trigram_logit_rank: int = 16,
+        trigram_init_scale: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -886,7 +890,9 @@ class GPT(nn.Module):
             nn.init.normal_(self.trigram_ctx_factors.weight, mean=0.0, std=0.02)
             self.trigram_vocab_factors = nn.Parameter(torch.empty(vocab_size, trigram_logit_rank))
             nn.init.normal_(self.trigram_vocab_factors, mean=0.0, std=0.02)
-            self.trigram_logit_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+            self.trigram_logit_scale = nn.Parameter(torch.tensor(trigram_init_scale, dtype=torch.float32))
+            # Ramp buffer: set externally each step from the training loop (0→1 over ramp_frac of budget).
+            self.register_buffer("trigram_ramp_factor", torch.tensor(0.0))
 
         # Distillation teacher — set externally before training, not part of state_dict.
         self._teacher: "GPT | None" = None
@@ -982,8 +988,10 @@ class GPT(nn.Module):
             h_tri = (prev1.to(torch.int64) * 1009 + prev2.to(torch.int64) * 9176) % self.trigram_logit_hash_size
             ctx_emb = self.trigram_ctx_factors(h_tri)  # [B, T, R]
             ctx_flat = ctx_emb.reshape(-1, self.trigram_logit_rank)  # [B*T, R]
-            trigram_correction = self.trigram_logit_scale.to(ctx_flat.dtype) * (
-                ctx_flat @ self.trigram_vocab_factors.to(ctx_flat.dtype).T
+            trigram_correction = (
+                self.trigram_ramp_factor.to(ctx_flat.dtype)
+                * self.trigram_logit_scale.to(ctx_flat.dtype)
+                * (ctx_flat @ self.trigram_vocab_factors.to(ctx_flat.dtype).T)
             )  # [B*T, V]
         else:
             trigram_correction = None
@@ -1139,6 +1147,7 @@ def main() -> None:
         use_trigram_logit=args.use_trigram_logit,
         trigram_logit_hash_size=args.trigram_logit_hash_size,
         trigram_logit_rank=args.trigram_logit_rank,
+        trigram_init_scale=args.trigram_init_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1176,6 +1185,7 @@ def main() -> None:
             use_trigram_logit=args.use_trigram_logit,
             trigram_logit_hash_size=args.trigram_logit_hash_size,
             trigram_logit_rank=args.trigram_logit_rank,
+            trigram_init_scale=args.trigram_init_scale,
         ).to(device).bfloat16()
         teacher_model.load_state_dict(teacher_sd, strict=False)
         teacher_model.eval()
@@ -1200,7 +1210,11 @@ def main() -> None:
     # - bigram_prev/next_factors are frozen after initialization and excluded from all optimizers
     named_params = list(base_model.named_parameters())
 
-    _SKIP_MATRIX_NAMES = {"tok_emb.weight", "bigram_prev_factors", "bigram_next_factors"}
+    _SKIP_MATRIX_NAMES = {
+        "tok_emb.weight", "bigram_prev_factors", "bigram_next_factors",
+        # Trigram logit factors use a dedicated Adam optimizer (not Muon) for stable optimization.
+        "trigram_ctx_factors.weight", "trigram_vocab_factors",
+    }
 
     matrix_params = [
         p for name, p in named_params
@@ -1240,6 +1254,19 @@ def main() -> None:
 
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
+    if args.use_trigram_logit:
+        _trigram_matrix_params = [
+            p for name, p in named_params
+            if name in {"trigram_ctx_factors.weight", "trigram_vocab_factors"}
+            and p.requires_grad
+        ]
+        if _trigram_matrix_params:
+            optimizer_trigram = torch.optim.Adam(
+                [{"params": _trigram_matrix_params, "lr": args.trigram_lr, "base_lr": args.trigram_lr}],
+                betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+            )
+            optimizers.append(optimizer_trigram)
+
     if args.bigram_trainable:
         optimizer_bigram = torch.optim.Adam(
             [{"params": [base_model.bigram_prev_factors, base_model.bigram_next_factors],
@@ -1262,6 +1289,11 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(f"muon_weight_decay:{args.muon_weight_decay} adam_weight_decay:{args.adam_weight_decay}")
+    if args.use_trigram_logit:
+        log0(
+            f"trigram_logit: enabled trigram_lr={args.trigram_lr} "
+            f"init_scale={args.trigram_init_scale} ramp_frac={args.trigram_ramp_frac}"
+        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1359,6 +1391,15 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # Trigram logit ramp: linearly ramp from 0 to 1 over trigram_ramp_frac of training budget.
+        if args.use_trigram_logit and args.trigram_ramp_frac > 0:
+            if max_wallclock_ms is not None:
+                _ramp = min(elapsed_ms / max(args.trigram_ramp_frac * max_wallclock_ms, 1e-9), 1.0)
+            else:
+                _ramp = min(step / max(args.trigram_ramp_frac * args.iterations, 1.0), 1.0)
+            base_model.trigram_ramp_factor.fill_(_ramp)
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
