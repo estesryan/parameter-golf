@@ -789,6 +789,34 @@ class Block(nn.Module):
         return x
 
 
+class PooledContextBranch(nn.Module):
+    def __init__(self, dim: int, pool: int, num_heads: int, rope_base: float, qk_gain_init: float, rope_partial_dims: int):
+        super().__init__()
+        self.pool = pool
+        self.pre_norm = RMSNorm()
+        self.post_norm = RMSNorm()
+        self.attn = CausalSelfAttention(dim, num_heads, num_heads, rope_base, qk_gain_init, rope_partial_dims)
+        self.mlp = MLP(dim, 1.0)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, T, D]
+        B, T, D = x.shape
+        P = self.pool
+        Tp = (T + P - 1) // P
+        pad = Tp * P - T
+        if pad > 0:
+            x_pad = F.pad(x, (0, 0, 0, pad))
+        else:
+            x_pad = x
+        xs = x_pad.reshape(B, Tp, P, D).mean(dim=2)             # [B, Tp, D]
+        ys = xs + self.attn_scale.to(xs.dtype)[None, None, :] * self.attn(self.pre_norm(xs))
+        ys = ys + self.mlp_scale.to(ys.dtype)[None, None, :] * self.mlp(self.post_norm(ys))
+        yu = ys[:, :, None, :].expand(B, Tp, P, D).reshape(B, Tp * P, D)
+        return yu[:, :T, :]
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -850,6 +878,16 @@ class GPT(nn.Module):
         self.trigram_embed = nn.Embedding(8192, vocab_size)
         self.trigram_scale = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
 
+        self.pooled_branch = PooledContextBranch(
+            model_dim,
+            pool=8,
+            num_heads=num_heads,
+            rope_base=rope_base,
+            qk_gain_init=qk_gain_init,
+            rope_partial_dims=rope_partial_dims,
+        )
+        self.pooled_scale = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -868,6 +906,9 @@ class GPT(nn.Module):
             x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            if i == 0:
+                x = x + self.pooled_scale.to(dtype=x.dtype) * self.pooled_branch(x)
+
             if skips:
                 # skip_weights[i] is valid: i < num_encoder_layers ≤ num_skip_weights
                 # whenever skips is non-empty (len(skips) decrements with each pop).
@@ -1031,6 +1072,7 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    pooled_named_params = list(base_model.pooled_branch.named_parameters())
     trigram_named_params = list(base_model.trigram_embed.named_parameters())
     matrix_params = [
         p
@@ -1052,7 +1094,18 @@ def main() -> None:
         for name, p in trigram_named_params
         if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     )
+    matrix_params.extend(
+        p
+        for name, p in pooled_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
+    scalar_params.extend(
+        p
+        for name, p in pooled_named_params
+        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
     scalar_params.append(base_model.trigram_scale)
+    scalar_params.append(base_model.pooled_scale)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     # Conv encoder params: depthwise (3D) and pointwise (3D) weights → scalar group (Adam).
