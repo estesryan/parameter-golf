@@ -879,7 +879,10 @@ class GPT(nn.Module):
         prev1[:, 1:] = input_ids[:, :-1]
         prev2[:, 2:] = input_ids[:, :-2]
 
-        trigram_hash = (prev1 * 4099 + prev2) % 8192
+        trigram_hash = (
+            ((prev2.to(torch.int64) * 1315423911) ^ (prev1.to(torch.int64) * 2654435761))
+            & 8191
+        ).to(torch.int64)
         trigram_logits = self.trigram_embed(trigram_hash).reshape(-1, self.tok_emb.num_embeddings)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
