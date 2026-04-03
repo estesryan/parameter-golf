@@ -95,8 +95,6 @@ class Hyperparameters:
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
     # --- Markov Transformer hyperparameters ---
-    # Number of causal conv layers in the encoder (1=bigram only, 2=+trigram, 3=+pointwise mix).
-    num_conv_layers = int(os.environ.get("NUM_CONV_LAYERS", 3))
     # Head dimensions that receive positional encoding. Flat position entropy justifies keeping this small.
     rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
     # Fraction of transformer blocks used as encoder in the U-Net. 0.35 → 3 enc / 6 dec for 9 layers.
@@ -1080,7 +1078,7 @@ def main() -> None:
     n_enc = base_model.num_encoder_layers
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
-    log0(f"markov_transformer:num_conv_layers:{args.num_conv_layers} rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
+    log0(f"markov_transformer:local_depth:{base_model.local_lm.depth} rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
