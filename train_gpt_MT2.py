@@ -1,20 +1,17 @@
 """
-Hybrid Interpolated N-gram Transformer — parameter-golf submission.
+Markov Transformer — parameter-golf submission.
 
 Motivating data analysis:
   - Bigram mutual information: 2.57 bits (29.7% of uncertainty resolved by prior token)
   - Trigram adds another 4.44 bits on top of bigram
   - Position-level entropy is completely flat across all 1024 positions (variance < 0.01 bits)
 
-Architecture (hybrid interpolated mixture):
-  - Exact bigram logits table: fixed Markov base, frozen after corpus init
-  - Dense local conv path: depthwise causal Conv1d → cheap local Markov learner
-  - Sparse hashed trigram path: count-gated precise local memory
-  - logsumexp mixture: proper log-space interpolation of the three n-gram components
-  - Small transformer residual on top of the mixture base
-  - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
-  - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
-  - LeakyReLU(0.5)² activation
+Architecture changes vs train_gpt_MT.py:
+  1. Stacked 3-layer causal conv encoder (bigram → trigram → pointwise) with RMSNorm each layer
+  2. Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
+  3. Learned per-token logit temperature table: (vocab_size,) fp16, 2 KB artifact cost
+  4. Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
+  5. LeakyReLU(0.5)² activation instead of PReLU²
 """
 
 from __future__ import annotations
@@ -97,11 +94,14 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
-    # --- N-gram Logits Transformer hyperparameters ---
+    # --- Markov Transformer hyperparameters ---
+    # Number of causal conv layers in the encoder (1=bigram only, 2=+trigram, 3=+pointwise mix).
+    num_conv_layers = int(os.environ.get("NUM_CONV_LAYERS", 3))
     # Head dimensions that receive positional encoding. Flat position entropy justifies keeping this small.
     rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
     # Fraction of transformer blocks used as encoder in the U-Net. 0.35 → 3 enc / 6 dec for 9 layers.
     encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
+
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
@@ -347,7 +347,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,skip_weights",
+        "attn_scale,mlp_scale,resid_mix,q_gain,skip_weight,skip_weights,logit_temp",
     ).split(",")
     if pattern
 )
@@ -591,24 +591,6 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-
-def build_bigram_logits(train_files: str, vocab_size: int, max_tokens: int = 50_000_000) -> Tensor:
-    counts = torch.zeros(vocab_size, vocab_size, dtype=torch.float32)
-    stream = TokenStream(train_files)
-    tokens_read = 0
-    prev = None
-    while tokens_read < max_tokens:
-        chunk = stream.take(1_000_000)
-        if prev is not None:
-            chunk = torch.cat([prev, chunk])
-        counts[chunk[:-1].long(), chunk[1:].long()] += 1
-        prev = chunk[-1:]
-        tokens_read += chunk.numel()
-    probs = counts / counts.sum(dim=1, keepdim=True).clamp_min(1)
-    logits = torch.log(probs + 1e-8)
-    return logits
-
-
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -635,6 +617,52 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+
+# -----------------------------
+# STACKED LOCAL CONV ENCODER (Change 1)
+# -----------------------------
+# Three-layer causal conv stack that injects bigram, trigram, and channel-mixing
+# inductive bias before the transformer blocks, motivated by the observed MI:
+#   bigram: 2.57 bits, trigram adds 4.44 bits more.
+# Causality: left-pad by (kernel_size - 1) so position i sees only tokens ≤ i.
+
+class LocalConvLM(nn.Module):
+    def __init__(self, dim: int, vocab_size: int):
+        super().__init__()
+        # dominant local learner: multi-scale causal depthwise convs
+        self.dw2 = nn.Conv1d(dim, dim, kernel_size=2, dilation=1, groups=dim, bias=False)
+        self.dw4 = nn.Conv1d(dim, dim, kernel_size=2, dilation=2, groups=dim, bias=False)
+        self.dw8 = nn.Conv1d(dim, dim, kernel_size=2, dilation=4, groups=dim, bias=False)
+        self.dw16 = nn.Conv1d(dim, dim, kernel_size=2, dilation=8, groups=dim, bias=False)
+        self.mix = CastedLinear(dim * 4, dim, bias=False)
+        self.norm = RMSNorm()
+        self.scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.to_logits = CastedLinear(dim, vocab_size, bias=False)
+        self.to_features = CastedLinear(dim, dim, bias=False)
+        self.depth = 2
+
+    def _causal_conv(self, x: Tensor, conv: nn.Conv1d, k: int) -> Tensor:
+        # x: [B, T, D]
+        y = x.transpose(1, 2)              # [B, D, T]
+        y = F.pad(y, (k - 1, 0))
+        y = conv(y)
+        return y.transpose(1, 2)           # [B, T, D]
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        h = x
+        for _ in range(self.depth):
+            c2 = self._causal_conv(h, self.dw2, 2)
+            c4 = self._causal_conv(h, self.dw4, 3)
+            c8 = self._causal_conv(h, self.dw8, 5)
+            c16 = self._causal_conv(h, self.dw16, 9)
+            h = torch.cat([c2, c4, c8, c16], dim=-1)
+            h = self.mix(h)
+            h = self.norm(h)
+
+        features = self.to_features(h)
+        logits = self.to_logits(self.scale.to(h.dtype) * h)
+        return features, logits
 
 
 class Rotary(nn.Module):
@@ -730,6 +758,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    # LeakyReLU(0.5)² activation — removes the per-layer PReLU parameter (Change 5).
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         hidden = int(round(mlp_mult * dim / 8)) * 8
@@ -796,39 +825,10 @@ class GPT(nn.Module):
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
-        # Exact bigram logit table: bigram_logits[prev_token] → logit vector over vocab.
-        self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
+        self.local_lm = LocalConvLM(model_dim, vocab_size)
+        self.transformer_scale = nn.Parameter(torch.tensor(0.30, dtype=torch.float32))
 
-        # Hashed discrete trigram correction (low-rank projection).
-        self.trigram_hash_size = 4096
-        self.trigram_hash_emb = nn.Embedding(self.trigram_hash_size, 64)
-        self.trigram_hidden = nn.Linear(64, 32, bias=False)
-        self.trigram_to_bigram = nn.Linear(32, vocab_size, bias=False)
-        nn.init.normal_(self.trigram_hash_emb.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.trigram_hidden.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.trigram_to_bigram.weight, mean=0.0, std=1e-4)
-        # Trigram observation counts: how often each hash bucket has been seen during training.
-        self.register_buffer("trigram_hash_counts", torch.zeros(self.trigram_hash_size, dtype=torch.float32))
-
-        # Dense local Markov learner: causal depthwise Conv1d over token embeddings.
-        # Cheap alternative to attention for capturing immediate local patterns.
-        self.local_conv = nn.Conv1d(
-            model_dim, model_dim,
-            kernel_size=3,
-            groups=model_dim,
-            bias=False
-        )
-        self.local_conv_proj = nn.Linear(model_dim, vocab_size, bias=False)
-        nn.init.normal_(self.local_conv.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.local_conv_proj.weight, mean=0.0, std=1e-4)
-
-        self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
-
-        # LUTs registered as buffers so forward() can use them without passing as args.
-        self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
-        self.register_buffer("is_boundary_token_lut", torch.zeros(vocab_size, dtype=torch.bool))
-
-        # Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
+        # Change 4: Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
         self.num_encoder_layers = max(1, round(n_blocks * encoder_layer_frac))
         self.num_decoder_layers = n_blocks - self.num_encoder_layers
@@ -853,21 +853,23 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm()
         self.lm_head = None
 
+        # Change 3: Per-token logit temperature, shape (vocab_size,), initialized to 1.0.
+        # Stored as fp16 in the artifact (2 KB for vocab_size=1024).
+        self.logit_temp = nn.Parameter(torch.ones(vocab_size, dtype=torch.float16))
 
         self._init_weights()
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        emb = self.tok_emb(input_ids)
+        conv_features, local_logits = self.local_lm(emb)
+        x = emb + conv_features
         x0 = x
-
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
@@ -875,86 +877,24 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
+                # skip_weights[i] is valid: i < num_encoder_layers ≤ num_skip_weights
+                # whenever skips is non-empty (len(skips) decrements with each pop).
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x_norm = self.final_norm(x)
-        x_flat = x_norm.reshape(-1, x.size(-1))
+        x = self.final_norm(x)
         targets = target_ids.reshape(-1)
-        logits_proj = F.linear(x_flat, self.tok_emb.weight)
-        transformer_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-        # Bigram log-probabilities: fixed Markov base indexed by previous token → [BT, V].
-        bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
-        bigram_logits_mixed = bigram_flat  # treated as logits for linear mixture
+        transformer_logits = F.linear(x.reshape(-1, x.size(-1)), self.tok_emb.weight)
+        transformer_logits = self.logit_softcap * torch.tanh(transformer_logits / self.logit_softcap)
 
-        # Dense local Markov learner: causal depthwise conv over embedding input (not transformer output).
-        # Operating on x0 gives independent fast-local signal decoupled from attention.
-        x_conv = x0.transpose(1, 2)                                            # [B, D, T] — use embeddings
-        x_conv = F.pad(x_conv, (2, 0))                                         # causal left-pad for kernel_size=3
-        x_conv = self.local_conv(x_conv).transpose(1, 2)                       # [B, T, D]
-        conv_logits = self.local_conv_proj(x_conv.reshape(-1, x_conv.size(-1)))  # [BT, V]
-        # Scale conv logits up before softcap so the conv path has stronger early signal.
-        # Conv is the primary early-learning path; bigram remains the stable backoff base.
-        conv_logits = 1.5 * conv_logits
-        conv_logits = self.logit_softcap * torch.tanh(conv_logits / self.logit_softcap)
-        # Keep as logits for linear mixture — more aggressive than probability-space interpolation.
-        conv_logits_mixed = conv_logits
+        local_logits = local_logits.reshape(-1, local_logits.size(-1)).float()
+        logits = local_logits + self.transformer_scale.float() * transformer_logits.float()
 
-        prev1 = input_ids
-        prev2 = torch.roll(input_ids, shifts=1, dims=1)
-        prev2[:, 0] = 0
-
-        trigram_hash = ((prev2.to(torch.int64) * 1315423911 + prev1.to(torch.int64)) & (self.trigram_hash_size - 1))
-
-        # Update trigram observation counts during training; these drive the sparse reliability weights.
-        if self.training:
-            with torch.no_grad():
-                flat_hash = trigram_hash.reshape(-1)
-                ones = torch.ones_like(flat_hash, dtype=self.trigram_hash_counts.dtype)
-                self.trigram_hash_counts.index_add_(0, flat_hash, ones)
-
-        trigram_emb = self.trigram_hash_emb(trigram_hash)
-        trigram_hidden = self.trigram_hidden(trigram_emb.reshape(-1, 64))
-        trigram_logits = self.trigram_to_bigram(trigram_hidden)  # [BT, V]
-        # Scale then softcap trigram logits for calibration before mixture.
-        trigram_logits = 0.5 * trigram_logits
-        trigram_logits = self.logit_softcap * torch.tanh(trigram_logits / self.logit_softcap)
-        # Keep as logits for linear mixture — improves early learning dynamics.
-        trigram_logits_mixed = trigram_logits
-
-        # Mixture weights: trigram count drives how much to trust the sparse trigram path.
-        # lambda_bigram is the backoff base; lambda_conv is constant; lambda_trigram rises with frequency.
-        hash_count = self.trigram_hash_counts[trigram_hash.reshape(-1)]
-        log_count = torch.log1p(hash_count)
-        log_count = torch.clamp(log_count / 8.0, 0.0, 1.0)
-
-        # Conservative trigram trust — grows slowly, stays below 0.25 even at saturation.
-        # Trigram remains conservative until counts build up.
-        lambda_trigram = 0.25 * (log_count ** 0.7)
-        # Conv is now the primary early-learning path; bigram is stable backoff but no longer dominates as heavily.
-        lambda_conv = torch.full_like(lambda_trigram, 0.30)
-        lambda_bigram = 1.0 - lambda_trigram - lambda_conv
-        lambda_bigram = torch.clamp(lambda_bigram, min=0.05)
-
-        # Renormalize so all three weights sum to 1.
-        weight_sum = lambda_bigram + lambda_conv + lambda_trigram
-        lambda_bigram = lambda_bigram / weight_sum
-        lambda_conv = lambda_conv / weight_sum
-        lambda_trigram = lambda_trigram / weight_sum
-
-        # Linear combination of logits — intentionally more aggressive than probability-space interpolation.
-        # Allows conv/trigram to strongly override bigram early in training.
-        # transformer_logits is a learned residual logit correction added on top.
-        base_logits = (
-            lambda_bigram.unsqueeze(-1) * bigram_logits_mixed +
-            lambda_conv.unsqueeze(-1) * conv_logits_mixed +
-            lambda_trigram.unsqueeze(-1) * trigram_logits_mixed
-        )
-
-        logits = base_logits + self.transformer_scale * transformer_logits
-
-        log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
+        # Change 3: Scale logits by learned per-input-token temperature before softmax.
+        input_flat = input_ids.reshape(-1)
+        temp = self.logit_temp[input_flat].to(torch.float32).unsqueeze(-1)  # [N, 1]
+        log_probs = F.log_softmax(logits.float() * self.logit_sharpen * temp, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         loss = -target_logp.mean()
         return loss
@@ -1078,47 +1018,40 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-
-    log0("building_bigram_logits...")
-    bigram_init = build_bigram_logits(args.train_files, args.vocab_size)
-    bigram_init = bigram_init.to(device=device, dtype=base_model.bigram_logits.dtype)
-    base_model.bigram_logits.data.copy_(bigram_init)
-    base_model.has_leading_space_lut.copy_(has_leading_space_lut)
-    base_model.is_boundary_token_lut.copy_(is_boundary_token_lut)
-
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    # Hybrid mixture model may not use all parameters every forward pass
-    # (e.g., trigram / conv paths under certain conditions), so enable unused param detection.
-    model: nn.Module = DDP(
-        compiled_model,
-        device_ids=[local_rank],
-        broadcast_buffers=False,
-        find_unused_parameters=True,
-    ) if distributed else compiled_model
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
 
     # Optimizer split:
-    # - token embedding uses TIED_EMBED_LR via Adam
+    # - token embedding (Adam) uses TIED_EMBED_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    # - bigram_logits table uses scalar_lr * 0.01 via Adam
-    named_params = list(base_model.named_parameters())
-
+    block_named_params = list(base_model.blocks.named_parameters())
+    local_lm_named_params = list(base_model.local_lm.named_parameters())
     matrix_params = [
-        p for name, p in named_params
-        if p.ndim == 2
-        and name != "tok_emb.weight"
-        and name != "bigram_logits"
-        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-
+    matrix_params.extend(
+        p
+        for name, p in local_lm_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
     scalar_params = [
-        p for name, p in named_params
-        if (
-            (p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-            and name != "bigram_logits"
-            and name != "tok_emb.weight"
-        )
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    scalar_params.extend(
+        p
+        for name, p in local_lm_named_params
+        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
+    scalar_params.append(base_model.transformer_scale)
+    # Per-token logit temperature: 1D, trained with Adam at scalar_lr.
+    scalar_params.append(base_model.logit_temp)
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1141,16 +1074,13 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-
-    # bigram_logits is a frozen Markov base — freeze after corpus init, exclude from all optimizers.
-    base_model.bigram_logits.requires_grad_(False)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
     n_params = sum(p.numel() for p in base_model.parameters())
     n_enc = base_model.num_encoder_layers
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
-    log0(f"ngram_transformer:rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
+    log0(f"markov_transformer:num_conv_layers:{args.num_conv_layers} rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1252,8 +1182,6 @@ def main() -> None:
                     f"step:{step}/{args.iterations}"
                 )
             break
-
-        base_model.current_step = step
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
