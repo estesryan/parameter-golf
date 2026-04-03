@@ -789,6 +789,30 @@ class Block(nn.Module):
         return x
 
 
+class RecurrentMemory(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.in_proj = nn.Linear(dim, dim, bias=False)
+        self.state_proj = nn.Linear(dim, dim, bias=False)
+        self.gate = nn.Linear(dim, dim, bias=False)
+        self.scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, T, D]
+        B, T, D = x.shape
+        h = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+        outputs = []
+
+        for t in range(T):
+            xt = x[:, t, :]
+            g = torch.sigmoid(self.gate(xt))
+            h = g * torch.tanh(self.in_proj(xt)) + (1 - g) * torch.tanh(self.state_proj(h))
+            outputs.append(h)
+
+        y = torch.stack(outputs, dim=1)  # [B, T, D]
+        return self.scale.to(dtype=x.dtype)[None, None, :] * y
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -817,6 +841,7 @@ class GPT(nn.Module):
 
         # Change 1: 3-layer causal conv encoder replacing single token_mixer conv.
         self.conv_encoder = CausalConvEncoder(model_dim, num_conv_layers)
+        self.rec_mem = RecurrentMemory(model_dim)
 
         # Change 4: Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
@@ -861,6 +886,7 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         # Change 1: Stacked causal conv encoder (handles transpose/norm internally).
         x = self.conv_encoder(self.tok_emb(input_ids))
+        x = x + self.rec_mem(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -1032,6 +1058,7 @@ def main() -> None:
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     trigram_named_params = list(base_model.trigram_embed.named_parameters())
+    rec_named_params = list(base_model.rec_mem.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1053,6 +1080,17 @@ def main() -> None:
         if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     )
     scalar_params.append(base_model.trigram_scale)
+    matrix_params.extend(
+        p
+        for name, p in rec_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
+    scalar_params.extend(
+        p
+        for name, p in rec_named_params
+        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
+    scalar_params.append(base_model.rec_mem.scale)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     # Conv encoder params: depthwise (3D) and pointwise (3D) weights → scalar group (Adam).
