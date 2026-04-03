@@ -805,7 +805,7 @@ class GPT(nn.Module):
         # Hashed n-gram input feature: biases the token embedding with a small local-context signal.
         # Hash combines prev1 and prev2 into a 3072-bucket embedding; scaled by a learned scalar so
         # the influence starts small and can grow with training. No count gating, no vocab projection.
-        self.ngram_hash_size = 3072
+        self.ngram_hash_size = 8192
         self.ngram_emb = nn.Embedding(self.ngram_hash_size, model_dim)
         self.ngram_scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
         nn.init.normal_(self.ngram_emb.weight, mean=0.0, std=0.02)
@@ -860,11 +860,7 @@ class GPT(nn.Module):
         prev2 = torch.roll(input_ids, shifts=1, dims=1)
         prev2[:, 0] = 0
 
-        # XOR-based mixing improves bucket dispersion vs. linear hash; reduces structured collisions
-        # under power-of-two hash sizes by spreading bits across the full table width.
-        h = (prev1.to(torch.int64) * 1315423911) ^ (prev2.to(torch.int64) * 2654435761)
-        h = h ^ (h >> 13)
-        ngram_hash = h & (self.ngram_hash_size - 1)
+        ngram_hash = ((prev1.to(torch.int64) * 1009 + prev2.to(torch.int64) * 9176) % self.ngram_hash_size)
         ngram_feat = self.ngram_emb(ngram_hash)
 
         x = tok + self.ngram_scale.to(dtype=tok.dtype) * ngram_feat
