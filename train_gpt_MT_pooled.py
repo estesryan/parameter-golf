@@ -847,8 +847,8 @@ class GPT(nn.Module):
         # Stored as fp16 in the artifact (2 KB for vocab_size=1024).
         self.logit_temp = nn.Parameter(torch.ones(vocab_size, dtype=torch.float16))
 
-        self.trigram_embed = nn.Embedding(8192, model_dim)
-        self.trigram_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        self.trigram_embed = nn.Embedding(8192, vocab_size)
+        self.trigram_scale = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
 
         self._init_weights()
 
@@ -859,20 +859,8 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        prev1 = torch.zeros_like(input_ids)
-        prev2 = torch.zeros_like(input_ids)
-        prev1[:, 1:] = input_ids[:, :-1]
-        prev2[:, 2:] = input_ids[:, :-2]
-
-        trigram_hash = (
-            ((prev2.to(torch.int64) * 1315423911) ^ (prev1.to(torch.int64) * 2654435761))
-            & 8191
-        ).to(torch.int64)
-        trigram_feat = self.trigram_embed(trigram_hash)  # [B, T, D]
-
         # Change 1: Stacked causal conv encoder (handles transpose/norm internally).
         x = self.conv_encoder(self.tok_emb(input_ids))
-        x = x + self.trigram_scale.to(dtype=x.dtype) * trigram_feat.to(dtype=x.dtype)
         x0 = x
         skips: list[Tensor] = []
 
@@ -886,10 +874,26 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
+        prev1 = torch.zeros_like(input_ids)
+        prev2 = torch.zeros_like(input_ids)
+        prev1[:, 1:] = input_ids[:, :-1]
+        prev2[:, 2:] = input_ids[:, :-2]
+
+        trigram_hash = (
+            ((prev2.to(torch.int64) * 1315423911) ^ (prev1.to(torch.int64) * 2654435761))
+            & 8191
+        ).to(torch.int64)
+        trigram_logits = self.trigram_embed(trigram_hash).reshape(-1, self.tok_emb.num_embeddings)
+
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         logits_proj = F.linear(x, self.tok_emb.weight)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        logits_base = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+        logits = (
+            logits_base
+            + self.trigram_scale * trigram_logits.float()
+        )
 
         # Change 3: Scale logits by learned per-input-token temperature before softmax.
         input_flat = input_ids.reshape(-1)
