@@ -860,8 +860,11 @@ class GPT(nn.Module):
         prev2 = torch.roll(input_ids, shifts=1, dims=1)
         prev2[:, 0] = 0
 
-        # Hashed local n-gram feature: mostly bigram, with prev2 folded in for extra local structure.
-        ngram_hash = ((prev1.to(torch.int64) * 1009 + prev2.to(torch.int64) * 9176) % self.ngram_hash_size)
+        # XOR-based mixing improves bucket dispersion vs. linear hash; reduces structured collisions
+        # under power-of-two hash sizes by spreading bits across the full table width.
+        h = (prev1.to(torch.int64) * 1315423911) ^ (prev2.to(torch.int64) * 2654435761)
+        h = h ^ (h >> 13)
+        ngram_hash = h & (self.ngram_hash_size - 1)
         ngram_feat = self.ngram_emb(ngram_hash)
 
         x = tok + self.ngram_scale.to(dtype=tok.dtype) * ngram_feat
