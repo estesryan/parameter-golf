@@ -804,17 +804,20 @@ class PooledContextBranch(nn.Module):
         # x: [B, T, D]
         B, T, D = x.shape
         P = self.pool
-        Tp = (T + P - 1) // P
-        pad = Tp * P - T
-        if pad > 0:
-            x_pad = F.pad(x, (0, 0, 0, pad))
-        else:
-            x_pad = x
-        xs = x_pad.reshape(B, Tp, P, D).mean(dim=2)             # [B, Tp, D]
+
+        # Causal prefix pooling: pooled state j summarizes tokens <= end_j only.
+        csum = x.cumsum(dim=1)  # [B, T, D]
+        end_idx = torch.arange(P - 1, T, P, device=x.device)
+        xs = csum[:, end_idx, :] / (end_idx.to(x.dtype)[None, :, None] + 1.0)  # [B, Tp, D]
+
         ys = xs + self.attn_scale.to(xs.dtype)[None, None, :] * self.attn(self.pre_norm(xs))
         ys = ys + self.mlp_scale.to(ys.dtype)[None, None, :] * self.mlp(self.post_norm(ys))
-        yu = ys[:, :, None, :].expand(B, Tp, P, D).reshape(B, Tp * P, D)
-        return yu[:, :T, :]
+
+        # Each original position t gets the pooled summary for the latest completed prefix bucket.
+        bucket = torch.div(torch.arange(T, device=x.device), P, rounding_mode="floor")
+        bucket = torch.clamp(bucket, max=ys.size(1) - 1)
+        yu = ys[:, bucket, :]  # [B, T, D]
+        return yu
 
 
 class GPT(nn.Module):
