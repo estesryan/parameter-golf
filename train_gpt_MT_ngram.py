@@ -9,9 +9,10 @@ Motivating data analysis:
 Architecture:
   - Exact bigram logits table: initialized from corpus counts, frozen after initialization,
     serves as the fixed Markov backoff base added directly to final logits
-  - Hashed trigram correction: embedding → low-rank projection (64 → 32 → vocab) gates a
-    context delta via count-based backoff gate — lambda_context = 0.35 * (clamp(log1p(count)/8, 0, 1) ** 0.7);
-    hash size 16384 reduces collisions; power law gives gradual increase in trigram trust with observed frequency
+  - Hashed n-gram input feature: a small embedding bias injected at the token embedding level.
+    Hash combines prev1 and prev2 tokens into a 3072-bucket lookup; scaled by a learned scalar
+    (init 0.05) so the transformer can learn to use local context without overwriting logits.
+    No count-based gating, no output correction — the signal lives in the hidden representation.
   - Transformer residual: small learned correction (scale ~0.3) on top of the n-gram base
   - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
   - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
@@ -801,19 +802,13 @@ class GPT(nn.Module):
         # Acts as a fixed Markov backoff base — bigram_logits[prev_token] → logit vector over vocab.
         self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
 
-        # Hashed trigram correction: trades exactness for parameter efficiency.
-        # Low-rank projection 64 → 32 → vocab produces a context delta per (prev2, prev1) pair.
-        # Reliability of each hash bucket is tracked in trigram_hash_counts and used as the
-        # frequency-based smoothing signal for count-based backoff of the trigram correction.
-        # Larger hash size (16384 vs 4096) reduces collisions and restores meaningful count variance.
-        self.trigram_hash_size = 16384
-        self.register_buffer("trigram_hash_counts", torch.zeros(self.trigram_hash_size, dtype=torch.float32))
-        self.trigram_hash_emb = nn.Embedding(self.trigram_hash_size, 64)
-        self.trigram_hidden = nn.Linear(64, 32, bias=False)
-        self.trigram_to_bigram = nn.Linear(32, vocab_size, bias=False)
-        nn.init.normal_(self.trigram_hash_emb.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.trigram_hidden.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.trigram_to_bigram.weight, mean=0.0, std=1e-4)
+        # Hashed n-gram input feature: biases the token embedding with a small local-context signal.
+        # Hash combines prev1 and prev2 into a 3072-bucket embedding; scaled by a learned scalar so
+        # the influence starts small and can grow with training. No count gating, no vocab projection.
+        self.ngram_hash_size = 3072
+        self.ngram_emb = nn.Embedding(self.ngram_hash_size, model_dim)
+        self.ngram_scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+        nn.init.normal_(self.ngram_emb.weight, mean=0.0, std=0.02)
 
 
         self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
@@ -859,7 +854,17 @@ class GPT(nn.Module):
 
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        tok = self.tok_emb(input_ids)
+
+        prev1 = input_ids
+        prev2 = torch.roll(input_ids, shifts=1, dims=1)
+        prev2[:, 0] = 0
+
+        # Hashed local n-gram feature: mostly bigram, with prev2 folded in for extra local structure.
+        ngram_hash = ((prev1.to(torch.int64) * 1009 + prev2.to(torch.int64) * 9176) % self.ngram_hash_size)
+        ngram_feat = self.ngram_emb(ngram_hash)
+
+        x = tok + self.ngram_scale.to(dtype=tok.dtype) * ngram_feat
         x0 = x
 
         skips: list[Tensor] = []
@@ -882,37 +887,7 @@ class GPT(nn.Module):
         # This is the backoff distribution; it does not change during training.
         bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
 
-        prev1 = input_ids
-        prev2 = torch.roll(input_ids, shifts=1, dims=1)
-        prev2[:, 0] = 0
-
-        trigram_hash = ((prev2.to(torch.int64) * 1315423911 + prev1.to(torch.int64)) & (self.trigram_hash_size - 1))
-
-        # Update observation counts during training — drives count-based trigram trust.
-        if self.training:
-            with torch.no_grad():
-                flat_hash = trigram_hash.reshape(-1)
-                ones = torch.ones_like(flat_hash, dtype=self.trigram_hash_counts.dtype)
-                self.trigram_hash_counts.index_add_(0, flat_hash, ones)
-
-        trigram_emb = self.trigram_hash_emb(trigram_hash)
-        hidden = self.trigram_hidden(trigram_emb.reshape(-1, 64))
-        # Scale up trigram logits so the correction can strongly dominate bigram for frequent contexts.
-        context_delta = 1.5 * self.trigram_to_bigram(hidden)
-
-        # Count-based backoff gate: trigram correction is gated by how frequently this hashed
-        # (prev2, prev1) context has been observed. log1p smooths raw counts; dividing by 8.0
-        # normalizes to a bounded range. The power law gives a gradual increase in trigram trust
-        # with observed frequency. This is the original simpler count-based smoothing rule.
-        hash_count = self.trigram_hash_counts[trigram_hash.reshape(-1)]
-        log_count = torch.log1p(hash_count)
-        log_count = torch.clamp(log_count / 8.0, 0.0, 1.0)
-
-        lambda_context = 0.35 * (log_count ** 0.7)
-
-        adjusted_bigram = bigram_flat + lambda_context.unsqueeze(-1) * context_delta
-
-        logits = self.transformer_scale * transformer_logits + adjusted_bigram
+        logits = self.transformer_scale * transformer_logits + bigram_flat
 
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
