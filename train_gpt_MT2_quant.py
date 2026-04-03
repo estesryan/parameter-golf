@@ -907,6 +907,7 @@ class GPT(nn.Module):
 
         logits = (
             logits_base
+            + 1.25 * (logits_base - logits_proj).float()  # boost transformer residual
             + self.trigram_scale * trigram_logits.float()
         )
 
