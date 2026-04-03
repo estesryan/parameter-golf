@@ -824,6 +824,8 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
         self.local_lm = LocalConvLM(model_dim, vocab_size)
+        self.trigram_embed = nn.Embedding(4096, vocab_size)
+        self.trigram_scale = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
         self.transformer_scale = nn.Parameter(torch.tensor(0.30, dtype=torch.float32))
 
         # Change 4: Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
@@ -886,8 +888,19 @@ class GPT(nn.Module):
         transformer_logits = F.linear(x.reshape(-1, x.size(-1)), self.tok_emb.weight)
         transformer_logits = self.logit_softcap * torch.tanh(transformer_logits / self.logit_softcap)
 
+        prev1 = torch.zeros_like(input_ids)
+        prev2 = torch.zeros_like(input_ids)
+        prev1[:, 1:] = input_ids[:, :-1]
+        prev2[:, 2:] = input_ids[:, :-2]
+        trigram_hash = (prev1 * 1021 + prev2) % 4096
+        trigram_logits = self.trigram_embed(trigram_hash).reshape(-1, self.tok_emb.num_embeddings)
+
         local_logits = local_logits.reshape(-1, local_logits.size(-1)).float()
-        logits = local_logits + self.transformer_scale.float() * transformer_logits.float()
+        logits = (
+            local_logits
+            + self.trigram_scale.float() * trigram_logits.float()
+            + self.transformer_scale.float() * transformer_logits.float()
+        )
 
         # Change 3: Scale logits by learned per-input-token temperature before softmax.
         input_flat = input_ids.reshape(-1)
@@ -1025,6 +1038,7 @@ def main() -> None:
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     local_lm_named_params = list(base_model.local_lm.named_parameters())
+    trigram_named_params = list(base_model.trigram_embed.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1033,6 +1047,11 @@ def main() -> None:
     matrix_params.extend(
         p
         for name, p in local_lm_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
+    matrix_params.extend(
+        p
+        for name, p in trigram_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     )
     scalar_params = [
@@ -1045,9 +1064,15 @@ def main() -> None:
         for name, p in local_lm_named_params
         if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     )
+    scalar_params.extend(
+        p
+        for name, p in trigram_named_params
+        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    )
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.transformer_scale)
+    scalar_params.append(base_model.trigram_scale)
     # Per-token logit temperature: 1D, trained with Adam at scalar_lr.
     scalar_params.append(base_model.logit_temp)
     token_lr = args.tied_embed_lr
