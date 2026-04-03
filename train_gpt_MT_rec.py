@@ -797,6 +797,7 @@ class RecurrentMemory(nn.Module):
         self.gate = nn.Linear(dim, dim, bias=False)
         self.scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
 
+    @torch._dynamo.disable
     def forward(self, x: Tensor) -> Tensor:
         # x: [B, T, D]
         B, T, D = x.shape
