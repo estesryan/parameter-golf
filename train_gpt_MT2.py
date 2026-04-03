@@ -847,7 +847,7 @@ class GPT(nn.Module):
         # Stored as fp16 in the artifact (2 KB for vocab_size=1024).
         self.logit_temp = nn.Parameter(torch.ones(vocab_size, dtype=torch.float16))
 
-        self.trigram_embed = nn.Embedding(4096, vocab_size)
+        self.trigram_embed = nn.Embedding(8192, vocab_size)
         self.trigram_scale = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
 
         self._init_weights()
@@ -879,7 +879,7 @@ class GPT(nn.Module):
         prev1[:, 1:] = input_ids[:, :-1]
         prev2[:, 2:] = input_ids[:, :-2]
 
-        trigram_hash = (prev1 * 1021 + prev2) % 4096
+        trigram_hash = (prev1 * 4099 + prev2) % 8192
         trigram_logits = self.trigram_embed(trigram_hash).reshape(-1, self.tok_emb.num_embeddings)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
