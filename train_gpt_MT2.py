@@ -95,6 +95,8 @@ class Hyperparameters:
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
     # --- Markov Transformer hyperparameters ---
+    # Number of causal conv layers in the encoder (1=bigram only, 2=+trigram, 3=+pointwise mix).
+    num_conv_layers = int(os.environ.get("NUM_CONV_LAYERS", 3))
     # Head dimensions that receive positional encoding. Flat position entropy justifies keeping this small.
     rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
     # Fraction of transformer blocks used as encoder in the U-Net. 0.35 → 3 enc / 6 dec for 9 layers.
@@ -625,42 +627,31 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 #   bigram: 2.57 bits, trigram adds 4.44 bits more.
 # Causality: left-pad by (kernel_size - 1) so position i sees only tokens ≤ i.
 
-class LocalConvLM(nn.Module):
-    def __init__(self, dim: int, vocab_size: int):
+class CausalConvEncoder(nn.Module):
+    def __init__(self, dim: int, num_layers: int = 3):
         super().__init__()
-        # dominant local learner: multi-scale causal depthwise convs
-        self.dw2 = nn.Conv1d(dim, dim, kernel_size=2, dilation=1, groups=dim, bias=False)
-        self.dw4 = nn.Conv1d(dim, dim, kernel_size=2, dilation=2, groups=dim, bias=False)
-        self.dw8 = nn.Conv1d(dim, dim, kernel_size=2, dilation=4, groups=dim, bias=False)
-        self.dw16 = nn.Conv1d(dim, dim, kernel_size=2, dilation=8, groups=dim, bias=False)
-        self.mix = CastedLinear(dim * 4, dim, bias=False)
-        self.norm = RMSNorm()
-        self.scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.to_logits = CastedLinear(dim, vocab_size, bias=False)
-        self.to_features = CastedLinear(dim, dim, bias=False)
-        self.depth = 2
+        assert 0 <= num_layers <= 3, "num_layers must be 0, 1, 2, or 3"
+        # kernel_sizes: bigram(2), trigram(3), pointwise(1)
+        kernel_sizes = [2, 3, 1][:num_layers]
+        self.kernel_sizes: list[int] = kernel_sizes
+        self.convs = nn.ModuleList([
+            # Depthwise for k>1 (local context per channel), pointwise for k=1 (channel mix)
+            nn.Conv1d(dim, dim, kernel_size=k, groups=(dim // 4 if k > 1 else 1), bias=False)
+            for k in kernel_sizes
+        ])
+        self.norms = nn.ModuleList([RMSNorm() for _ in kernel_sizes])
 
-    def _causal_conv(self, x: Tensor, conv: nn.Conv1d, k: int) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         # x: [B, T, D]
-        y = x.transpose(1, 2)              # [B, D, T]
-        y = F.pad(y, (k - 1, 0))
-        y = conv(y)
-        return y.transpose(1, 2)           # [B, T, D]
-
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        h = x
-        for _ in range(self.depth):
-            c2 = self._causal_conv(h, self.dw2, 2)
-            c4 = self._causal_conv(h, self.dw4, 3)
-            c8 = self._causal_conv(h, self.dw8, 5)
-            c16 = self._causal_conv(h, self.dw16, 9)
-            h = torch.cat([c2, c4, c8, c16], dim=-1)
-            h = self.mix(h)
-            h = self.norm(h)
-
-        features = self.to_features(h)
-        logits = self.to_logits(self.scale.to(h.dtype) * h)
-        return features, logits
+        x = x.transpose(1, 2)  # → [B, D, T]
+        for conv, norm, k in zip(self.convs, self.norms, self.kernel_sizes):
+            residual = x
+            if k > 1:
+                x = F.pad(x, (k - 1, 0))
+            x = conv(x)
+            x = norm(x.transpose(1, 2)).transpose(1, 2)
+            x = x + residual
+        return x.transpose(1, 2)  # → [B, T, D]
 
 
 class Rotary(nn.Module):
@@ -812,6 +803,7 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         logit_sharpen: float = 1.1,
+        num_conv_layers: int = 3,
         rope_partial_dims: int = 8,
         encoder_layer_frac: float = 0.35,
     ):
@@ -823,10 +815,8 @@ class GPT(nn.Module):
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
-        self.local_lm = LocalConvLM(model_dim, vocab_size)
-        self.trigram_embed = nn.Embedding(4096, vocab_size)
-        self.trigram_scale = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
-        self.transformer_scale = nn.Parameter(torch.tensor(0.30, dtype=torch.float32))
+        # Change 1: 3-layer causal conv encoder replacing single token_mixer conv.
+        self.conv_encoder = CausalConvEncoder(model_dim, num_conv_layers)
 
         # Change 4: Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
         n_blocks = num_layers
@@ -857,6 +847,9 @@ class GPT(nn.Module):
         # Stored as fp16 in the artifact (2 KB for vocab_size=1024).
         self.logit_temp = nn.Parameter(torch.ones(vocab_size, dtype=torch.float16))
 
+        self.trigram_embed = nn.Embedding(4096, vocab_size)
+        self.trigram_scale = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -866,9 +859,8 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        emb = self.tok_emb(input_ids)
-        conv_features, local_logits = self.local_lm(emb)
-        x = emb + conv_features
+        # Change 1: Stacked causal conv encoder (handles transpose/norm internally).
+        x = self.conv_encoder(self.tok_emb(input_ids))
         x0 = x
         skips: list[Tensor] = []
 
@@ -882,24 +874,22 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x)
-        targets = target_ids.reshape(-1)
-
-        transformer_logits = F.linear(x.reshape(-1, x.size(-1)), self.tok_emb.weight)
-        transformer_logits = self.logit_softcap * torch.tanh(transformer_logits / self.logit_softcap)
-
         prev1 = torch.zeros_like(input_ids)
         prev2 = torch.zeros_like(input_ids)
         prev1[:, 1:] = input_ids[:, :-1]
         prev2[:, 2:] = input_ids[:, :-2]
+
         trigram_hash = (prev1 * 1021 + prev2) % 4096
         trigram_logits = self.trigram_embed(trigram_hash).reshape(-1, self.tok_emb.num_embeddings)
 
-        local_logits = local_logits.reshape(-1, local_logits.size(-1)).float()
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
+        logits_proj = F.linear(x, self.tok_emb.weight)
+        logits_base = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
         logits = (
-            local_logits
-            + self.trigram_scale.float() * trigram_logits.float()
-            + self.transformer_scale.float() * transformer_logits.float()
+            logits_base
+            + self.trigram_scale * trigram_logits.float()
         )
 
         # Change 3: Scale logits by learned per-input-token temperature before softmax.
@@ -1022,6 +1012,7 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         logit_sharpen=args.logit_sharpen,
+        num_conv_layers=args.num_conv_layers,
         rope_partial_dims=args.rope_partial_dims,
         encoder_layer_frac=args.encoder_layer_frac,
     ).to(device).bfloat16()
@@ -1037,42 +1028,32 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    local_lm_named_params = list(base_model.local_lm.named_parameters())
     trigram_named_params = list(base_model.trigram_embed.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    matrix_params.extend(
-        p
-        for name, p in local_lm_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    )
-    matrix_params.extend(
-        p
-        for name, p in trigram_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    )
     scalar_params = [
         p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params.extend(
+    matrix_params.extend(
         p
-        for name, p in local_lm_named_params
-        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        for name, p in trigram_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     )
     scalar_params.extend(
         p
         for name, p in trigram_named_params
         if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     )
+    scalar_params.append(base_model.trigram_scale)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_params.append(base_model.transformer_scale)
-    scalar_params.append(base_model.trigram_scale)
+    # Conv encoder params: depthwise (3D) and pointwise (3D) weights → scalar group (Adam).
+    scalar_params.extend(base_model.conv_encoder.parameters())
     # Per-token logit temperature: 1D, trained with Adam at scalar_lr.
     scalar_params.append(base_model.logit_temp)
     token_lr = args.tied_embed_lr
@@ -1103,7 +1084,7 @@ def main() -> None:
     n_enc = base_model.num_encoder_layers
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
-    log0(f"markov_transformer:local_depth:{base_model.local_lm.depth} rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
+    log0(f"markov_transformer:num_conv_layers:{args.num_conv_layers} rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
