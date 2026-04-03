@@ -864,6 +864,7 @@ class GPT(nn.Module):
 
         self.trigram_embed = nn.Embedding(8192, vocab_size)
         self.trigram_scale = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
+        self.trans_head = nn.Linear(model_dim, vocab_size, bias=False)
 
         self._init_weights()
 
@@ -901,13 +902,14 @@ class GPT(nn.Module):
         trigram_logits = self.trigram_embed(trigram_hash).reshape(-1, self.tok_emb.num_embeddings)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
+        trans_logits = self.trans_head(x)
         targets = target_ids.reshape(-1)
         logits_proj = F.linear(x, self.tok_emb.weight)
         logits_base = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
         logits = (
             logits_base
-            + 1.25 * (logits_base - logits_proj).float()  # boost transformer residual
+            + 0.3 * trans_logits.float()
             + self.trigram_scale * trigram_logits.float()
         )
 
