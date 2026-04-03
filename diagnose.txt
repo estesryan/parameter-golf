@@ -1,0 +1,30 @@
+NUM_LAYERS=8 \
+MLP_MULT=1.0 \
+BIGRAM_RANK=64 \
+NGRAM_NUM_HASHES=3 \
+NGRAM_HASH_SIZE=4096 \
+USE_INT6=1 \
+QAT_MODE=progressive \
+QAT_START_FRAC=0.6 \
+python diagnose_hailmary.py \
+  --model-script train_gpt_hailmary.py \
+  --checkpoint final_model.pt
+                  full  val_loss=2.59516105  val_bpb=1.53700055
+           bigram_only  val_loss=6.89076026  val_bpb=4.08109637
+     bigram_plus_ngram  val_loss=6.89076026  val_bpb=4.08109637
+bigram_plus_transformer  val_loss=3.89301845  val_bpb=2.30566481
+transformer_plus_ngram  val_loss=5.78715251  val_bpb=3.42747769
+      transformer_only  val_loss=8.56637833  val_bpb=5.07349177
+             no_bigram  val_loss=5.78715251  val_bpb=3.42747769
+              no_ngram  val_loss=3.89301845  val_bpb=2.30566481
+        no_transformer  val_loss=6.89076026  val_bpb=4.08109637
+
+Deltas vs full (positive means worse than full):
+    delta_vs_full::bigram_only  +2.54409582
+delta_vs_full::bigram_plus_ngram  +2.54409582
+delta_vs_full::bigram_plus_transformer  +0.76866426
+delta_vs_full::transformer_plus_ngram  +1.89047714
+delta_vs_full::transformer_only  +3.53649122
+      delta_vs_full::no_bigram  +1.89047714
+       delta_vs_full::no_ngram  +0.76866426
+ delta_vs_full::no_transformer  +2.54409582
