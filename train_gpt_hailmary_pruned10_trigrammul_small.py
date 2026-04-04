@@ -1,9 +1,8 @@
 """
-Bigram-Residual Transformer — parameter-golf submission (pruned10_local1_causal).
+Bigram-Residual Transformer — parameter-golf submission.
+pruned10_trigrammul_small
 
 Structured residual language model: low-rank bigram base + compact transformer residual.
-Single causal depthwise local mixing block replaces first decoder transformer block.
-(Causal fix: LocalMixBlock uses explicit left-only padding instead of symmetric padding.)
 
 Motivating data analysis:
   - Bigram mutual information: 2.57 bits (29.7% of uncertainty resolved by prior token)
@@ -19,11 +18,10 @@ Architecture:
   - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of head dims get positional encoding
   - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → enc/dec split with skip connections
   - LeakyReLU(0.5)² activation
-  - First decoder block (index num_encoder_layers) replaced with LocalMixBlock:
-    depthwise Conv1d(kernel=5) + GLU pointwise projection; no attention, no RoPE.
   - Optional distillation (USE_DISTILLATION): CE loss on full logits; KL loss on residual logits only
     (residual = full_logits − that model's own bigram base, so the shared corpus statistic is factored out)
   - QAT modes: off | late | progressive (start fake-int6 at QAT_START_FRAC of training budget)
+  - Tiny ordered multiplicative (t-1, t-2) interaction head added to the bigram base
 
 Ablation note: the hidden-space hashed n-gram module (previously K independent hash tables summed
 into the transformer input) was found to contribute no measurable quality improvement.
@@ -150,13 +148,14 @@ class Hyperparameters:
     use_multilag_bigram = bool(int(os.environ.get("USE_MULTILAG_BIGRAM", "1")))
     bigram_lags = [1, 2, 4, 8, 16]
 
-    # Bigram gate removed; full_logits = transformer_scale * transformer_logits + bigram_flat always.
-
     # --- Distillation: CE on full logits + KL on residual logits (residual = full − bigram_base) ---
     use_distillation = bool(int(os.environ.get("USE_DISTILLATION", "0")))
     distill_alpha = float(os.environ.get("DISTILL_ALPHA", 0.7))
     distill_temperature = float(os.environ.get("DISTILL_TEMPERATURE", 1.5))
     distill_teacher_path = os.environ.get("DISTILL_TEACHER_PATH", "")
+
+    # --- Trigram-mul: tiny ordered multiplicative (t-1, t-2) interaction head ---
+    trigram_mul_rank = int(os.environ.get("TRIGRAM_MUL_RANK", 16))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -931,41 +930,12 @@ class Block(nn.Module):
         return x
 
 
-class LocalMixBlock(nn.Module):
-    """Cheap local mixing block: depthwise Conv1d + GLU pointwise projection.
-
-    Replaces one transformer Block to test short-range structure learning.
-    No attention, no RoPE. Input/output shape: [B, T, D].
-    """
-    def __init__(self, dim: int):
-        super().__init__()
-        self.norm = RMSNorm()
-        self.dw_conv = nn.Conv1d(dim, dim, kernel_size=5, padding=0, groups=dim, bias=False)
-        self.pw_expand = CastedLinear(dim, 2 * dim, bias=False)
-        self.pw_proj = CastedLinear(dim, dim, bias=False)
-        self.pw_proj._zero_init = True
-        self.local_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
-
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        h = self.norm(x)
-        # Depthwise conv over sequence: [B, T, D] -> [B, D, T] -> conv -> [B, T, D]
-        h = h.transpose(1, 2)
-        h = F.pad(h, (4, 0))   # causal left pad only — prevents future-token leakage
-        h = self.dw_conv(h.to(dtype=self.dw_conv.weight.dtype))
-        h = h.to(dtype=x.dtype).transpose(1, 2)
-        # GLU gating via pointwise expansion
-        h = self.pw_expand(h)
-        a, b = h.chunk(2, dim=-1)
-        h = a * torch.sigmoid(b)
-        h = self.pw_proj(h)
-        return x + self.local_scale.to(dtype=x.dtype)[None, None, :] * h
-
-
 class GPT(nn.Module):
     """Bigram-residual transformer.
 
     Architecture: low-rank bigram logit base + compact transformer residual.
     Input to the transformer is token embeddings only (no hidden-space n-gram augmentation).
+    Additive trigram-mul head: vocab_projection(embed1(x[t-1]) * embed2(x[t-2])) scaled by trigram_mul_weight.
     """
     def __init__(
         self,
@@ -985,6 +955,7 @@ class GPT(nn.Module):
         bigram_rank: int = 64,
         use_multilag_bigram: bool = True,
         bigram_lags: list[int] | None = None,
+        trigram_mul_rank: int = 16,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1027,13 +998,9 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         mlp_mults = [mlp_mult] * n_blocks
 
-        _local_mix_idx = self.num_encoder_layers
-        _blocks: list[nn.Module] = []
-        for i in range(n_blocks):
-            if i == _local_mix_idx:
-                _blocks.append(LocalMixBlock(model_dim))
-            else:
-                _blocks.append(Block(
+        self.blocks = nn.ModuleList(
+            [
+                Block(
                     model_dim,
                     num_heads,
                     num_kv_heads,
@@ -1041,10 +1008,20 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     rope_partial_dims,
-                ))
-        self.blocks = nn.ModuleList(_blocks)
+                )
+                for i in range(n_blocks)
+            ]
+        )
         self.final_norm = RMSNorm()
         self.lm_head = None
+
+        # Trigram-mul: tiny ordered multiplicative (t-1, t-2) interaction head.
+        # full_logits += trigram_mul_weight * (trigram_prev1[t-1] * trigram_prev2[t-2]) @ trigram_out.T
+        self.trigram_mul_rank = trigram_mul_rank
+        self.trigram_prev1 = nn.Parameter(torch.zeros(vocab_size, trigram_mul_rank))
+        self.trigram_prev2 = nn.Parameter(torch.zeros(vocab_size, trigram_mul_rank))
+        self.trigram_out = nn.Parameter(torch.zeros(vocab_size, trigram_mul_rank))
+        self.trigram_mul_weight = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
 
         self._init_weights()
 
@@ -1055,12 +1032,17 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+        nn.init.normal_(self.trigram_prev1, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram_prev2, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram_out, mean=0.0, std=0.002)
+
 
     def _compute_logits(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
         """Shared forward computation.
 
         Bigram-residual architecture:
           - bigram base: low-rank prev_factors @ next_factors.T
+          - trigram-mul additive term: weight * (embed1[t-1] * embed2[t-2]) @ out.T
           - transformer residual: small correction on top of bigram base
           - transformer input: token embeddings only
 
@@ -1102,6 +1084,18 @@ class GPT(nn.Module):
             logits_i = prev_f.reshape(-1, self.bigram_rank) @ self.bigram_next_factors[i].to(prev_f.dtype).T  # [B*T, V]
             w = self.bigram_lag_weights[i].to(dtype=logits_i.dtype)
             bigram_flat = bigram_flat + w * logits_i
+
+        # Trigram-mul: ordered multiplicative (t-1, t-2) interaction head.
+        # Adds: trigram_mul_weight * (trigram_prev1[x[t-1]] * trigram_prev2[x[t-2]]) @ trigram_out.T
+        pad1 = torch.zeros(B, 1, dtype=input_ids.dtype, device=input_ids.device)
+        prev1_ids = torch.cat([pad1, input_ids[:, :-1]], dim=1)   # [B, T]
+        pad2 = torch.zeros(B, 2, dtype=input_ids.dtype, device=input_ids.device)
+        prev2_ids = torch.cat([pad2, input_ids[:, :-2]], dim=1)    # [B, T]
+        h1 = self.trigram_prev1[prev1_ids]                          # [B, T, R]
+        h2 = self.trigram_prev2[prev2_ids]                          # [B, T, R]
+        h = h1 * h2                                                  # [B, T, R]
+        trigram_mul_logits = h.reshape(-1, self.trigram_mul_rank) @ self.trigram_out.to(h.dtype).T  # [B*T, V]
+        bigram_flat = bigram_flat + self.trigram_mul_weight.to(trigram_mul_logits.dtype) * trigram_mul_logits
 
         full_logits = self.transformer_scale * transformer_logits + bigram_flat
         return full_logits, bigram_flat  # [B*T, V], [B*T, V]
@@ -1245,6 +1239,7 @@ def main() -> None:
         bigram_rank=args.bigram_rank,
         use_multilag_bigram=args.use_multilag_bigram,
         bigram_lags=args.bigram_lags,
+        trigram_mul_rank=args.trigram_mul_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1281,6 +1276,7 @@ def main() -> None:
             logit_sharpen=args.logit_sharpen, rope_partial_dims=args.rope_partial_dims,
             encoder_layer_frac=args.encoder_layer_frac, bigram_rank=args.bigram_rank,
             use_multilag_bigram=args.use_multilag_bigram, bigram_lags=args.bigram_lags,
+            trigram_mul_rank=args.trigram_mul_rank,
         ).to(device).bfloat16()
         teacher_model.load_state_dict(teacher_sd, strict=False)
         teacher_model.eval()
@@ -1300,15 +1296,14 @@ def main() -> None:
 
     # Optimizer split:
     # - token embedding uses TIED_EMBED_LR via Adam
-    # - matrix params (ndim==2) in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars (ndim<2) and control tensors use SCALAR_LR via Adam
-    # - 3D weights (e.g. LocalMixBlock.dw_conv.weight [D,1,K]) use SCALAR_LR via Adam;
-    #   bigram_prev/next_factors (also 3D) are excluded as they are frozen / handled separately
+    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    #   (includes trigram_prev1, trigram_prev2, trigram_out which are 2D)
+    # - vectors/scalars use SCALAR_LR via Adam
+    #   (includes trigram_mul_weight which is 0D)
     # - bigram_prev/next_factors are frozen after initialization and excluded from all optimizers
     named_params = list(base_model.named_parameters())
 
     _SKIP_MATRIX_NAMES = {"tok_emb.weight", "bigram_prev_factors", "bigram_next_factors", "bigram_lag_weights"}
-    _BIGRAM_FACTOR_NAMES = {"bigram_prev_factors", "bigram_next_factors"}
 
     matrix_params = [
         p for name, p in named_params
@@ -1320,9 +1315,7 @@ def main() -> None:
 
     scalar_params = [
         p for name, p in named_params
-        if (p.ndim < 2
-            or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-            or (p.ndim > 2 and name not in _BIGRAM_FACTOR_NAMES))
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         and p.requires_grad
     ]
     token_lr = args.tied_embed_lr
@@ -1362,8 +1355,8 @@ def main() -> None:
     n_enc = base_model.num_encoder_layers
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
-    log0(f"local_mix:enabled replace_block_index:{base_model.num_encoder_layers} kernel_size:5")
     log0("bigram_gate:disabled")
+    log0(f"trigram_mul:enabled rank:{args.trigram_mul_rank} weight_init:0.25")
     if args.use_multilag_bigram:
         log0(f"multilag_bigram:enabled lags={args.bigram_lags}")
     else:
