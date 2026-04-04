@@ -808,15 +808,15 @@ class GPT(nn.Module):
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
-        # Multilag bigram: lags [1,2,4], SVD-initialized on lag-0, others zero-init.
+        # Multilag bigram: lags [1,2,4], SVD-initialized on lag-1 slot (index 0), others small-random init.
         self.bigram_lags = bigram_lags if bigram_lags is not None else [1]
         num_lags = len(self.bigram_lags)
         self.bigram_prev = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
         self.bigram_next = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
-        _lag_w = torch.tensor([1.0, 0.10, 0.05], dtype=torch.float32)
+        _lag_w = torch.tensor([1.0, 0.18, 0.07], dtype=torch.float32)
         if num_lags != 3:
             _lag_w = torch.ones(num_lags, dtype=torch.float32)
-            _lag_w[1:] *= 0.1
+            _lag_w[1:] *= 0.15
         self.bigram_lag_weights = nn.Parameter(_lag_w)
         self.bigram_scale = nn.Parameter(torch.tensor(bigram_base_scale))
 
