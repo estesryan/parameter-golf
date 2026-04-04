@@ -1,6 +1,6 @@
 """
 Bigram-Residual Transformer — parameter-golf submission.
-pruned10_trigrammul_dominant
+pruned11_multitrigram
 
 Structured residual language model: low-rank bigram base + compact transformer residual.
 
@@ -21,7 +21,7 @@ Architecture:
   - Optional distillation (USE_DISTILLATION): CE loss on full logits; KL loss on residual logits only
     (residual = full_logits − that model's own bigram base, so the shared corpus statistic is factored out)
   - QAT modes: off | late | progressive (start fake-int6 at QAT_START_FRAC of training budget)
-  - Trigram-dominant ordered multiplicative (t-1, t-2) interaction head with reduced bigram base scale
+  - Three ordered low-rank interaction heads added to the base logits: (t-1,t-2), (t-1,t-3), (t-2,t-3)
 
 Ablation note: the hidden-space hashed n-gram module (previously K independent hash tables summed
 into the transformer input) was found to contribute no measurable quality improvement.
@@ -154,9 +154,13 @@ class Hyperparameters:
     distill_temperature = float(os.environ.get("DISTILL_TEMPERATURE", 1.5))
     distill_teacher_path = os.environ.get("DISTILL_TEACHER_PATH", "")
 
-    # --- Trigram-mul: tiny ordered multiplicative (t-1, t-2) interaction head ---
-    trigram_mul_rank = int(os.environ.get("TRIGRAM_MUL_RANK", 32))
-    trigram_mul_weight_init = float(os.environ.get("TRIGRAM_MUL_WEIGHT_INIT", 0.7))
+    # --- Multi-trigram: three ordered low-rank interaction heads ---
+    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 16))
+    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 12))
+    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 8))
+    trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.60))
+    trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.30))
+    trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.30))
     bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.5))
 
 # -----------------------------
@@ -937,7 +941,7 @@ class GPT(nn.Module):
 
     Architecture: low-rank bigram logit base + compact transformer residual.
     Input to the transformer is token embeddings only (no hidden-space n-gram augmentation).
-    Additive trigram-mul head: vocab_projection(embed1(x[t-1]) * embed2(x[t-2])) scaled by trigram_mul_weight.
+    Three ordered low-rank interaction heads: (t-1,t-2), (t-1,t-3), (t-2,t-3).
     """
     def __init__(
         self,
@@ -957,8 +961,12 @@ class GPT(nn.Module):
         bigram_rank: int = 64,
         use_multilag_bigram: bool = True,
         bigram_lags: list[int] | None = None,
-        trigram_mul_rank: int = 32,
-        trigram_mul_weight_init: float = 0.7,
+        trigram12_rank: int = 16,
+        trigram13_rank: int = 12,
+        trigram23_rank: int = 8,
+        trigram12_weight_init: float = 0.60,
+        trigram13_weight_init: float = 0.30,
+        trigram23_weight_init: float = 0.30,
         bigram_base_scale: float = 0.5,
     ):
         super().__init__()
@@ -1019,13 +1027,29 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm()
         self.lm_head = None
 
-        # Trigram-mul: ordered multiplicative (t-1, t-2) interaction head.
-        # This variant intentionally makes the trigram signal stronger and scales the additive bigram base down.
-        self.trigram_mul_rank = trigram_mul_rank
-        self.trigram_prev1 = nn.Parameter(torch.zeros(vocab_size, trigram_mul_rank))
-        self.trigram_prev2 = nn.Parameter(torch.zeros(vocab_size, trigram_mul_rank))
-        self.trigram_out = nn.Parameter(torch.zeros(vocab_size, trigram_mul_rank))
-        self.trigram_mul_weight = nn.Parameter(torch.tensor(trigram_mul_weight_init, dtype=torch.float32))
+        # Multi-trigram: three ordered low-rank interaction heads.
+        # head12: (t-1, t-2), head13: (t-1, t-3), head23: (t-2, t-3)
+        self.trigram12_prev_a = nn.Parameter(torch.zeros(vocab_size, trigram12_rank))
+        self.trigram12_prev_b = nn.Parameter(torch.zeros(vocab_size, trigram12_rank))
+        self.trigram12_mix_a = nn.Parameter(torch.zeros(trigram12_rank, trigram12_rank))
+        self.trigram12_mix_b = nn.Parameter(torch.zeros(trigram12_rank, trigram12_rank))
+        self.trigram12_out = nn.Parameter(torch.zeros(vocab_size, trigram12_rank))
+        self.trigram12_weight = nn.Parameter(torch.tensor(trigram12_weight_init, dtype=torch.float32))
+
+        self.trigram13_prev_a = nn.Parameter(torch.zeros(vocab_size, trigram13_rank))
+        self.trigram13_prev_b = nn.Parameter(torch.zeros(vocab_size, trigram13_rank))
+        self.trigram13_mix_a = nn.Parameter(torch.zeros(trigram13_rank, trigram13_rank))
+        self.trigram13_mix_b = nn.Parameter(torch.zeros(trigram13_rank, trigram13_rank))
+        self.trigram13_out = nn.Parameter(torch.zeros(vocab_size, trigram13_rank))
+        self.trigram13_weight = nn.Parameter(torch.tensor(trigram13_weight_init, dtype=torch.float32))
+
+        self.trigram23_prev_a = nn.Parameter(torch.zeros(vocab_size, trigram23_rank))
+        self.trigram23_prev_b = nn.Parameter(torch.zeros(vocab_size, trigram23_rank))
+        self.trigram23_mix_a = nn.Parameter(torch.zeros(trigram23_rank, trigram23_rank))
+        self.trigram23_mix_b = nn.Parameter(torch.zeros(trigram23_rank, trigram23_rank))
+        self.trigram23_out = nn.Parameter(torch.zeros(vocab_size, trigram23_rank))
+        self.trigram23_weight = nn.Parameter(torch.tensor(trigram23_weight_init, dtype=torch.float32))
+
         self.bigram_base_scale = nn.Parameter(torch.tensor(bigram_base_scale, dtype=torch.float32))
 
         self._init_weights()
@@ -1037,9 +1061,21 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-        nn.init.normal_(self.trigram_prev1, mean=0.0, std=0.002)
-        nn.init.normal_(self.trigram_prev2, mean=0.0, std=0.002)
-        nn.init.normal_(self.trigram_out, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram12_prev_a, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram12_prev_b, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram12_mix_a, mean=0.0, std=0.02)
+        nn.init.normal_(self.trigram12_mix_b, mean=0.0, std=0.02)
+        nn.init.normal_(self.trigram12_out, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram13_prev_a, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram13_prev_b, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram13_mix_a, mean=0.0, std=0.02)
+        nn.init.normal_(self.trigram13_mix_b, mean=0.0, std=0.02)
+        nn.init.normal_(self.trigram13_out, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram23_prev_a, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram23_prev_b, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram23_mix_a, mean=0.0, std=0.02)
+        nn.init.normal_(self.trigram23_mix_b, mean=0.0, std=0.02)
+        nn.init.normal_(self.trigram23_out, mean=0.0, std=0.002)
 
 
     def _compute_logits(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
@@ -1092,17 +1128,42 @@ class GPT(nn.Module):
 
         bigram_flat = self.bigram_base_scale.to(dtype=bigram_flat.dtype) * bigram_flat
 
-        # Trigram-mul: ordered multiplicative (t-1, t-2) interaction head.
-        # Adds: trigram_mul_weight * (trigram_prev1[x[t-1]] * trigram_prev2[x[t-2]]) @ trigram_out.T
+        # Multi-trigram: three ordered low-rank interaction heads.
         pad1 = torch.zeros(B, 1, dtype=input_ids.dtype, device=input_ids.device)
-        prev1_ids = torch.cat([pad1, input_ids[:, :-1]], dim=1)   # [B, T]
+        prev1_ids = torch.cat([pad1, input_ids[:, :-1]], dim=1)    # [B, T]
         pad2 = torch.zeros(B, 2, dtype=input_ids.dtype, device=input_ids.device)
         prev2_ids = torch.cat([pad2, input_ids[:, :-2]], dim=1)    # [B, T]
-        h1 = self.trigram_prev1[prev1_ids]                          # [B, T, R]
-        h2 = self.trigram_prev2[prev2_ids]                          # [B, T, R]
-        h = h1 * h2                                                  # [B, T, R]
-        trigram_mul_logits = h.reshape(-1, self.trigram_mul_rank) @ self.trigram_out.to(h.dtype).T  # [B*T, V]
-        bigram_flat = bigram_flat + self.trigram_mul_weight.to(trigram_mul_logits.dtype) * trigram_mul_logits
+        pad3 = torch.zeros(B, 3, dtype=input_ids.dtype, device=input_ids.device)
+        prev3_ids = torch.cat([pad3, input_ids[:, :-3]], dim=1)    # [B, T]
+
+        # head12: (t-1, t-2)
+        h12a = self.trigram12_prev_a[prev1_ids]                    # [B, T, R12]
+        h12b = self.trigram12_prev_b[prev2_ids]
+        h12a_m = h12a @ self.trigram12_mix_a.to(h12a.dtype)
+        h12b_m = h12b @ self.trigram12_mix_b.to(h12b.dtype)
+        z12 = h12a_m * h12b_m
+        logits12 = z12.reshape(-1, z12.size(-1)) @ self.trigram12_out.to(z12.dtype).T   # [B*T, V]
+
+        # head13: (t-1, t-3)
+        h13a = self.trigram13_prev_a[prev1_ids]                    # [B, T, R13]
+        h13b = self.trigram13_prev_b[prev3_ids]
+        h13a_m = h13a @ self.trigram13_mix_a.to(h13a.dtype)
+        h13b_m = h13b @ self.trigram13_mix_b.to(h13b.dtype)
+        z13 = h13a_m * h13b_m
+        logits13 = z13.reshape(-1, z13.size(-1)) @ self.trigram13_out.to(z13.dtype).T   # [B*T, V]
+
+        # head23: (t-2, t-3)
+        h23a = self.trigram23_prev_a[prev2_ids]                    # [B, T, R23]
+        h23b = self.trigram23_prev_b[prev3_ids]
+        h23a_m = h23a @ self.trigram23_mix_a.to(h23a.dtype)
+        h23b_m = h23b @ self.trigram23_mix_b.to(h23b.dtype)
+        z23 = h23a_m * h23b_m
+        logits23 = z23.reshape(-1, z23.size(-1)) @ self.trigram23_out.to(z23.dtype).T   # [B*T, V]
+
+        bigram_flat = (bigram_flat
+            + self.trigram12_weight.to(logits12.dtype) * logits12
+            + self.trigram13_weight.to(logits13.dtype) * logits13
+            + self.trigram23_weight.to(logits23.dtype) * logits23)
 
         full_logits = self.transformer_scale * transformer_logits + bigram_flat
         return full_logits, bigram_flat  # [B*T, V], [B*T, V]
@@ -1246,8 +1307,12 @@ def main() -> None:
         bigram_rank=args.bigram_rank,
         use_multilag_bigram=args.use_multilag_bigram,
         bigram_lags=args.bigram_lags,
-        trigram_mul_rank=args.trigram_mul_rank,
-        trigram_mul_weight_init=args.trigram_mul_weight_init,
+        trigram12_rank=args.trigram12_rank,
+        trigram13_rank=args.trigram13_rank,
+        trigram23_rank=args.trigram23_rank,
+        trigram12_weight_init=args.trigram12_weight_init,
+        trigram13_weight_init=args.trigram13_weight_init,
+        trigram23_weight_init=args.trigram23_weight_init,
         bigram_base_scale=args.bigram_base_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -1285,8 +1350,11 @@ def main() -> None:
             logit_sharpen=args.logit_sharpen, rope_partial_dims=args.rope_partial_dims,
             encoder_layer_frac=args.encoder_layer_frac, bigram_rank=args.bigram_rank,
             use_multilag_bigram=args.use_multilag_bigram, bigram_lags=args.bigram_lags,
-            trigram_mul_rank=args.trigram_mul_rank,
-            trigram_mul_weight_init=args.trigram_mul_weight_init,
+            trigram12_rank=args.trigram12_rank, trigram13_rank=args.trigram13_rank,
+            trigram23_rank=args.trigram23_rank,
+            trigram12_weight_init=args.trigram12_weight_init,
+            trigram13_weight_init=args.trigram13_weight_init,
+            trigram23_weight_init=args.trigram23_weight_init,
             bigram_base_scale=args.bigram_base_scale,
         ).to(device).bfloat16()
         teacher_model.load_state_dict(teacher_sd, strict=False)
@@ -1308,9 +1376,9 @@ def main() -> None:
     # Optimizer split:
     # - token embedding uses TIED_EMBED_LR via Adam
     # - matrix params in transformer blocks use MATRIX_LR via Muon
-    #   (includes trigram_prev1, trigram_prev2, trigram_out which are 2D)
+    #   (includes all trigram prev_a/prev_b/out matrices which are 2D)
     # - vectors/scalars use SCALAR_LR via Adam
-    #   (includes trigram_mul_weight which is 0D)
+    #   (includes trigram12/13/23_weight which are 0D)
     # - bigram_prev/next_factors are frozen after initialization and excluded from all optimizers
     named_params = list(base_model.named_parameters())
 
@@ -1367,7 +1435,12 @@ def main() -> None:
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
     log0("bigram_gate:disabled")
-    log0(f"trigram_mul:enabled rank:{args.trigram_mul_rank} weight_init:{args.trigram_mul_weight_init}")
+    log0(
+        f"multitrigram:enabled "
+        f"head12_rank:{args.trigram12_rank} weight_init:{args.trigram12_weight_init} "
+        f"head13_rank:{args.trigram13_rank} weight_init:{args.trigram13_weight_init} "
+        f"head23_rank:{args.trigram23_rank} weight_init:{args.trigram23_weight_init}"
+    )
     log0(f"bigram_base_scale:init:{args.bigram_base_scale}")
     if args.use_multilag_bigram:
         log0(f"multilag_bigram:enabled lags={args.bigram_lags}")
