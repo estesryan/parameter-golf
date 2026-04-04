@@ -1,11 +1,5 @@
 """
-Bigram-Residual Transformer — parameter-golf submission.
-
 Structured residual language model: low-rank bigram base + compact transformer residual.
-
-Motivating data analysis:
-  - Bigram mutual information: 2.57 bits (29.7% of uncertainty resolved by prior token)
-  - Position-level entropy is completely flat across all 1024 positions (variance < 0.01 bits)
 
 Architecture:
   - Low-rank bigram logit model: initialized via truncated SVD of corpus bigram counts (rank R).
@@ -20,11 +14,8 @@ Architecture:
   - Optional distillation (USE_DISTILLATION): CE loss on full logits; KL loss on residual logits only
     (residual = full_logits − that model's own bigram base, so the shared corpus statistic is factored out)
   - QAT modes: off | late | progressive (start fake-int6 at QAT_START_FRAC of training budget)
-
-Ablation note: the hidden-space hashed n-gram module (previously K independent hash tables summed
-into the transformer input) was found to contribute no measurable quality improvement.
-bigram_only == bigram_plus_ngram; transformer_plus_ngram == no_bigram. The n-gram input path has
-been removed. The real model is: low-rank bigram base + transformer residual.
+  - Shared multi-trigram interaction module: three ordered pair interactions (t-1,t-2), (t-1,t-3),
+    (t-2,t-3) through a shared latent space with one output projection to vocab.
 """
 
 from __future__ import annotations
@@ -42,17 +33,11 @@ import uuid
 import zlib
 from pathlib import Path
 
-# Import zstandard for better compression than zlib, installing if needed
 try:
     import zstandard as zstd
     HAS_ZSTD = True
 except ImportError:
-    subprocess.run(["pip", "install", "zstandard", "-q"], check=False)
-    try:
-        import zstandard as zstd
-        HAS_ZSTD = True
-    except ImportError:
-        HAS_ZSTD = False
+    HAS_ZSTD = False
 
 import numpy as np
 import sentencepiece as spm
@@ -142,14 +127,22 @@ class Hyperparameters:
     qat_mode = os.environ.get("QAT_MODE", "progressive")
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.6))
 
-    # --- Feature gate: per-channel gating of transformer representation before projection ---
-    use_feature_gate = bool(int(os.environ.get("USE_FEATURE_GATE", "1")))
+    # --- Multi-lag bigram: sum of low-rank bigram bases at lags [1, 2, 4, 8, 16] ---
+    use_multilag_bigram = bool(int(os.environ.get("USE_MULTILAG_BIGRAM", "1")))
+    bigram_lags = [1, 2, 4, 8, 16]
 
     # --- Distillation: CE on full logits + KL on residual logits (residual = full − bigram_base) ---
     use_distillation = bool(int(os.environ.get("USE_DISTILLATION", "0")))
     distill_alpha = float(os.environ.get("DISTILL_ALPHA", 0.7))
     distill_temperature = float(os.environ.get("DISTILL_TEMPERATURE", 1.5))
     distill_teacher_path = os.environ.get("DISTILL_TEACHER_PATH", "")
+
+    # --- Shared multi-trigram: one latent space for all three ordered pair interactions ---
+    trigram_rank = int(os.environ.get("TRIGRAM_RANK", 16))
+    trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.60))
+    trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.30))
+    trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.30))
+    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.5))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -300,116 +293,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
-
-## TODO: DELETE
-@torch.inference_mode()
-def eval_val_context_ablation(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    keep_last_n: int,
-) -> tuple[float, float]:
-    if keep_last_n <= 0 or keep_last_n > args.train_seq_len:
-        raise ValueError(f"keep_last_n must be in [1, {args.train_seq_len}]")
-
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
-
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    model.eval()
-    with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-
-            x_full = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
-
-            x_eval = x_full.clone()
-            prefix_len = args.train_seq_len - keep_last_n
-            if prefix_len > 0:
-                x_eval[:, :prefix_len] = 0
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                full_logits, _ = model._compute_logits(x_eval)
-
-            logits = full_logits.float().view(-1, args.vocab_size)
-            targets = y.reshape(-1)
-
-            per_tok_nll = -F.log_softmax(logits * model.logit_sharpen, dim=-1).gather(
-                -1, targets.unsqueeze(-1)
-            ).squeeze(-1)
-
-            loss_mask = torch.zeros_like(y, dtype=torch.bool)
-            loss_mask[:, prefix_len:] = True
-            flat_mask = loss_mask.reshape(-1)
-
-            val_loss_sum += per_tok_nll[flat_mask].sum().to(torch.float64)
-            val_token_count += float(flat_mask.sum().item())
-
-            prev_ids = x_full.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes[flat_mask].to(torch.float64).sum()
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-
-def run_context_ablation(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    log0,
-    keep_list=(2, 4, 8, 16, 32, 64, 128),
-):
-    full_loss, full_bpb = eval_val(
-        args, model, rank, world_size, device, grad_accum_steps,
-        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
-    )
-    log0(f"context_ablation keep=full val_loss:{full_loss:.8f} val_bpb:{full_bpb:.8f}")
-    for n in keep_list:
-        loss, bpb = eval_val_context_ablation(
-            args, model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            keep_last_n=n,
-        )
-        log0(
-            f"context_ablation keep={n} val_loss:{loss:.8f} val_bpb:{bpb:.8f} "
-            f"delta_loss:{loss - full_loss:+.8f} delta_bpb:{bpb - full_bpb:+.8f}"
-        )
-# END TODO: DELETE
 
 def eval_val(
     args: Hyperparameters,
@@ -929,6 +812,8 @@ class GPT(nn.Module):
 
     Architecture: low-rank bigram logit base + compact transformer residual.
     Input to the transformer is token embeddings only (no hidden-space n-gram augmentation).
+    Shared multi-trigram module: three ordered pair interactions (t-1,t-2), (t-1,t-3), (t-2,t-3)
+    through shared latent token factors and a single output projection.
     """
     def __init__(
         self,
@@ -946,7 +831,13 @@ class GPT(nn.Module):
         rope_partial_dims: int = 8,
         encoder_layer_frac: float = 0.35,
         bigram_rank: int = 64,
-        use_feature_gate: bool = True,
+        use_multilag_bigram: bool = True,
+        bigram_lags: list[int] | None = None,
+        trigram_rank: int = 16,
+        trigram12_weight_init: float = 0.60,
+        trigram13_weight_init: float = 0.30,
+        trigram23_weight_init: float = 0.30,
+        bigram_base_scale: float = 0.5,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -956,12 +847,19 @@ class GPT(nn.Module):
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
-        # Low-rank bigram logit base: prev_factors @ next_factors.T ≈ log P(next|prev).
-        # Initialized from corpus SVD, frozen by default (BIGRAM_TRAINABLE=0).
+        # Multi-lag low-rank bigram base: sum_i alpha_i * bigram_i(token_{t-lag_i}).
+        # Lag-1 factors initialized from corpus SVD; other lag factors zero-initialized.
         # Kept in fp32 for precision; cast to compute dtype in _compute_logits like CastedLinear.
         self.bigram_rank = bigram_rank
-        self.bigram_prev_factors = nn.Parameter(torch.zeros(vocab_size, bigram_rank))
-        self.bigram_next_factors = nn.Parameter(torch.zeros(vocab_size, bigram_rank))
+        self.bigram_lags: list[int] = bigram_lags if (use_multilag_bigram and bigram_lags is not None) else [1]
+        self.use_multilag_bigram = use_multilag_bigram
+        num_lags = len(self.bigram_lags)
+        self.bigram_prev_factors = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
+        self.bigram_next_factors = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
+        # Lag weights: init [1, 0, 0, ...] so model starts identical to single-lag baseline.
+        _lag_w = torch.zeros(num_lags, dtype=torch.float32)
+        _lag_w[0] = 1.0
+        self.bigram_lag_weights = nn.Parameter(_lag_w)
 
         # Distillation teacher — set externally before training, not part of state_dict.
         self._teacher: "GPT | None" = None
@@ -969,14 +867,6 @@ class GPT(nn.Module):
         self._distill_temperature: float = 1.5
 
         self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
-
-        # Per-channel feature gate applied to transformer representation before projection.
-        # gate → 0 at init (zero weights) → exact baseline behavior at step 0.
-        if use_feature_gate:
-            self.feature_gate_proj = nn.Linear(model_dim, model_dim, bias=False)
-            self.feature_gate_proj._zero_init = True
-        else:
-            self.feature_gate_proj = None
 
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
@@ -1007,6 +897,20 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm()
         self.lm_head = None
 
+        # Shared multi-trigram interaction module: one latent space for all three ordered pairs.
+        # Pair interactions (t-1,t-2), (t-1,t-3), (t-2,t-3) share token factors and output projection;
+        # scalar weights learn the relative contribution of each pair.
+        self.trigram_prev_a = nn.Parameter(torch.zeros(vocab_size, trigram_rank))
+        self.trigram_prev_b = nn.Parameter(torch.zeros(vocab_size, trigram_rank))
+        self.trigram_mix_a = nn.Parameter(torch.zeros(trigram_rank, trigram_rank))
+        self.trigram_mix_b = nn.Parameter(torch.zeros(trigram_rank, trigram_rank))
+        self.trigram_out = nn.Parameter(torch.zeros(vocab_size, trigram_rank))
+        self.trigram12_weight = nn.Parameter(torch.tensor(trigram12_weight_init, dtype=torch.float32))
+        self.trigram13_weight = nn.Parameter(torch.tensor(trigram13_weight_init, dtype=torch.float32))
+        self.trigram23_weight = nn.Parameter(torch.tensor(trigram23_weight_init, dtype=torch.float32))
+
+        self.bigram_base_scale = nn.Parameter(torch.tensor(bigram_base_scale, dtype=torch.float32))
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1016,12 +920,19 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+        nn.init.normal_(self.trigram_prev_a, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram_prev_b, mean=0.0, std=0.002)
+        nn.init.normal_(self.trigram_mix_a, mean=0.0, std=0.02)
+        nn.init.normal_(self.trigram_mix_b, mean=0.0, std=0.02)
+        nn.init.normal_(self.trigram_out, mean=0.0, std=0.002)
+
 
     def _compute_logits(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
         """Shared forward computation.
 
         Bigram-residual architecture:
           - bigram base: low-rank prev_factors @ next_factors.T
+          - trigram-mul additive term: weight * (embed1[t-1] * embed2[t-2]) @ out.T
           - transformer residual: small correction on top of bigram base
           - transformer input: token embeddings only
 
@@ -1043,24 +954,57 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x_norm = self.final_norm(x)
-
-        # Per-channel feature gate: modulates which transformer features override bigram.
-        # gate → 0 at init (zero weights) → x_mod == x_norm at step 0.
-        if self.feature_gate_proj is not None:
-            gate = torch.tanh(self.feature_gate_proj(x_norm))  # [B, T, C]
-            x_mod = x_norm * (1.0 + gate)
-        else:
-            x_mod = x_norm
-
-        x_flat = x_mod.reshape(-1, x_norm.size(-1))
+        x_flat = x_norm.reshape(-1, x.size(-1))
         logits_proj = F.linear(x_flat, self.tok_emb.weight)
         transformer_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-        # Low-rank bigram base: prev_factors[t] @ next_factors.T — never materializes full [V×V].
-        prev_f = self.bigram_prev_factors[input_ids]  # [B, T, R]
-        bigram_flat = prev_f.reshape(-1, self.bigram_rank) @ self.bigram_next_factors.to(prev_f.dtype).T
+        # Multi-lag low-rank bigram base: sum_i weight_i * (prev_factors_i[t-lag_i] @ next_factors_i.T).
+        # Never materializes full [V×V]; each lag contributes [B*T, V] logits.
+        B, T = input_ids.shape
+        vocab_size = self.bigram_prev_factors.shape[1]
+        # fp32 accumulator — matches factor dtype; consistent with original single-lag behavior.
+        bigram_flat = torch.zeros(B * T, vocab_size, device=input_ids.device, dtype=torch.float32)
+        for i, lag in enumerate(self.bigram_lags):
+            if lag == 0:
+                prev_ids = input_ids
+            else:
+                pad = torch.zeros(B, lag, dtype=input_ids.dtype, device=input_ids.device)
+                prev_ids = torch.cat([pad, input_ids[:, :-lag]], dim=1)  # [B, T]
+            prev_f = self.bigram_prev_factors[i][prev_ids]  # [B, T, R]
+            logits_i = prev_f.reshape(-1, self.bigram_rank) @ self.bigram_next_factors[i].to(prev_f.dtype).T  # [B*T, V]
+            w = self.bigram_lag_weights[i].to(dtype=logits_i.dtype)
+            bigram_flat = bigram_flat + w * logits_i
 
-        full_logits = bigram_flat + self.transformer_scale * transformer_logits
+        bigram_flat = self.bigram_base_scale.to(dtype=bigram_flat.dtype) * bigram_flat
+
+        # Shared multi-trigram interaction module.
+        # Build shifted context ids for lags 1, 2, 3.
+        pad1 = torch.zeros(B, 1, dtype=input_ids.dtype, device=input_ids.device)
+        pad2 = torch.zeros(B, 2, dtype=input_ids.dtype, device=input_ids.device)
+        pad3 = torch.zeros(B, 3, dtype=input_ids.dtype, device=input_ids.device)
+        prev1_ids = torch.cat([pad1, input_ids[:, :-1]], dim=1)  # [B, T]
+        prev2_ids = torch.cat([pad2, input_ids[:, :-2]], dim=1)  # [B, T]
+        prev3_ids = torch.cat([pad3, input_ids[:, :-3]], dim=1)  # [B, T]
+
+        # Shared projected factors for each lag via the same token embedding matrices.
+        _dt = bigram_flat.dtype
+        mix_a = self.trigram_mix_a.to(_dt)
+        mix_b = self.trigram_mix_b.to(_dt)
+        ma1 = self.trigram_prev_a[prev1_ids].to(_dt) @ mix_a  # [B, T, R]
+        ma2 = self.trigram_prev_a[prev2_ids].to(_dt) @ mix_a  # [B, T, R]
+        mb2 = self.trigram_prev_b[prev2_ids].to(_dt) @ mix_b  # [B, T, R]
+        mb3 = self.trigram_prev_b[prev3_ids].to(_dt) @ mix_b  # [B, T, R]
+
+        # Weighted sum of latent pair interactions; single projection to vocab.
+        w12 = self.trigram12_weight.to(_dt)
+        w13 = self.trigram13_weight.to(_dt)
+        w23 = self.trigram23_weight.to(_dt)
+        z = w12 * (ma1 * mb2) + w13 * (ma1 * mb3) + w23 * (ma2 * mb3)  # [B, T, R]
+        trigram_logits = z.reshape(-1, z.size(-1)) @ self.trigram_out.to(_dt).T  # [B*T, V]
+
+        bigram_flat = bigram_flat + trigram_logits
+
+        full_logits = self.transformer_scale * transformer_logits + bigram_flat
         return full_logits, bigram_flat  # [B*T, V], [B*T, V]
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1200,7 +1144,13 @@ def main() -> None:
         rope_partial_dims=args.rope_partial_dims,
         encoder_layer_frac=args.encoder_layer_frac,
         bigram_rank=args.bigram_rank,
-        use_feature_gate=args.use_feature_gate,
+        use_multilag_bigram=args.use_multilag_bigram,
+        bigram_lags=args.bigram_lags,
+        trigram_rank=args.trigram_rank,
+        trigram12_weight_init=args.trigram12_weight_init,
+        trigram13_weight_init=args.trigram13_weight_init,
+        trigram23_weight_init=args.trigram23_weight_init,
+        bigram_base_scale=args.bigram_base_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1213,11 +1163,13 @@ def main() -> None:
 
     log0(f"building_bigram_factors rank={args.bigram_rank}...")
     prev_factors, next_factors = build_bigram_factors(args.train_files, args.vocab_size, args.bigram_rank)
-    base_model.bigram_prev_factors.data.copy_(prev_factors.float())
-    base_model.bigram_next_factors.data.copy_(next_factors.float())
+    # Initialize lag-0 (lag=1) with SVD factors; other lags stay zero-initialized.
+    base_model.bigram_prev_factors.data[0].copy_(prev_factors.float())
+    base_model.bigram_next_factors.data[0].copy_(next_factors.float())
     bigram_init_prev = prev_factors.float().to(device=device)
     bigram_init_next = next_factors.float().to(device=device)
     if not args.bigram_trainable:
+        # Freeze factor tensors; bigram_lag_weights remains trainable via scalar optimizer.
         base_model.bigram_prev_factors.requires_grad_(False)
         base_model.bigram_next_factors.requires_grad_(False)
     base_model.has_leading_space_lut.copy_(has_leading_space_lut)
@@ -1234,7 +1186,12 @@ def main() -> None:
             rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
             logit_sharpen=args.logit_sharpen, rope_partial_dims=args.rope_partial_dims,
             encoder_layer_frac=args.encoder_layer_frac, bigram_rank=args.bigram_rank,
-            use_feature_gate=args.use_feature_gate,
+            use_multilag_bigram=args.use_multilag_bigram, bigram_lags=args.bigram_lags,
+            trigram_rank=args.trigram_rank,
+            trigram12_weight_init=args.trigram12_weight_init,
+            trigram13_weight_init=args.trigram13_weight_init,
+            trigram23_weight_init=args.trigram23_weight_init,
+            bigram_base_scale=args.bigram_base_scale,
         ).to(device).bfloat16()
         teacher_model.load_state_dict(teacher_sd, strict=False)
         teacher_model.eval()
@@ -1255,11 +1212,13 @@ def main() -> None:
     # Optimizer split:
     # - token embedding uses TIED_EMBED_LR via Adam
     # - matrix params in transformer blocks use MATRIX_LR via Muon
+    #   (includes all trigram prev_a/prev_b/out matrices which are 2D)
     # - vectors/scalars use SCALAR_LR via Adam
+    #   (includes trigram12/13/23_weight which are 0D)
     # - bigram_prev/next_factors are frozen after initialization and excluded from all optimizers
     named_params = list(base_model.named_parameters())
 
-    _SKIP_MATRIX_NAMES = {"tok_emb.weight", "bigram_prev_factors", "bigram_next_factors"}
+    _SKIP_MATRIX_NAMES = {"tok_emb.weight", "bigram_prev_factors", "bigram_next_factors", "bigram_lag_weights"}
 
     matrix_params = [
         p for name, p in named_params
@@ -1311,7 +1270,16 @@ def main() -> None:
     n_enc = base_model.num_encoder_layers
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
-    log0(f"feature_gate:{'enabled' if args.use_feature_gate else 'disabled'}")
+    log0("bigram_gate:disabled")
+    log0(
+        f"multitrigram:enabled shared_rank:{args.trigram_rank} "
+        f"w12_init:{args.trigram12_weight_init} w13_init:{args.trigram13_weight_init} w23_init:{args.trigram23_weight_init}"
+    )
+    log0(f"bigram_base_scale:init:{args.bigram_base_scale}")
+    if args.use_multilag_bigram:
+        log0(f"multilag_bigram:enabled lags={args.bigram_lags}")
+    else:
+        log0("multilag_bigram:disabled")
     log0(f"bigram_residual_transformer:rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1475,11 +1443,12 @@ def main() -> None:
         # Bigram L2 regularization toward SVD initialization (only when trainable)
         if args.bigram_trainable and args.bigram_reg_lambda > 0:
             with torch.no_grad():
-                base_model.bigram_prev_factors.data.sub_(
-                    args.bigram_reg_lambda * (base_model.bigram_prev_factors.data - bigram_init_prev)
+                # Regularize only lag-0 (lag=1) factors toward SVD initialization.
+                base_model.bigram_prev_factors.data[0].sub_(
+                    args.bigram_reg_lambda * (base_model.bigram_prev_factors.data[0] - bigram_init_prev)
                 )
-                base_model.bigram_next_factors.data.sub_(
-                    args.bigram_reg_lambda * (base_model.bigram_next_factors.data - bigram_init_next)
+                base_model.bigram_next_factors.data[0].sub_(
+                    args.bigram_reg_lambda * (base_model.bigram_next_factors.data[0] - bigram_init_next)
                 )
 
         zero_grad_all()
@@ -1518,7 +1487,8 @@ def main() -> None:
 
     if master_process:
         # Detailed parameter size breakdown by component.
-        _n_bigram = base_model.bigram_prev_factors.numel() + base_model.bigram_next_factors.numel()
+        _n_bigram = (base_model.bigram_prev_factors.numel() + base_model.bigram_next_factors.numel()
+                     + base_model.bigram_lag_weights.numel())
         _n_tok = base_model.tok_emb.weight.numel()
         _n_transformer = sum(
             p.numel() for name, p in base_model.named_parameters()
@@ -1599,22 +1569,6 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-
-    # TODO: DELETE
-    run_context_ablation(
-        args=args,
-        model=base_model,
-        rank=rank,
-        world_size=world_size,
-        device=device,
-        grad_accum_steps=grad_accum_steps,
-        val_tokens=val_tokens,
-        base_bytes_lut=base_bytes_lut,
-        has_leading_space_lut=has_leading_space_lut,
-        is_boundary_token_lut=is_boundary_token_lut,
-        log0=log0,
-        keep_list=(2, 4, 8, 16, 32, 64, 128),
-    )
 
     if distributed:
         dist.destroy_process_group()

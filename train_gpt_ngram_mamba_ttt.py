@@ -1,22 +1,7 @@
 """
-N-gram Logits Transformer — parameter-golf submission.
+The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Motivating data analysis:
-  - Bigram mutual information: 2.57 bits (29.7% of uncertainty resolved by prior token)
-  - Trigram adds another 4.44 bits on top of bigram
-  - Position-level entropy is completely flat across all 1024 positions (variance < 0.01 bits)
-
-Architecture:
-  - Exact bigram logits table: initialized from corpus counts, frozen after initialization,
-    serves as the fixed Markov backoff base added directly to final logits
-  - Hashed n-gram input feature: a small embedding bias injected at the token embedding level.
-    Hash combines prev1 and prev2 tokens into a 3072-bucket lookup; scaled by a learned scalar
-    (init 0.05) so the transformer can learn to use local context without overwriting logits.
-    No count-based gating, no output correction — the signal lives in the hidden representation.
-  - Transformer residual: small learned correction (scale ~0.3) on top of the n-gram base
-  - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of 64 head dims get positional encoding
-  - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → 3 encoder / 6 decoder for 9-layer model
-  - LeakyReLU(0.5)² activation
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
 """
 
 from __future__ import annotations
@@ -93,17 +78,12 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 1))
+    mlp_mult = int(os.environ.get("MLP_MULT", 1))
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
-    # --- N-gram Logits Transformer hyperparameters ---
-    # Head dimensions that receive positional encoding. Flat position entropy justifies keeping this small.
-    rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
-    # Fraction of transformer blocks used as encoder in the U-Net. 0.35 → 3 enc / 6 dec for 9 layers.
-    encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
@@ -126,9 +106,9 @@ class Hyperparameters:
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
 
 # -----------------------------
-# MUON OPTIMIZER
+# MUON OPTIMIZER 
 # -----------------------------
-#
+# 
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
@@ -229,7 +209,7 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP
+# TOKENIZER-AGNOSTIC EVALUATION SETUP 
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -523,7 +503,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING
+# DATA LOADING 
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -593,24 +573,6 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-
-def build_bigram_logits(train_files: str, vocab_size: int, max_tokens: int = 50_000_000) -> Tensor:
-    counts = torch.zeros(vocab_size, vocab_size, dtype=torch.float32)
-    stream = TokenStream(train_files)
-    tokens_read = 0
-    prev = None
-    while tokens_read < max_tokens:
-        chunk = stream.take(1_000_000)
-        if prev is not None:
-            chunk = torch.cat([prev, chunk])
-        counts[chunk[:-1].long(), chunk[1:].long()] += 1
-        prev = chunk[-1:]
-        tokens_read += chunk.numel()
-    probs = counts / counts.sum(dim=1, keepdim=True).clamp_min(1)
-    logits = torch.log(probs + 1e-8)
-    return logits
-
-
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -664,14 +626,10 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int) -> Tensor:
-    # Rotate only the first rope_dims elements of the head dim; pass the rest through.
-    # cos/sin shape: [1, 1, T, rope_dims//2]
-    x1 = x[..., :rope_dims // 2]
-    x2 = x[..., rope_dims // 2:rope_dims]
-    rotated = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-    # Concatenate un-rotated tail dimensions (empty when rope_dims == head_dim)
-    return torch.cat((rotated, x[..., rope_dims:]), dim=-1)
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -682,7 +640,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        rope_partial_dims: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -694,9 +651,6 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        if rope_partial_dims % 2 != 0 or rope_partial_dims > self.head_dim:
-            raise ValueError("rope_partial_dims must be even and ≤ head_dim")
-        self.rope_partial_dims = rope_partial_dims
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -704,8 +658,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        # RoPE only covers rope_partial_dims; remaining head dims get no positional bias.
-        self.rotary = Rotary(rope_partial_dims, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -715,9 +668,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        # Apply positional encoding to only the first rope_partial_dims of each head.
-        q = apply_rotary_emb(q, cos, sin, self.rope_partial_dims)
-        k = apply_rotary_emb(k, cos, sin, self.rope_partial_dims)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -732,15 +684,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: float):
+    # relu^2 MLP from the original modded-nanogpt setup
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = int(round(mlp_mult * dim / 8)) * 8
+        hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.prelu = nn.PReLU(num_parameters=1, init=0.1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
+        x = self.prelu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -750,15 +704,14 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: float,
+        mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        rope_partial_dims: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_partial_dims)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
@@ -781,14 +734,12 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: float,
+        mlp_mult: int,
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
         logit_sharpen: float = 1.1,
-        rope_partial_dims: int = 8,
-        encoder_layer_frac: float = 0.35,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -797,29 +748,9 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-
-        # Bigram logit table: initialized from corpus counts, frozen after initialization.
-        # Acts as a fixed Markov backoff base — bigram_logits[prev_token] → logit vector over vocab.
-        self.bigram_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size))
-
-        # Hashed n-gram input feature: biases the token embedding with a small local-context signal.
-        # Hash combines prev1 and prev2 into a 3072-bucket embedding; scaled by a learned scalar so
-        # the influence starts small and can grow with training. No count gating, no vocab projection.
-        self.ngram_hash_size = 8192
-        self.ngram_emb = nn.Embedding(self.ngram_hash_size, model_dim)
-        self.ngram_scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
-        nn.init.normal_(self.ngram_emb.weight, mean=0.0, std=0.02)
-
-
-        self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
-
-        # LUTs registered as buffers so forward() can use them without passing as args.
-        self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
-        self.register_buffer("is_boundary_token_lut", torch.zeros(vocab_size, dtype=torch.bool))
-
-        # Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
+        self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
         n_blocks = num_layers
-        self.num_encoder_layers = max(1, round(n_blocks * encoder_layer_frac))
+        self.num_encoder_layers = n_blocks // 2
         self.num_decoder_layers = n_blocks - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
@@ -834,38 +765,28 @@ class GPT(nn.Module):
                     mlp_mults[i],
                     rope_base,
                     qk_gain_init,
-                    rope_partial_dims,
                 )
                 for i in range(n_blocks)
             ]
         )
         self.final_norm = RMSNorm()
         self.lm_head = None
-
-
         self._init_weights()
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        tok = self.tok_emb(input_ids)
-
-        prev1 = input_ids
-        prev2 = torch.roll(input_ids, shifts=1, dims=1)
-        prev2[:, 0] = 0
-
-        ngram_hash = ((prev1.to(torch.int64) * 1009 + prev2.to(torch.int64) * 9176) % self.ngram_hash_size)
-        ngram_feat = self.ngram_emb(ngram_hash)
-
-        x = tok + self.ngram_scale.to(dtype=tok.dtype) * ngram_feat
+        x = self.tok_emb(input_ids)
+        x = x.transpose(1, 2)
+        x = self.token_mixer(x)
+        x = x[:, :, :input_ids.size(1)]
+        x = x.transpose(1, 2)
+        x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
@@ -876,18 +797,10 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x_norm = self.final_norm(x)
-        x_flat = x_norm.reshape(-1, x.size(-1))
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-        logits_proj = F.linear(x_flat, self.tok_emb.weight)
-        transformer_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-
-        # Fixed Markov base: look up frozen bigram_logits by the current input token → [B, T, V], flatten.
-        # This is the backoff distribution; it does not change during training.
-        bigram_flat = self.bigram_logits[input_ids].reshape(-1, self.bigram_logits.size(-1))
-
-        logits = self.transformer_scale * transformer_logits + bigram_flat
-
+        logits_proj = F.linear(x, self.tok_emb.weight)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         loss = -target_logp.mean()
@@ -1005,47 +918,32 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         logit_sharpen=args.logit_sharpen,
-        rope_partial_dims=args.rope_partial_dims,
-        encoder_layer_frac=args.encoder_layer_frac,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-
-    log0("building_bigram_logits...")
-    bigram_init = build_bigram_logits(args.train_files, args.vocab_size)
-    bigram_init = bigram_init.to(device=device, dtype=base_model.bigram_logits.dtype)
-    base_model.bigram_logits.data.copy_(bigram_init)
-    base_model.bigram_logits.requires_grad_(False)  # frozen fixed Markov base — not a learned parameter
-    base_model.has_leading_space_lut.copy_(has_leading_space_lut)
-    base_model.is_boundary_token_lut.copy_(is_boundary_token_lut)
-
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
 
     # Optimizer split:
-    # - token embedding uses TIED_EMBED_LR via Adam
+    # - token embedding (Adam) uses TIED_EMBED_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    # - bigram_logits is frozen after initialization and excluded from all optimizers
-    named_params = list(base_model.named_parameters())
-
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
-        p for name, p in named_params
-        if p.ndim == 2
-        and name != "tok_emb.weight"
-        and name != "bigram_logits"
-        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-
     scalar_params = [
-        p for name, p in named_params
-        if (
-            (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-            and name != "bigram_logits"
-        )
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
+    scalar_params.extend(base_model.token_mixer.parameters())
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1068,14 +966,10 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    n_enc = base_model.num_encoder_layers
-    n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
-    log0(f"ngram_transformer:rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1177,8 +1071,6 @@ def main() -> None:
                     f"step:{step}/{args.iterations}"
                 )
             break
-
-        base_model.current_step = step
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
