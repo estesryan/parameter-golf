@@ -964,7 +964,7 @@ class GPT(nn.Module):
         self._distill_alpha: float = 0.7
         self._distill_temperature: float = 1.5
 
-        self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
+        self.transformer_scale = nn.Parameter(torch.tensor(0.4, dtype=torch.float32))
 
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
