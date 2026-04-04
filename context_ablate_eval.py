@@ -5,12 +5,12 @@ import io
 import math
 import os
 import sys
-import glob
 import zlib
 import importlib.util
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import sentencepiece as spm
 
 # -----------------------------
@@ -24,9 +24,12 @@ spec.loader.exec_module(mod)
 
 Hyperparameters = mod.Hyperparameters
 GPT = mod.GPT
+CastedLinear = mod.CastedLinear
+restore_low_dim_params_to_fp32 = mod.restore_low_dim_params_to_fp32
 load_validation_tokens = mod.load_validation_tokens
 build_sentencepiece_luts = mod.build_sentencepiece_luts
 dequantize_state_dict_int8 = mod.dequantize_state_dict_int8
+eval_val = mod.eval_val
 
 try:
     import zstandard as zstd
@@ -45,7 +48,7 @@ def load_checkpoint(path: str):
         raw = zlib.decompress(blob)
     except zlib.error:
         if not HAS_ZSTD:
-            raise RuntimeError("Checkpoint looks zstd-compressed but zstandard is not installed.")
+            raise RuntimeError("Checkpoint appears zstd-compressed but zstandard is unavailable.")
         raw = zstd.ZstdDecompressor().decompress(blob)
 
     obj = torch.load(io.BytesIO(raw), map_location="cpu")
@@ -61,12 +64,18 @@ def eval_val_context_ablation(
     base_bytes_lut,
     has_leading_space_lut,
     is_boundary_token_lut,
-    keep_last_n: int | None,
+    keep_last_n: int,
     batch_seqs: int = 8,
 ):
+    """
+    Evaluate only positions that have at most keep_last_n visible tokens of context.
+    We blank the earlier prefix with token id 0, and score only the final keep_last_n positions.
+    """
     seq_len = args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // seq_len
+    if keep_last_n <= 0 or keep_last_n > seq_len:
+        raise ValueError(f"keep_last_n must be in [1, {seq_len}]")
 
+    total_seqs = (val_tokens.numel() - 1) // seq_len
     loss_sum = 0.0
     token_count = 0
     byte_count = 0.0
@@ -82,26 +91,23 @@ def eval_val_context_ablation(
         x_full = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
 
-        if keep_last_n is None or keep_last_n >= seq_len:
-            x_eval = x_full
-            loss_mask = torch.ones_like(y, dtype=torch.bool)
-        else:
-            x_eval = x_full.clone()
-            prefix_len = seq_len - keep_last_n
-            if prefix_len > 0:
-                x_eval[:, :prefix_len] = 0  # token id 0 as dummy inaccessible context
-            loss_mask = torch.zeros_like(y, dtype=torch.bool)
-            loss_mask[:, prefix_len:] = True
+        x_eval = x_full.clone()
+        prefix_len = seq_len - keep_last_n
+        if prefix_len > 0:
+            x_eval[:, :prefix_len] = 0
 
         full_logits, _ = model._compute_logits(x_eval)
         logits = full_logits.float().view(-1, args.vocab_size)
         targets = y.reshape(-1)
 
-        per_tok_nll = -torch.log_softmax(logits * model.logit_sharpen, dim=-1).gather(
+        per_tok_nll = -F.log_softmax(logits * model.logit_sharpen, dim=-1).gather(
             -1, targets.unsqueeze(-1)
         ).squeeze(-1)
 
+        loss_mask = torch.zeros_like(y, dtype=torch.bool)
+        loss_mask[:, prefix_len:] = True
         flat_mask = loss_mask.reshape(-1)
+
         loss_sum += per_tok_nll[flat_mask].sum().item()
         token_count += int(flat_mask.sum().item())
 
@@ -118,10 +124,9 @@ def eval_val_context_ablation(
 
 
 def main():
-    ckpt_path = os.environ.get("CKPT", "final_model.pt")
-    keep_list = [None, 2, 4, 8, 16, 32, 64, 128]
-    if "KEEP_LIST" in os.environ:
-        keep_list = [None if s == "full" else int(s) for s in os.environ["KEEP_LIST"].split(",")]
+    ckpt_path = os.environ.get("CKPT", "final_model.int8.ptz")
+    keep_list_env = os.environ.get("KEEP_LIST", "2,4,8,16,32,64,128")
+    keep_list = [int(x) for x in keep_list_env.split(",") if x.strip()]
 
     args = Hyperparameters()
 
@@ -155,29 +160,50 @@ def main():
         bigram_rank=args.bigram_rank,
     ).to(device).bfloat16()
 
+    # Match train/eval setup from your script
+    for module in model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    restore_low_dim_params_to_fp32(model)
+    model.bigram_prev_factors.data = model.bigram_prev_factors.data.float()
+    model.bigram_next_factors.data = model.bigram_next_factors.data.float()
+
     state = load_checkpoint(ckpt_path)
     model.load_state_dict(state, strict=True)
     model.eval()
 
     print(f"checkpoint={ckpt_path}")
+    print(f"model_dim={args.model_dim} num_layers={args.num_layers} num_heads={args.num_heads} num_kv_heads={args.num_kv_heads}")
+    print(f"mlp_mult={args.mlp_mult} rope_partial_dims={args.rope_partial_dims} encoder_layer_frac={args.encoder_layer_frac} bigram_rank={args.bigram_rank}")
     print(f"seq_len={args.train_seq_len}")
-    print("mode: prefix is blanked, metric only on positions that still have <=N-token visible context")
     print()
 
-    full_loss, full_bpb = eval_val_context_ablation(
-        args, model, device, val_tokens,
-        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        keep_last_n=None
+    # Full eval sanity check: should be near your final roundtrip number
+    full_loss, full_bpb = eval_val(
+        args=args,
+        model=model,
+        rank=0,
+        world_size=1,
+        device=device,
+        grad_accum_steps=1,
+        val_tokens=val_tokens,
+        base_bytes_lut=base_bytes_lut,
+        has_leading_space_lut=has_leading_space_lut,
+        is_boundary_token_lut=is_boundary_token_lut,
     )
     print(f"keep=full  val_loss={full_loss:.8f}  val_bpb={full_bpb:.8f}")
+    print()
 
     for n in keep_list:
-        if n is None:
-            continue
         loss, bpb = eval_val_context_ablation(
-            args, model, device, val_tokens,
-            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            keep_last_n=n
+            args=args,
+            model=model,
+            device=device,
+            val_tokens=val_tokens,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+            keep_last_n=n,
         )
         print(
             f"keep={n:<4d} val_loss={loss:.8f}  val_bpb={bpb:.8f}  "
