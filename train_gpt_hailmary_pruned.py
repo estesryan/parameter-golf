@@ -298,6 +298,115 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
 
+## TODO: DELETE
+@torch.inference_mode()
+def eval_val_context_ablation(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    keep_last_n: int,
+) -> tuple[float, float]:
+    if keep_last_n <= 0 or keep_last_n > args.train_seq_len:
+        raise ValueError(f"keep_last_n must be in [1, {args.train_seq_len}]")
+
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    local_batch_seqs = local_batch_tokens // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            raw_start = batch_seq_start * args.train_seq_len
+            raw_end = batch_seq_end * args.train_seq_len + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+
+            x_full = local[:-1].reshape(-1, args.train_seq_len)
+            y = local[1:].reshape(-1, args.train_seq_len)
+
+            x_eval = x_full.clone()
+            prefix_len = args.train_seq_len - keep_last_n
+            if prefix_len > 0:
+                x_eval[:, :prefix_len] = 0
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                full_logits, _ = model._compute_logits(x_eval)
+
+            logits = full_logits.float().view(-1, args.vocab_size)
+            targets = y.reshape(-1)
+
+            per_tok_nll = -F.log_softmax(logits * model.logit_sharpen, dim=-1).gather(
+                -1, targets.unsqueeze(-1)
+            ).squeeze(-1)
+
+            loss_mask = torch.zeros_like(y, dtype=torch.bool)
+            loss_mask[:, prefix_len:] = True
+            flat_mask = loss_mask.reshape(-1)
+
+            val_loss_sum += per_tok_nll[flat_mask].sum().to(torch.float64)
+            val_token_count += float(flat_mask.sum().item())
+
+            prev_ids = x_full.reshape(-1)
+            tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes[flat_mask].to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def run_context_ablation(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    log0,
+    keep_list=(2, 4, 8, 16, 32, 64, 128),
+):
+    full_loss, full_bpb = eval_val(
+        args, model, rank, world_size, device, grad_accum_steps,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
+    )
+    log0(f"context_ablation keep=full val_loss:{full_loss:.8f} val_bpb:{full_bpb:.8f}")
+    for n in keep_list:
+        loss, bpb = eval_val_context_ablation(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            keep_last_n=n,
+        )
+        log0(
+            f"context_ablation keep={n} val_loss:{loss:.8f} val_bpb:{bpb:.8f} "
+            f"delta_loss:{loss - full_loss:+.8f} delta_bpb:{bpb - full_bpb:+.8f}"
+        )
+# END TODO: DELETE
 
 def eval_val(
     args: Hyperparameters,
@@ -1466,6 +1575,22 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # TODO: DELETE
+    run_context_ablation(
+        args=args,
+        model=base_model,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        grad_accum_steps=grad_accum_steps,
+        val_tokens=val_tokens,
+        base_bytes_lut=base_bytes_lut,
+        has_leading_space_lut=has_leading_space_lut,
+        is_boundary_token_lut=is_boundary_token_lut,
+        log0=log0,
+        keep_list=(2, 4, 8, 16, 32, 64, 128),
+    )
 
     if distributed:
         dist.destroy_process_group()
