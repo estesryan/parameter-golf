@@ -86,8 +86,8 @@ class Hyperparameters:
 
     bigram_rank = int(os.environ.get("BIGRAM_RANK", 32))
     trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 16))
-    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 16))
-    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 16))
+    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 12))
+    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 8))
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
@@ -815,9 +815,9 @@ class GPT(nn.Module):
         self.tri23_b = nn.Parameter(torch.randn(vocab_size, trigram23_rank) * 0.02)
         self.tri23_out = nn.Parameter(torch.randn(trigram23_rank, vocab_size) * 0.02)
 
-        self.tri12_w = nn.Parameter(torch.tensor(1.0))
-        self.tri13_w = nn.Parameter(torch.tensor(1.0))
-        self.tri23_w = nn.Parameter(torch.tensor(1.0))
+        self.tri12_w = nn.Parameter(torch.tensor(0.60))
+        self.tri13_w = nn.Parameter(torch.tensor(0.30))
+        self.tri23_w = nn.Parameter(torch.tensor(0.30))
 
         self.transformer_scale = nn.Parameter(torch.tensor(0.3))
 
@@ -1207,6 +1207,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            log0(f"lag_weights:{base_model.bigram_lag_weights.detach().cpu().tolist()}")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
