@@ -130,8 +130,6 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     use_int6 = bool(int(os.environ.get("USE_INT6", "0")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
-    use_lag_mixer = bool(int(os.environ.get("USE_LAG_MIXER", "1")))
-    lag_list = [1, 2, 4, 8, 16, 32, 64, 128]
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
 
@@ -143,6 +141,9 @@ class Hyperparameters:
     # --- QAT mode: off | late | progressive ---
     qat_mode = os.environ.get("QAT_MODE", "progressive")
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.6))
+
+    # --- Bigram gate: context-dependent scalar that modulates bigram base strength ---
+    use_bigram_gate = bool(int(os.environ.get("USE_BIGRAM_GATE", "1")))
 
     # --- Distillation: CE on full logits + KL on residual logits (residual = full − bigram_base) ---
     use_distillation = bool(int(os.environ.get("USE_DISTILLATION", "0")))
@@ -904,8 +905,6 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         rope_partial_dims: int,
-        use_lag_mixer: bool = True,
-        lag_list: list | None = None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -915,34 +914,10 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        if use_lag_mixer and lag_list:
-            self.lag_list = lag_list
-            self.lag_scales = nn.Parameter(
-                torch.zeros(len(lag_list), dim, dtype=torch.float32)
-            )
-        else:
-            self.lag_list = []
-            self.lag_scales = None
-
-    def apply_lag_mixer(self, x: Tensor) -> Tensor:
-        # x: [B, T, C]
-        if self.lag_scales is None:
-            return x
-        _, T, _ = x.shape
-        out = x
-        for i, d in enumerate(self.lag_list):
-            if d >= T:
-                continue
-            shifted = torch.zeros_like(x)
-            shifted[:, d:, :] = x[:, :-d, :]
-            scale = self.lag_scales[i].to(dtype=x.dtype)[None, None, :]
-            out = out + scale * shifted
-        return out
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        x = self.apply_lag_mixer(x)
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -971,8 +946,7 @@ class GPT(nn.Module):
         rope_partial_dims: int = 8,
         encoder_layer_frac: float = 0.35,
         bigram_rank: int = 64,
-        use_lag_mixer: bool = True,
-        lag_list: list | None = None,
+        use_bigram_gate: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -996,6 +970,14 @@ class GPT(nn.Module):
 
         self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
 
+        # Context-dependent gate that modulates bigram base strength.
+        # gate → 0 at init (zero weights) → exact baseline behavior at step 0.
+        if use_bigram_gate:
+            self.bigram_gate_proj = nn.Linear(model_dim, 1, bias=False)
+            self.bigram_gate_proj._zero_init = True
+        else:
+            self.bigram_gate_proj = None
+
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
         self.register_buffer("is_boundary_token_lut", torch.zeros(vocab_size, dtype=torch.bool))
@@ -1018,8 +1000,6 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     rope_partial_dims,
-                    use_lag_mixer=use_lag_mixer,
-                    lag_list=lag_list,
                 )
                 for i in range(n_blocks)
             ]
@@ -1071,7 +1051,12 @@ class GPT(nn.Module):
         prev_f = self.bigram_prev_factors[input_ids]  # [B, T, R]
         bigram_flat = prev_f.reshape(-1, self.bigram_rank) @ self.bigram_next_factors.to(prev_f.dtype).T
 
-        full_logits = self.transformer_scale * transformer_logits + bigram_flat
+        if self.bigram_gate_proj is not None:
+            gate = self.bigram_gate_proj(x_norm)          # [B, T, 1]
+            gate = torch.tanh(gate).reshape(-1, 1)        # [B*T, 1]
+            full_logits = (1.0 + gate) * bigram_flat + self.transformer_scale * transformer_logits
+        else:
+            full_logits = self.transformer_scale * transformer_logits + bigram_flat
         return full_logits, bigram_flat  # [B*T, V], [B*T, V]
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1211,8 +1196,7 @@ def main() -> None:
         rope_partial_dims=args.rope_partial_dims,
         encoder_layer_frac=args.encoder_layer_frac,
         bigram_rank=args.bigram_rank,
-        use_lag_mixer=args.use_lag_mixer,
-        lag_list=args.lag_list,
+        use_bigram_gate=args.use_bigram_gate,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1246,6 +1230,7 @@ def main() -> None:
             rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
             logit_sharpen=args.logit_sharpen, rope_partial_dims=args.rope_partial_dims,
             encoder_layer_frac=args.encoder_layer_frac, bigram_rank=args.bigram_rank,
+            use_bigram_gate=args.use_bigram_gate,
         ).to(device).bfloat16()
         teacher_model.load_state_dict(teacher_sd, strict=False)
         teacher_model.eval()
@@ -1322,10 +1307,7 @@ def main() -> None:
     n_enc = base_model.num_encoder_layers
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
-    if args.use_lag_mixer:
-        log0(f"lag_mixer:enabled lags={args.lag_list}")
-    else:
-        log0("lag_mixer:disabled")
+    log0(f"bigram_gate:{'enabled' if args.use_bigram_gate else 'disabled'}")
     log0(f"bigram_residual_transformer:rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
