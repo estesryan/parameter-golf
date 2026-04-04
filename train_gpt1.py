@@ -111,6 +111,8 @@ class Hyperparameters:
     qat_mode = os.environ.get("QAT_MODE", "progressive")
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.6))
     bigram_trainable = bool(int(os.environ.get("BIGRAM_TRAINABLE", "0")))
+    use_multilag_bigram = bool(int(os.environ.get("USE_MULTILAG_BIGRAM", "1")))
+    bigram_lags = [1, 2, 4]
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
 
 # -----------------------------
@@ -777,6 +779,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         logit_sharpen: float = 1.1,
         bigram_rank: int = 32,
+        bigram_lags: list = None,
         trigram12_rank: int = 16,
         trigram13_rank: int = 16,
         trigram23_rank: int = 16,
@@ -789,9 +792,14 @@ class GPT(nn.Module):
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
-        # --- Bigram base (lag-1 only) ---
-        self.bigram_prev = nn.Parameter(torch.zeros(vocab_size, bigram_rank))
-        self.bigram_next = nn.Parameter(torch.zeros(vocab_size, bigram_rank))
+        # --- Bigram base (multilag) ---
+        self.bigram_lags = bigram_lags if bigram_lags is not None else [1]
+        num_lags = len(self.bigram_lags)
+        self.bigram_prev = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
+        self.bigram_next = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
+        _lag_w = torch.zeros(num_lags, dtype=torch.float32)
+        _lag_w[0] = 1.0
+        self.bigram_lag_weights = nn.Parameter(_lag_w)
         self.bigram_scale = nn.Parameter(torch.tensor(0.5))
 
         # --- Trigram heads (separate, logit-space) ---
@@ -876,8 +884,18 @@ class GPT(nn.Module):
         t2 = torch.cat([pad2, input_ids[:, :-2]], dim=1)
         t3 = torch.cat([pad3, input_ids[:, :-3]], dim=1)
 
-        # --- Bigram ---
-        b = (self.bigram_prev[t1] @ self.bigram_next.t()) / math.sqrt(self.bigram_prev.size(1))
+        # --- Bigram (multilag) ---
+        _rank = self.bigram_prev.size(2)
+        _scale = math.sqrt(_rank)
+        _lag_shifted = {}
+        for _lag in self.bigram_lags:
+            _pad = torch.zeros(B, _lag, dtype=input_ids.dtype, device=device)
+            _lag_shifted[_lag] = torch.cat([_pad, input_ids[:, :-_lag]], dim=1)
+        b = torch.zeros(B, T, self.bigram_next.size(1), dtype=torch.float32, device=device)
+        for _i, _lag in enumerate(self.bigram_lags):
+            _sid = _lag_shifted[_lag]
+            _contrib = (self.bigram_prev[_i][_sid].float() @ self.bigram_next[_i].float().t()) / _scale
+            b = b + self.bigram_lag_weights[_i] * _contrib
 
         # --- Trigram 12 ---
         z12 = (self.tri12_a[t1] * self.tri12_b[t2])
@@ -1021,6 +1039,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         logit_sharpen=args.logit_sharpen,
         bigram_rank=args.bigram_rank,
+        bigram_lags=args.bigram_lags if args.use_multilag_bigram else [1],
         trigram12_rank=args.trigram12_rank,
         trigram13_rank=args.trigram13_rank,
         trigram23_rank=args.trigram23_rank,
@@ -1032,8 +1051,8 @@ def main() -> None:
     log0("Building bigram factors via truncated SVD...")
     _prev_factors, _next_factors = build_bigram_factors(args.train_files, args.vocab_size, args.bigram_rank)
     with torch.no_grad():
-        base_model.bigram_prev.data.copy_(_prev_factors.to(device=device, dtype=base_model.bigram_prev.dtype))
-        base_model.bigram_next.data.copy_(_next_factors.to(device=device, dtype=base_model.bigram_next.dtype))
+        base_model.bigram_prev.data[0].copy_(_prev_factors.to(device=device, dtype=base_model.bigram_prev.dtype))
+        base_model.bigram_next.data[0].copy_(_next_factors.to(device=device, dtype=base_model.bigram_next.dtype))
     del _prev_factors, _next_factors
     if not args.bigram_trainable:
         base_model.bigram_prev.requires_grad_(False)
@@ -1063,6 +1082,7 @@ def main() -> None:
         p for p in [base_model.bigram_prev, base_model.bigram_next] if p.requires_grad
     ]
     scalar_params.extend([base_model.bigram_scale, base_model.transformer_scale,
+                           base_model.bigram_lag_weights,
                            *_bigram_trainable_params,
                            base_model.tri12_w, base_model.tri13_w, base_model.tri23_w])
     matrix_params.extend([
