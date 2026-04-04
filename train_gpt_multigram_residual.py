@@ -113,10 +113,11 @@ class Hyperparameters:
     bigram_lags = [1, 2, 4]
     rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
     encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
-    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.30))
-    trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.60))
-    trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.30))
-    trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.30))
+    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.22))
+    trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.40))
+    trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.20))
+    trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.20))
+    transformer_scale_init = float(os.environ.get("TRANSFORMER_SCALE_INIT", 0.9))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
     debug_lag_weights = bool(int(os.environ.get("DEBUG_LAG_WEIGHTS", "0")))
 
@@ -795,10 +796,11 @@ class GPT(nn.Module):
         trigram23_rank: int = 16,
         rope_partial_dims: int = 8,
         encoder_layer_frac: float = 0.35,
-        bigram_base_scale: float = 0.55,
-        trigram12_weight_init: float = 0.60,
-        trigram13_weight_init: float = 0.30,
-        trigram23_weight_init: float = 0.30,
+        bigram_base_scale: float = 0.22,
+        trigram12_weight_init: float = 0.40,
+        trigram13_weight_init: float = 0.20,
+        trigram23_weight_init: float = 0.20,
+        transformer_scale_init: float = 0.9,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -837,7 +839,7 @@ class GPT(nn.Module):
         self.tri13_w = nn.Parameter(torch.tensor(trigram13_weight_init))
         self.tri23_w = nn.Parameter(torch.tensor(trigram23_weight_init))
 
-        self.transformer_scale = nn.Parameter(torch.tensor(0.5))
+        self.transformer_scale = nn.Parameter(torch.tensor(transformer_scale_init))
 
         self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
         n_blocks = num_layers
@@ -1068,6 +1070,7 @@ def main() -> None:
         trigram12_weight_init=args.trigram12_weight_init,
         trigram13_weight_init=args.trigram13_weight_init,
         trigram23_weight_init=args.trigram23_weight_init,
+        transformer_scale_init=args.transformer_scale_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
