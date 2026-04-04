@@ -142,9 +142,12 @@ class Hyperparameters:
     qat_mode = os.environ.get("QAT_MODE", "progressive")
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.6))
 
-    # --- Low-rank output adapter: untied additive correction on top of tied projection ---
-    output_adapter_rank = int(os.environ.get("OUTPUT_ADAPTER_RANK", 32))
-    use_output_adapter = bool(int(os.environ.get("USE_OUTPUT_ADAPTER", "1")))
+    # --- Multi-lag bigram: sum of low-rank bigram bases at lags [1, 2, 4, 8, 16] ---
+    use_multilag_bigram = bool(int(os.environ.get("USE_MULTILAG_BIGRAM", "1")))
+    bigram_lags = [1, 2, 4, 8, 16]
+
+    # --- Bigram gate: context-dependent scalar that modulates bigram base strength ---
+    use_bigram_gate = bool(int(os.environ.get("USE_BIGRAM_GATE", "0")))
 
     # --- Distillation: CE on full logits + KL on residual logits (residual = full − bigram_base) ---
     use_distillation = bool(int(os.environ.get("USE_DISTILLATION", "0")))
@@ -947,8 +950,9 @@ class GPT(nn.Module):
         rope_partial_dims: int = 8,
         encoder_layer_frac: float = 0.35,
         bigram_rank: int = 64,
-        output_adapter_rank: int = 0,
-        use_output_adapter: bool = False,
+        use_bigram_gate: bool = False,
+        use_multilag_bigram: bool = True,
+        bigram_lags: list[int] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -958,12 +962,19 @@ class GPT(nn.Module):
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
-        # Low-rank bigram logit base: prev_factors @ next_factors.T ≈ log P(next|prev).
-        # Initialized from corpus SVD, frozen by default (BIGRAM_TRAINABLE=0).
+        # Multi-lag low-rank bigram base: sum_i alpha_i * bigram_i(token_{t-lag_i}).
+        # Lag-1 factors initialized from corpus SVD; other lag factors zero-initialized.
         # Kept in fp32 for precision; cast to compute dtype in _compute_logits like CastedLinear.
         self.bigram_rank = bigram_rank
-        self.bigram_prev_factors = nn.Parameter(torch.zeros(vocab_size, bigram_rank))
-        self.bigram_next_factors = nn.Parameter(torch.zeros(vocab_size, bigram_rank))
+        self.bigram_lags: list[int] = bigram_lags if (use_multilag_bigram and bigram_lags is not None) else [1]
+        self.use_multilag_bigram = use_multilag_bigram
+        num_lags = len(self.bigram_lags)
+        self.bigram_prev_factors = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
+        self.bigram_next_factors = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
+        # Lag weights: init [1, 0, 0, ...] so model starts identical to single-lag baseline.
+        _lag_w = torch.zeros(num_lags, dtype=torch.float32)
+        _lag_w[0] = 1.0
+        self.bigram_lag_weights = nn.Parameter(_lag_w)
 
         # Distillation teacher — set externally before training, not part of state_dict.
         self._teacher: "GPT | None" = None
@@ -972,16 +983,13 @@ class GPT(nn.Module):
 
         self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
 
-        # Low-rank output adapter: tied_logits + (x @ A) @ B^T
-        # A is small-random; B is zero so model starts identical to baseline.
-        if use_output_adapter and output_adapter_rank > 0:
-            self.output_adapter_A = nn.Parameter(
-                torch.randn(model_dim, output_adapter_rank) * (1.0 / math.sqrt(model_dim))
-            )
-            self.output_adapter_B = nn.Parameter(torch.zeros(vocab_size, output_adapter_rank))
+        # Context-dependent gate that modulates bigram base strength.
+        # gate → 0 at init (zero weights) → exact baseline behavior at step 0.
+        if use_bigram_gate:
+            self.bigram_gate_proj = nn.Linear(model_dim, 1, bias=False)
+            self.bigram_gate_proj._zero_init = True
         else:
-            self.output_adapter_A = None
-            self.output_adapter_B = None
+            self.bigram_gate_proj = None
 
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
@@ -1049,20 +1057,32 @@ class GPT(nn.Module):
 
         x_norm = self.final_norm(x)
         x_flat = x_norm.reshape(-1, x.size(-1))
-        tied_logits = F.linear(x_flat, self.tok_emb.weight)
-        if self.output_adapter_A is not None:
-            adapter_hidden = x_flat @ self.output_adapter_A.to(x_flat.dtype)   # [N, r]
-            adapter_logits = adapter_hidden @ self.output_adapter_B.to(x_flat.dtype).T  # [N, vocab]
-            logits_proj = tied_logits + adapter_logits
-        else:
-            logits_proj = tied_logits
+        logits_proj = F.linear(x_flat, self.tok_emb.weight)
         transformer_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-        # Low-rank bigram base: prev_factors[t] @ next_factors.T — never materializes full [V×V].
-        prev_f = self.bigram_prev_factors[input_ids]  # [B, T, R]
-        bigram_flat = prev_f.reshape(-1, self.bigram_rank) @ self.bigram_next_factors.to(prev_f.dtype).T
+        # Multi-lag low-rank bigram base: sum_i weight_i * (prev_factors_i[t-lag_i] @ next_factors_i.T).
+        # Never materializes full [V×V]; each lag contributes [B*T, V] logits.
+        B, T = input_ids.shape
+        vocab_size = self.bigram_prev_factors.shape[1]
+        # fp32 accumulator — matches factor dtype; consistent with original single-lag behavior.
+        bigram_flat = torch.zeros(B * T, vocab_size, device=input_ids.device, dtype=torch.float32)
+        for i, lag in enumerate(self.bigram_lags):
+            if lag == 0:
+                prev_ids = input_ids
+            else:
+                pad = torch.zeros(B, lag, dtype=input_ids.dtype, device=input_ids.device)
+                prev_ids = torch.cat([pad, input_ids[:, :-lag]], dim=1)  # [B, T]
+            prev_f = self.bigram_prev_factors[i][prev_ids]  # [B, T, R]
+            logits_i = prev_f.reshape(-1, self.bigram_rank) @ self.bigram_next_factors[i].to(prev_f.dtype).T  # [B*T, V]
+            w = self.bigram_lag_weights[i].to(dtype=logits_i.dtype)
+            bigram_flat = bigram_flat + w * logits_i
 
-        full_logits = self.transformer_scale * transformer_logits + bigram_flat
+        if self.bigram_gate_proj is not None:
+            gate = self.bigram_gate_proj(x_norm)          # [B, T, 1]
+            gate = torch.tanh(gate).reshape(-1, 1)        # [B*T, 1]
+            full_logits = (1.0 + gate) * bigram_flat + self.transformer_scale * transformer_logits
+        else:
+            full_logits = self.transformer_scale * transformer_logits + bigram_flat
         return full_logits, bigram_flat  # [B*T, V], [B*T, V]
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1202,8 +1222,9 @@ def main() -> None:
         rope_partial_dims=args.rope_partial_dims,
         encoder_layer_frac=args.encoder_layer_frac,
         bigram_rank=args.bigram_rank,
-        output_adapter_rank=args.output_adapter_rank,
-        use_output_adapter=args.use_output_adapter,
+        use_bigram_gate=args.use_bigram_gate,
+        use_multilag_bigram=args.use_multilag_bigram,
+        bigram_lags=args.bigram_lags,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1214,17 +1235,15 @@ def main() -> None:
     base_model.bigram_prev_factors.data = base_model.bigram_prev_factors.data.float()
     base_model.bigram_next_factors.data = base_model.bigram_next_factors.data.float()
 
-    if args.use_output_adapter:
-        log0(f"output_adapter:enabled rank:{args.output_adapter_rank}")
-    else:
-        log0("output_adapter:disabled")
     log0(f"building_bigram_factors rank={args.bigram_rank}...")
     prev_factors, next_factors = build_bigram_factors(args.train_files, args.vocab_size, args.bigram_rank)
-    base_model.bigram_prev_factors.data.copy_(prev_factors.float())
-    base_model.bigram_next_factors.data.copy_(next_factors.float())
+    # Initialize lag-0 (lag=1) with SVD factors; other lags stay zero-initialized.
+    base_model.bigram_prev_factors.data[0].copy_(prev_factors.float())
+    base_model.bigram_next_factors.data[0].copy_(next_factors.float())
     bigram_init_prev = prev_factors.float().to(device=device)
     bigram_init_next = next_factors.float().to(device=device)
     if not args.bigram_trainable:
+        # Freeze factor tensors; bigram_lag_weights remains trainable via scalar optimizer.
         base_model.bigram_prev_factors.requires_grad_(False)
         base_model.bigram_next_factors.requires_grad_(False)
     base_model.has_leading_space_lut.copy_(has_leading_space_lut)
@@ -1241,6 +1260,8 @@ def main() -> None:
             rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
             logit_sharpen=args.logit_sharpen, rope_partial_dims=args.rope_partial_dims,
             encoder_layer_frac=args.encoder_layer_frac, bigram_rank=args.bigram_rank,
+            use_bigram_gate=args.use_bigram_gate,
+            use_multilag_bigram=args.use_multilag_bigram, bigram_lags=args.bigram_lags,
         ).to(device).bfloat16()
         teacher_model.load_state_dict(teacher_sd, strict=False)
         teacher_model.eval()
@@ -1265,7 +1286,7 @@ def main() -> None:
     # - bigram_prev/next_factors are frozen after initialization and excluded from all optimizers
     named_params = list(base_model.named_parameters())
 
-    _SKIP_MATRIX_NAMES = {"tok_emb.weight", "bigram_prev_factors", "bigram_next_factors"}
+    _SKIP_MATRIX_NAMES = {"tok_emb.weight", "bigram_prev_factors", "bigram_next_factors", "bigram_lag_weights"}
 
     matrix_params = [
         p for name, p in named_params
@@ -1317,6 +1338,11 @@ def main() -> None:
     n_enc = base_model.num_encoder_layers
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
+    log0(f"bigram_gate:{'enabled' if args.use_bigram_gate else 'disabled'}")
+    if args.use_multilag_bigram:
+        log0(f"multilag_bigram:enabled lags={args.bigram_lags}")
+    else:
+        log0("multilag_bigram:disabled")
     log0(f"bigram_residual_transformer:rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1480,11 +1506,12 @@ def main() -> None:
         # Bigram L2 regularization toward SVD initialization (only when trainable)
         if args.bigram_trainable and args.bigram_reg_lambda > 0:
             with torch.no_grad():
-                base_model.bigram_prev_factors.data.sub_(
-                    args.bigram_reg_lambda * (base_model.bigram_prev_factors.data - bigram_init_prev)
+                # Regularize only lag-0 (lag=1) factors toward SVD initialization.
+                base_model.bigram_prev_factors.data[0].sub_(
+                    args.bigram_reg_lambda * (base_model.bigram_prev_factors.data[0] - bigram_init_prev)
                 )
-                base_model.bigram_next_factors.data.sub_(
-                    args.bigram_reg_lambda * (base_model.bigram_next_factors.data - bigram_init_next)
+                base_model.bigram_next_factors.data[0].sub_(
+                    args.bigram_reg_lambda * (base_model.bigram_next_factors.data[0] - bigram_init_next)
                 )
 
         zero_grad_all()
@@ -1523,7 +1550,8 @@ def main() -> None:
 
     if master_process:
         # Detailed parameter size breakdown by component.
-        _n_bigram = base_model.bigram_prev_factors.numel() + base_model.bigram_next_factors.numel()
+        _n_bigram = (base_model.bigram_prev_factors.numel() + base_model.bigram_next_factors.numel()
+                     + base_model.bigram_lag_weights.numel())
         _n_tok = base_model.tok_emb.weight.numel()
         _n_transformer = sum(
             p.numel() for name, p in base_model.named_parameters()

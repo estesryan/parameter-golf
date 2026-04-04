@@ -142,9 +142,8 @@ class Hyperparameters:
     qat_mode = os.environ.get("QAT_MODE", "progressive")
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.6))
 
-    # --- Per-layer residual gains: learnable scalar multipliers per block ---
-    layer_gain_init = float(os.environ.get("LAYER_GAIN_INIT", 1.0))
-    use_layer_gains = bool(int(os.environ.get("USE_LAYER_GAINS", "1")))
+    # --- Feature gate: per-channel gating of transformer representation before projection ---
+    use_feature_gate = bool(int(os.environ.get("USE_FEATURE_GATE", "1")))
 
     # --- Distillation: CE on full logits + KL on residual logits (residual = full − bigram_base) ---
     use_distillation = bool(int(os.environ.get("USE_DISTILLATION", "0")))
@@ -906,8 +905,6 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         rope_partial_dims: int,
-        use_layer_gains: bool = True,
-        layer_gain_init: float = 1.0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -917,18 +914,13 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.use_layer_gains = use_layer_gains
-        self.layer_attn_gain = nn.Parameter(torch.tensor(layer_gain_init, dtype=torch.float32))
-        self.layer_mlp_gain = nn.Parameter(torch.tensor(layer_gain_init, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        attn_gain = self.layer_attn_gain.to(dtype=x.dtype) if self.use_layer_gains else x.new_ones(())
-        x = x + attn_gain * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        mlp_gain = self.layer_mlp_gain.to(dtype=x.dtype) if self.use_layer_gains else x.new_ones(())
-        x = x + mlp_gain * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -954,8 +946,7 @@ class GPT(nn.Module):
         rope_partial_dims: int = 8,
         encoder_layer_frac: float = 0.35,
         bigram_rank: int = 64,
-        use_layer_gains: bool = True,
-        layer_gain_init: float = 1.0,
+        use_feature_gate: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -979,6 +970,14 @@ class GPT(nn.Module):
 
         self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
 
+        # Per-channel feature gate applied to transformer representation before projection.
+        # gate → 0 at init (zero weights) → exact baseline behavior at step 0.
+        if use_feature_gate:
+            self.feature_gate_proj = nn.Linear(model_dim, model_dim, bias=False)
+            self.feature_gate_proj._zero_init = True
+        else:
+            self.feature_gate_proj = None
+
         # LUTs registered as buffers so forward() can use them without passing as args.
         self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
         self.register_buffer("is_boundary_token_lut", torch.zeros(vocab_size, dtype=torch.bool))
@@ -1001,8 +1000,6 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     rope_partial_dims,
-                    use_layer_gains=use_layer_gains,
-                    layer_gain_init=layer_gain_init,
                 )
                 for i in range(n_blocks)
             ]
@@ -1046,7 +1043,16 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x_norm = self.final_norm(x)
-        x_flat = x_norm.reshape(-1, x.size(-1))
+
+        # Per-channel feature gate: modulates which transformer features override bigram.
+        # gate → 0 at init (zero weights) → x_mod == x_norm at step 0.
+        if self.feature_gate_proj is not None:
+            gate = torch.tanh(self.feature_gate_proj(x_norm))  # [B, T, C]
+            x_mod = x_norm * (1.0 + gate)
+        else:
+            x_mod = x_norm
+
+        x_flat = x_mod.reshape(-1, x_norm.size(-1))
         logits_proj = F.linear(x_flat, self.tok_emb.weight)
         transformer_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
@@ -1054,7 +1060,7 @@ class GPT(nn.Module):
         prev_f = self.bigram_prev_factors[input_ids]  # [B, T, R]
         bigram_flat = prev_f.reshape(-1, self.bigram_rank) @ self.bigram_next_factors.to(prev_f.dtype).T
 
-        full_logits = self.transformer_scale * transformer_logits + bigram_flat
+        full_logits = bigram_flat + self.transformer_scale * transformer_logits
         return full_logits, bigram_flat  # [B*T, V], [B*T, V]
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1194,8 +1200,7 @@ def main() -> None:
         rope_partial_dims=args.rope_partial_dims,
         encoder_layer_frac=args.encoder_layer_frac,
         bigram_rank=args.bigram_rank,
-        use_layer_gains=args.use_layer_gains,
-        layer_gain_init=args.layer_gain_init,
+        use_feature_gate=args.use_feature_gate,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1229,7 +1234,7 @@ def main() -> None:
             rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
             logit_sharpen=args.logit_sharpen, rope_partial_dims=args.rope_partial_dims,
             encoder_layer_frac=args.encoder_layer_frac, bigram_rank=args.bigram_rank,
-            use_layer_gains=args.use_layer_gains, layer_gain_init=args.layer_gain_init,
+            use_feature_gate=args.use_feature_gate,
         ).to(device).bfloat16()
         teacher_model.load_state_dict(teacher_sd, strict=False)
         teacher_model.eval()
@@ -1306,11 +1311,8 @@ def main() -> None:
     n_enc = base_model.num_encoder_layers
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
+    log0(f"feature_gate:{'enabled' if args.use_feature_gate else 'disabled'}")
     log0(f"bigram_residual_transformer:rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
-    if args.use_layer_gains:
-        log0(f"layer_gains:enabled init:{args.layer_gain_init}")
-    else:
-        log0("layer_gains:disabled")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
