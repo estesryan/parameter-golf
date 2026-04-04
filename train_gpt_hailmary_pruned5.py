@@ -130,6 +130,8 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     use_int6 = bool(int(os.environ.get("USE_INT6", "0")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
+    use_lag_mixer = bool(int(os.environ.get("USE_LAG_MIXER", "1")))
+    lag_list = [1, 2, 4, 8, 16, 32, 64, 128]
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
 
@@ -141,10 +143,6 @@ class Hyperparameters:
     # --- QAT mode: off | late | progressive ---
     qat_mode = os.environ.get("QAT_MODE", "progressive")
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.6))
-
-    # --- Local conv: cheap causal depthwise conv for 4-64 token local structure ---
-    local_conv_kernel = int(os.environ.get("LOCAL_CONV_KERNEL", 7))
-    use_local_conv = bool(int(os.environ.get("USE_LOCAL_CONV", "1")))
 
     # --- Distillation: CE on full logits + KL on residual logits (residual = full − bigram_base) ---
     use_distillation = bool(int(os.environ.get("USE_DISTILLATION", "0")))
@@ -896,20 +894,6 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class LocalConv(nn.Module):
-    """Causal depthwise 1D convolution for cheap local structure mixing. [B, T, C] → [B, T, C]."""
-    def __init__(self, dim: int, kernel_size: int):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.conv = nn.Conv1d(dim, dim, kernel_size=kernel_size, groups=dim, bias=False)
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: [B, T, C] → transpose to [B, C, T], causal-pad left, conv, transpose back
-        x_t = x.transpose(1, 2)  # [B, C, T]
-        x_t = F.pad(x_t, (self.kernel_size - 1, 0))  # causal left-pad
-        return self.conv(x_t).transpose(1, 2)  # [B, T, C]
-
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -920,8 +904,8 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         rope_partial_dims: int,
-        use_local_conv: bool = False,
-        local_conv_kernel: int = 7,
+        use_lag_mixer: bool = True,
+        lag_list: list | None = None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -931,18 +915,34 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        if use_local_conv:
-            self.local_conv = LocalConv(dim, kernel_size=local_conv_kernel)
-            self.conv_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.05)
+        if use_lag_mixer and lag_list:
+            self.lag_list = lag_list
+            self.lag_scales = nn.Parameter(
+                torch.zeros(len(lag_list), dim, dtype=torch.float32)
+            )
         else:
-            self.local_conv = None
+            self.lag_list = []
+            self.lag_scales = None
+
+    def apply_lag_mixer(self, x: Tensor) -> Tensor:
+        # x: [B, T, C]
+        if self.lag_scales is None:
+            return x
+        _, T, _ = x.shape
+        out = x
+        for i, d in enumerate(self.lag_list):
+            if d >= T:
+                continue
+            shifted = torch.zeros_like(x)
+            shifted[:, d:, :] = x[:, :-d, :]
+            scale = self.lag_scales[i].to(dtype=x.dtype)[None, None, :]
+            out = out + scale * shifted
+        return out
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        if self.local_conv is not None:
-            conv_out = self.local_conv(x)
-            x = x + self.conv_scale.to(dtype=x.dtype)[None, None, :] * conv_out
+        x = self.apply_lag_mixer(x)
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -971,8 +971,8 @@ class GPT(nn.Module):
         rope_partial_dims: int = 8,
         encoder_layer_frac: float = 0.35,
         bigram_rank: int = 64,
-        use_local_conv: bool = False,
-        local_conv_kernel: int = 7,
+        use_lag_mixer: bool = True,
+        lag_list: list | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1018,8 +1018,8 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     rope_partial_dims,
-                    use_local_conv=use_local_conv,
-                    local_conv_kernel=local_conv_kernel,
+                    use_lag_mixer=use_lag_mixer,
+                    lag_list=lag_list,
                 )
                 for i in range(n_blocks)
             ]
@@ -1211,8 +1211,8 @@ def main() -> None:
         rope_partial_dims=args.rope_partial_dims,
         encoder_layer_frac=args.encoder_layer_frac,
         bigram_rank=args.bigram_rank,
-        use_local_conv=args.use_local_conv,
-        local_conv_kernel=args.local_conv_kernel,
+        use_lag_mixer=args.use_lag_mixer,
+        lag_list=args.lag_list,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1322,11 +1322,11 @@ def main() -> None:
     n_enc = base_model.num_encoder_layers
     n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
-    log0(f"bigram_residual_transformer:rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
-    if args.use_local_conv:
-        log0(f"local_conv:enabled kernel:{args.local_conv_kernel}")
+    if args.use_lag_mixer:
+        log0(f"lag_mixer:enabled lags={args.lag_list}")
     else:
-        log0("local_conv:disabled")
+        log0("lag_mixer:disabled")
+    log0(f"bigram_residual_transformer:rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
