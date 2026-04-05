@@ -840,7 +840,7 @@ class GPT(nn.Module):
         self.tri23_w = nn.Parameter(torch.tensor(trigram23_weight_init))
 
         self.transformer_scale = nn.Parameter(torch.tensor(transformer_scale_init))
-        self.prior_hidden_scale = nn.Parameter(torch.tensor(1.0))
+        self.prior_hidden_scale = nn.Parameter(torch.tensor(0.1))
 
         self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
         n_blocks = num_layers
@@ -937,6 +937,7 @@ class GPT(nn.Module):
             + self.tri23_w * tri23
         )
         prior_hidden = F.linear(prior_logits.to(x.dtype), self.tok_emb.weight.t())
+        prior_hidden = F.rms_norm(prior_hidden, (prior_hidden.size(-1),))
         x = x + self.prior_hidden_scale.to(dtype=x.dtype) * prior_hidden
         transformer_logits = F.linear(x, self.tok_emb.weight)
         logits = self.transformer_scale * transformer_logits
