@@ -1,11 +1,10 @@
 """
-ARCHITECTURE: 
-Mamba2 SSM + Topic-conditioned MoE + BigramHash + AR Self-Gen GPTQ architecture
-The proposed Mamba2 SSM + Topic-conditioned MoE + BigramHash + AR Self-Gen GPTQ architecture is fully allowed under the official rules.
+Multilag Bigram + Trigram Residual Transformer
 
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
-
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Architecture: multilag bigram (lags 1/2/4, SVD init on lag-1) + three separate trigram heads
+(12, 13, 23) + shallow U-Net transformer with partial RoPE, tied embeddings, and bfloat16 training.
+Optimizer: Muon for matrix params, Adam for scalars/embeddings.
+QAT: progressive INT6/INT8 quantization-aware training in the final phase.
 """
 
 from __future__ import annotations
@@ -46,11 +45,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 8 KV heads (GQA) and 1x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -78,15 +72,20 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 448))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 1))
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
+
+    bigram_rank = int(os.environ.get("BIGRAM_RANK", 32))
+    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 16))
+    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 12))
+    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 8))
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
@@ -107,18 +106,28 @@ class Hyperparameters:
     use_int6 = bool(int(os.environ.get("USE_INT6", "0")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
+    qat_mode = os.environ.get("QAT_MODE", "progressive")
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.6))
+    bigram_trainable = bool(int(os.environ.get("BIGRAM_TRAINABLE", "0")))
+    use_multilag_bigram = bool(int(os.environ.get("USE_MULTILAG_BIGRAM", "1")))
+    bigram_lags = [1, 2, 4]
+    rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
+    encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
+    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.22))
+    trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.40))
+    trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.20))
+    trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.20))
+    transformer_scale_init = float(os.environ.get("TRANSFORMER_SCALE_INIT", 0.9))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
+    debug_lag_weights = bool(int(os.environ.get("DEBUG_LAG_WEIGHTS", "0")))
 
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
+# Adapted from modded-nanogpt. Background: https://kellerjordan.github.io/posts/muon/
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
+    # Newton-Schulz iteration to orthogonalize a 2D gradient matrix.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -577,6 +586,34 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
+
+def build_bigram_factors(
+    train_files: str,
+    vocab_size: int,
+    rank: int,
+    max_tokens: int = 50_000_000,
+) -> tuple[Tensor, Tensor]:
+    counts = torch.zeros(vocab_size, vocab_size, dtype=torch.float32)
+    stream = TokenStream(train_files)
+    tokens_read = 0
+    prev = None
+    while tokens_read < max_tokens:
+        chunk = stream.take(1_000_000)
+        if prev is not None:
+            chunk = torch.cat([prev, chunk])
+        counts[chunk[:-1].long(), chunk[1:].long()] += 1
+        prev = chunk[-1:]
+        tokens_read += chunk.numel()
+    probs = counts / counts.sum(dim=1, keepdim=True).clamp_min(1)
+    logits = torch.log(probs + 1e-8)
+    q = min(rank * 2 + 8, vocab_size)
+    U, S, V = torch.svd_lowrank(logits, q=q, niter=8)
+    S_sqrt = S[:rank].clamp_min(0.0).sqrt()
+    prev_factors = (U[:, :rank] * S_sqrt.unsqueeze(0)).contiguous()
+    next_factors = (V[:, :rank] * S_sqrt.unsqueeze(0)).contiguous()
+    return prev_factors, next_factors
+
+
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -630,10 +667,11 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int) -> Tensor:
+    half = rope_dims // 2
+    x1, x2 = x[..., :half], x[..., half:rope_dims]
+    rotated = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    return torch.cat((rotated, x[..., rope_dims:]), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -644,6 +682,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_partial_dims: int = 8,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -655,6 +694,11 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        if rope_partial_dims % 2 != 0:
+            raise ValueError("rope_partial_dims must be even")
+        if rope_partial_dims > self.head_dim:
+            raise ValueError("rope_partial_dims must be <= head_dim")
+        self.rope_partial_dims = rope_partial_dims
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -662,7 +706,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.rope_partial_dims, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -672,8 +716,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin, self.rope_partial_dims)
+        k = apply_rotary_emb(k, cos, sin, self.rope_partial_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -695,10 +739,10 @@ class MLP(nn.Module):
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
-        self.prelu = nn.PReLU(num_parameters=1, init=0.1)
+        self.act = nn.LeakyReLU(negative_slope=0.1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.prelu(self.fc(x))
+        x = self.act(self.fc(x))
         return self.proj(x.square())
 
 
@@ -711,11 +755,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_partial_dims: int = 8,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_partial_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
@@ -744,6 +789,18 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         logit_sharpen: float = 1.1,
+        bigram_rank: int = 32,
+        bigram_lags: list = None,
+        trigram12_rank: int = 16,
+        trigram13_rank: int = 16,
+        trigram23_rank: int = 16,
+        rope_partial_dims: int = 8,
+        encoder_layer_frac: float = 0.35,
+        bigram_base_scale: float = 0.22,
+        trigram12_weight_init: float = 0.40,
+        trigram13_weight_init: float = 0.20,
+        trigram23_weight_init: float = 0.20,
+        transformer_scale_init: float = 0.9,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -752,9 +809,42 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+
+        # Multilag bigram: lags [1,2,4], SVD-initialized on lag-1 slot (index 0), others small-random init.
+        self.bigram_lags = bigram_lags if bigram_lags is not None else [1]
+        num_lags = len(self.bigram_lags)
+        self.bigram_prev = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
+        self.bigram_next = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
+        _lag_w = torch.tensor([1.0, 0.18, 0.07], dtype=torch.float32)
+        if num_lags != 3:
+            _lag_w = torch.ones(num_lags, dtype=torch.float32)
+            _lag_w[1:] *= 0.15
+        self.bigram_lag_weights = nn.Parameter(_lag_w)
+        self.bigram_scale = nn.Parameter(torch.tensor(bigram_base_scale))
+
+        # Three independent trigram heads (token-pairs 1-2, 1-3, 2-3), each in logit space.
+        self.tri12_a = nn.Parameter(torch.randn(vocab_size, trigram12_rank) * 0.02)
+        self.tri12_b = nn.Parameter(torch.randn(vocab_size, trigram12_rank) * 0.02)
+        self.tri12_out = nn.Parameter(torch.randn(trigram12_rank, vocab_size) * 0.02)
+
+        self.tri13_a = nn.Parameter(torch.randn(vocab_size, trigram13_rank) * 0.02)
+        self.tri13_b = nn.Parameter(torch.randn(vocab_size, trigram13_rank) * 0.02)
+        self.tri13_out = nn.Parameter(torch.randn(trigram13_rank, vocab_size) * 0.02)
+
+        self.tri23_a = nn.Parameter(torch.randn(vocab_size, trigram23_rank) * 0.02)
+        self.tri23_b = nn.Parameter(torch.randn(vocab_size, trigram23_rank) * 0.02)
+        self.tri23_out = nn.Parameter(torch.randn(trigram23_rank, vocab_size) * 0.02)
+
+        self.tri12_w = nn.Parameter(torch.tensor(trigram12_weight_init))
+        self.tri13_w = nn.Parameter(torch.tensor(trigram13_weight_init))
+        self.tri23_w = nn.Parameter(torch.tensor(trigram23_weight_init))
+
+        self.transformer_scale = nn.Parameter(torch.tensor(transformer_scale_init))
+        self.prior_hidden_scale = nn.Parameter(torch.tensor(1.0))
+
         self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
         n_blocks = num_layers
-        self.num_encoder_layers = n_blocks // 2
+        self.num_encoder_layers = max(1, round(n_blocks * encoder_layer_frac))
         self.num_decoder_layers = n_blocks - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
@@ -769,6 +859,7 @@ class GPT(nn.Module):
                     mlp_mults[i],
                     rope_base,
                     qk_gain_init,
+                    rope_partial_dims,
                 )
                 for i in range(n_blocks)
             ]
@@ -801,10 +892,59 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)
+
+        B, T = input_ids.shape
+        device = input_ids.device
+
+        pad1 = torch.zeros(B, 1, dtype=input_ids.dtype, device=device)
+        pad2 = torch.zeros(B, 2, dtype=input_ids.dtype, device=device)
+        pad3 = torch.zeros(B, 3, dtype=input_ids.dtype, device=device)
+
+        t1 = torch.cat([pad1, input_ids[:, :-1]], dim=1)
+        t2 = torch.cat([pad2, input_ids[:, :-2]], dim=1)
+        t3 = torch.cat([pad3, input_ids[:, :-3]], dim=1)
+
+        # --- Bigram (multilag) ---
+        _rank = self.bigram_prev.size(2)
+        _scale = math.sqrt(_rank)
+        _lag_shifted = {}
+        for _lag in self.bigram_lags:
+            _pad = torch.zeros(B, _lag, dtype=input_ids.dtype, device=device)
+            _lag_shifted[_lag] = torch.cat([_pad, input_ids[:, :-_lag]], dim=1)
+        b = torch.zeros(B, T, self.bigram_next.size(1), dtype=torch.float32, device=device)
+        for _i, _lag in enumerate(self.bigram_lags):
+            _sid = _lag_shifted[_lag]
+            _contrib = (self.bigram_prev[_i][_sid].float() @ self.bigram_next[_i].float().t()) / _scale
+            b = b + self.bigram_lag_weights[_i] * _contrib
+
+        # --- Trigram 12 ---
+        z12 = (self.tri12_a[t1] * self.tri12_b[t2])
+        tri12 = z12 @ self.tri12_out
+
+        # --- Trigram 13 ---
+        z13 = (self.tri13_a[t1] * self.tri13_b[t3])
+        tri13 = z13 @ self.tri13_out
+
+        # --- Trigram 23 ---
+        z23 = (self.tri23_a[t2] * self.tri23_b[t3])
+        tri23 = z23 @ self.tri23_out
+
+        prior_logits = (
+            self.bigram_scale * b
+            + self.tri12_w * tri12
+            + self.tri13_w * tri13
+            + self.tri23_w * tri23
+        )
+        prior_hidden = F.linear(prior_logits.to(x.dtype), self.tok_emb.weight.t())
+        x = x + self.prior_hidden_scale.to(dtype=x.dtype) * prior_hidden
+        transformer_logits = F.linear(x, self.tok_emb.weight)
+        logits = self.transformer_scale * transformer_logits
+
+        logits = logits.reshape(-1, logits.size(-1))
         targets = target_ids.reshape(-1)
-        logits_proj = F.linear(x, self.tok_emb.weight)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        logits = torch.clamp(logits, -50, 50)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         loss = -target_logp.mean()
@@ -922,18 +1062,41 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         logit_sharpen=args.logit_sharpen,
+        bigram_rank=args.bigram_rank,
+        bigram_lags=args.bigram_lags if args.use_multilag_bigram else [1],
+        trigram12_rank=args.trigram12_rank,
+        trigram13_rank=args.trigram13_rank,
+        trigram23_rank=args.trigram23_rank,
+        rope_partial_dims=args.rope_partial_dims,
+        encoder_layer_frac=args.encoder_layer_frac,
+        bigram_base_scale=args.bigram_base_scale,
+        trigram12_weight_init=args.trigram12_weight_init,
+        trigram13_weight_init=args.trigram13_weight_init,
+        trigram23_weight_init=args.trigram23_weight_init,
+        transformer_scale_init=args.transformer_scale_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    log0("Building bigram factors via truncated SVD...")
+    _prev_factors, _next_factors = build_bigram_factors(args.train_files, args.vocab_size, args.bigram_rank)
+    with torch.no_grad():
+        base_model.bigram_prev.data[0].copy_(_prev_factors.to(device=device, dtype=base_model.bigram_prev.dtype))
+        base_model.bigram_next.data[0].copy_(_next_factors.to(device=device, dtype=base_model.bigram_next.dtype))
+    with torch.no_grad():
+        if base_model.bigram_prev.size(0) > 1:
+            base_model.bigram_prev[1:].normal_(mean=0.0, std=1e-3)
+            base_model.bigram_next[1:].normal_(mean=0.0, std=1e-3)
+    del _prev_factors, _next_factors
+    if not args.bigram_trainable:
+        base_model.bigram_prev.requires_grad_(False)
+        base_model.bigram_next.requires_grad_(False)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token embedding (Adam) uses TIED_EMBED_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
+    # Three optimizer groups: token embedding (Adam/TIED_EMBED_LR), transformer matrices
+    # (Muon/MATRIX_LR), and all scalars/vectors including bigram/trigram weights (Adam/SCALAR_LR).
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -948,6 +1111,19 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.extend(base_model.token_mixer.parameters())
+    _bigram_trainable_params = [
+        p for p in [base_model.bigram_prev, base_model.bigram_next] if p.requires_grad
+    ]
+    scalar_params.extend([base_model.bigram_scale, base_model.transformer_scale,
+                           base_model.prior_hidden_scale,
+                           base_model.bigram_lag_weights,
+                           *_bigram_trainable_params,
+                           base_model.tri12_w, base_model.tri13_w, base_model.tri23_w])
+    matrix_params.extend([
+        base_model.tri12_a, base_model.tri12_b, base_model.tri12_out,
+        base_model.tri13_a, base_model.tri13_b, base_model.tri13_out,
+        base_model.tri23_a, base_model.tri23_b, base_model.tri23_out,
+    ])
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1065,6 +1241,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if args.debug_lag_weights:
+                log0(f"lag_weights:{base_model.bigram_lag_weights.detach().cpu().tolist()}")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1113,12 +1291,22 @@ def main() -> None:
                             if p.requires_grad:
                                 p.mul_(1 - lr * args.adam_weight_decay)
 
-        # Late QAT: apply fake int6 quantization when LR scale is below threshold
-        if args.late_qat and args.use_int6 and scale < args.late_qat_threshold:
-            with torch.no_grad():
-                for name, param in base_model.named_parameters():
-                    if param.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
-                        param.data.copy_(fake_quantize_int6(param.data))
+        _qat_mode = args.qat_mode
+        if _qat_mode == "off" and args.late_qat:
+            _qat_mode = "late"
+
+        if args.use_int6 and _qat_mode != "off":
+            _do_qat = False
+            if _qat_mode == "late":
+                _do_qat = scale < args.late_qat_threshold
+            elif _qat_mode == "progressive":
+                _elapsed_frac = (elapsed_ms / max_wallclock_ms) if max_wallclock_ms else (step / max(args.iterations, 1))
+                _do_qat = min(_elapsed_frac, 1.0) >= args.qat_start_frac
+            if _do_qat:
+                with torch.no_grad():
+                    for name, param in base_model.named_parameters():
+                        if param.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                            param.data.copy_(fake_quantize_int6(param.data))
 
         zero_grad_all()
 
