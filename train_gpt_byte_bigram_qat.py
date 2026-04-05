@@ -1,21 +1,39 @@
 """
-Structured residual language model: low-rank bigram base + compact transformer residual.
+This script implements a compression-aware autoregressive language model for the
+OpenAI parameter-golf challenge, optimized for strong performance under strict
+artifact-size and wall-clock constraints.
 
 Architecture:
-  - Low-rank bigram logit model: initialized via truncated SVD of corpus bigram counts (rank R).
-    Replaces the full [V×V] bigram table with two [V×R] factor matrices; bigram logits computed
-    on-the-fly as prev_factors[t] @ next_factors.T — never materializes the full matrix.
-    Parameter savings: V² → 2·V·R (full bigram: 1,048,576 params → low-rank: 131,072 params, ~8× reduction at R=64, V=1024).
-  - Compact transformer residual: small learned correction (scale ~0.3) on top of the bigram base.
-    Input is token embeddings only — no hidden-space n-gram augmentation.
-  - Minimal RoPE: only ROPE_PARTIAL_DIMS (default 8) of head dims get positional encoding
-  - Asymmetric U-Net: ENCODER_LAYER_FRAC=0.35 → enc/dec split with skip connections
-  - LeakyReLU(0.5)² activation
-  - Optional distillation (USE_DISTILLATION): CE loss on full logits; KL loss on residual logits only
-    (residual = full_logits − that model's own bigram base, so the shared corpus statistic is factored out)
-  - QAT modes: off | late | progressive (start fake-int6 at QAT_START_FRAC of training budget)
-  - Shared multi-trigram interaction module: three ordered pair interactions (t-1,t-2), (t-1,t-3),
-    (t-2,t-3) through a shared latent space with one output projection to vocab.
+- Compact GPT-style decoder-only transformer with RoPE attention, grouped-query
+  attention (GQA), RMSNorm, residual mixing, and a minimal MLP.
+- Byte-level tokenizer (vocab_size=256), operating directly on UTF-8 encoded data.
+- Tied token embeddings reused for output projection to reduce parameter count.
+- BigramHash input augmentation:
+  - Adjacent token pairs are hashed into a small embedding table.
+  - A low-dimensional bigram embedding is projected to model_dim and added to
+    the token embedding (scaled), injecting local n-gram structure at low cost.
+- Lightweight depthwise token-mixing convolution applied before the transformer
+  stack to improve local context mixing.
+
+Training:
+- Optimized for short wall-clock training using bf16 compute, torch.compile,
+  FlashAttention-backed SDPA, Muon for matrix parameters, and Adam for embeddings
+  and scalar/control parameters.
+- Optional ramped int6-aware quantization (QAT-style) during training to improve
+  compressibility of weights.
+- Auxiliary bigram loss encourages modeling of local token transitions to improve
+  convergence speed and compression efficiency.
+- EMA-based self-distillation is enabled by default to accelerate convergence under short training budgets.
+
+Compression / export:
+- Post-training quantization to int8 (or int6-in-int8) with per-row scaling.
+- Final model artifact compressed with zlib or zstd to meet submission size limits.
+- Roundtrip validation ensures numerical consistency after compression.
+
+Design goal:
+- Maximize bits-per-byte (BPB) performance per byte of final artifact size.
+- Emphasize parameter efficiency, local structure modeling, and compression-aware
+  training rather than raw model scale.
 """
 
 from __future__ import annotations
@@ -33,14 +51,19 @@ import uuid
 import zlib
 from pathlib import Path
 
+# Import zstandard for better compression than zlib, installing if needed
 try:
     import zstandard as zstd
     HAS_ZSTD = True
 except ImportError:
-    HAS_ZSTD = False
+    subprocess.run(["pip", "install", "zstandard", "-q"], check=False)
+    try:
+        import zstandard as zstd
+        HAS_ZSTD = True
+    except ImportError:
+        HAS_ZSTD = False
 
 import numpy as np
-import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -50,18 +73,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default run configuration:
-# - 8 transformer blocks at width 448
-# - 8 attention heads with 8 KV heads (GQA) and 1.0x MLP expansion
+# Default Simple Baseline run:
+# - 9 transformer blocks at width 512
+# - 8 attention heads with 8 KV heads (GQA) and 1x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_byte")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -81,22 +103,19 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 8))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 256))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
-    model_dim = int(os.environ.get("MODEL_DIM", 448))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 1))
+    mlp_mult = int(os.environ.get("MLP_MULT", 1))
+    bigram_hash_size = int(os.environ.get("BIGRAM_HASH_SIZE", 512))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 64))
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
-    # --- Bigram-Residual Transformer hyperparameters ---
-    # Head dimensions that receive positional encoding. Flat position entropy justifies keeping this small.
-    rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
-    # Fraction of transformer blocks used as encoder in the U-Net. 0.35 → 3 enc / 5 dec for 8 layers.
-    encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
@@ -116,38 +135,19 @@ class Hyperparameters:
     use_int6 = bool(int(os.environ.get("USE_INT6", "0")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.35))
+    qat_full_frac = float(os.environ.get("QAT_FULL_FRAC", 0.75))
+    qat_embeddings = bool(int(os.environ.get("QAT_EMBEDDINGS", "0")))
+    distill_lambda = float(os.environ.get("DISTILL_LAMBDA", 0.2))
+    distill_temp = float(os.environ.get("DISTILL_TEMP", 1.5))
+    distill_ema_decay = float(os.environ.get("DISTILL_EMA_DECAY", 0.999))
+    bigram_loss_lambda = float(os.environ.get("BIGRAM_LOSS_LAMBDA", 0.1))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
 
-    # --- Low-rank bigram: replaces full [V×V] table with two [V×R] factor matrices ---
-    bigram_rank = int(os.environ.get("BIGRAM_RANK", 64))
-    bigram_trainable = bool(int(os.environ.get("BIGRAM_TRAINABLE", "0")))
-    bigram_reg_lambda = float(os.environ.get("BIGRAM_REG_LAMBDA", 1e-4))
-
-    # --- QAT mode: off | late | progressive ---
-    qat_mode = os.environ.get("QAT_MODE", "progressive")
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.6))
-
-    # --- Multi-lag bigram: sum of low-rank bigram bases at lags [1, 2, 4, 8, 16] ---
-    use_multilag_bigram = bool(int(os.environ.get("USE_MULTILAG_BIGRAM", "1")))
-    bigram_lags = [1, 2, 4, 8, 16]
-
-    # --- Distillation: CE on full logits + KL on residual logits (residual = full − bigram_base) ---
-    use_distillation = bool(int(os.environ.get("USE_DISTILLATION", "0")))
-    distill_alpha = float(os.environ.get("DISTILL_ALPHA", 0.7))
-    distill_temperature = float(os.environ.get("DISTILL_TEMPERATURE", 1.5))
-    distill_teacher_path = os.environ.get("DISTILL_TEACHER_PATH", "")
-
-    # --- Shared multi-trigram: one latent space for all three ordered pair interactions ---
-    trigram_rank = int(os.environ.get("TRIGRAM_RANK", 16))
-    trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.60))
-    trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.30))
-    trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.30))
-    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.5))
-
 # -----------------------------
-# MUON OPTIMIZER
+# MUON OPTIMIZER 
 # -----------------------------
-#
+# 
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
@@ -248,7 +248,7 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP
+# TOKENIZER-AGNOSTIC EVALUATION SETUP 
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -256,31 +256,12 @@ class Muon(torch.optim.Optimizer):
 # We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
 # Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
 
-def build_sentencepiece_luts(
-    sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor]:
-    sp_vocab_size = int(sp.vocab_size())
-    table_size = max(sp_vocab_size, vocab_size)
-    base_bytes_np = np.zeros((table_size,), dtype=np.int16)
-    has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
-    is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
-    for token_id in range(sp_vocab_size):
-        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
-            continue
-        is_boundary_token_np[token_id] = False
-        if sp.is_byte(token_id):
-            base_bytes_np[token_id] = 1
-            continue
-        piece = sp.id_to_piece(token_id)
-        if piece.startswith("▁"):
-            has_leading_space_np[token_id] = True
-            piece = piece[1:]
-        base_bytes_np[token_id] = len(piece.encode("utf-8"))
-    return (
-        torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
-        torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
-        torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
-    )
+def build_byte_luts(vocab_size: int, device: torch.device):
+    # Byte-level tokenizer: each token = 1 byte
+    base_bytes = torch.ones(vocab_size, dtype=torch.int16, device=device)
+    has_leading_space = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+    is_boundary_token = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+    return base_bytes, has_leading_space, is_boundary_token
 
 
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
@@ -293,6 +274,7 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
+
 
 def eval_val(
     args: Hyperparameters,
@@ -457,6 +439,23 @@ def fake_quantize_int6(t: Tensor) -> Tensor:
             t_q = torch.round(t32.clamp(-clip_abs, clip_abs) / scale) * scale
         return t_q.to(dtype=t.dtype)
 
+def apply_ramped_int6_qat_(model: nn.Module, mix: float, qat_embeddings: bool = False) -> None:
+    mix = float(max(0.0, min(1.0, mix)))
+    if mix <= 0.0:
+        return
+
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if param.ndim != 2:
+                continue
+            if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                continue
+            if (not qat_embeddings) and ("tok_emb" in name or "bigram_emb" in name):
+                continue
+
+            q = fake_quantize_int6(param.data)
+            param.data.lerp_(q, mix)
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], use_int6: bool = False):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
@@ -541,7 +540,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING
+# DATA LOADING 
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -611,40 +610,6 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-
-def build_bigram_factors(
-    train_files: str, vocab_size: int, rank: int, max_tokens: int = 50_000_000
-) -> tuple[Tensor, Tensor]:
-    """Build low-rank bigram factors via truncated SVD of corpus bigram log-prob matrix.
-
-    Returns (prev_factors, next_factors) each of shape [vocab_size, rank] such that
-    prev_factors @ next_factors.T ≈ log P(next | prev).  Never stores the full [V×V] matrix
-    after factorization.  Uses randomized SVD for speed (O(V·rank) vs O(V³)).
-    """
-    counts = torch.zeros(vocab_size, vocab_size, dtype=torch.float32)
-    stream = TokenStream(train_files)
-    tokens_read = 0
-    prev = None
-    while tokens_read < max_tokens:
-        chunk = stream.take(1_000_000)
-        if prev is not None:
-            chunk = torch.cat([prev, chunk])
-        counts[chunk[:-1].long(), chunk[1:].long()] += 1
-        prev = chunk[-1:]
-        tokens_read += chunk.numel()
-    probs = counts / counts.sum(dim=1, keepdim=True).clamp_min(1)
-    logits = torch.log(probs + 1e-8)
-
-    # Randomized truncated SVD: much faster than full SVD for small rank.
-    # logits ≈ U @ diag(S) @ V.T  →  prev_factors = U*√S, next_factors = V*√S
-    q = min(rank * 2 + 8, vocab_size)
-    U, S, V = torch.svd_lowrank(logits, q=q, niter=8)
-    S_sqrt = S[:rank].clamp_min(0.0).sqrt()
-    prev_factors = (U[:, :rank] * S_sqrt.unsqueeze(0)).contiguous()
-    next_factors = (V[:, :rank] * S_sqrt.unsqueeze(0)).contiguous()
-    return prev_factors, next_factors
-
-
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
@@ -698,14 +663,10 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int) -> Tensor:
-    # Rotate only the first rope_dims elements of the head dim; pass the rest through.
-    # cos/sin shape: [1, 1, T, rope_dims//2]
-    x1 = x[..., :rope_dims // 2]
-    x2 = x[..., rope_dims // 2:rope_dims]
-    rotated = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-    # Concatenate un-rotated tail dimensions (empty when rope_dims == head_dim)
-    return torch.cat((rotated, x[..., rope_dims:]), dim=-1)
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -716,7 +677,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        rope_partial_dims: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -728,9 +688,6 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        if rope_partial_dims % 2 != 0 or rope_partial_dims > self.head_dim:
-            raise ValueError("rope_partial_dims must be even and ≤ head_dim")
-        self.rope_partial_dims = rope_partial_dims
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -738,8 +695,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        # RoPE only covers rope_partial_dims; remaining head dims get no positional bias.
-        self.rotary = Rotary(rope_partial_dims, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -749,9 +705,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        # Apply positional encoding to only the first rope_partial_dims of each head.
-        q = apply_rotary_emb(q, cos, sin, self.rope_partial_dims)
-        k = apply_rotary_emb(k, cos, sin, self.rope_partial_dims)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -766,15 +721,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: float):
+    # relu^2 MLP from the original modded-nanogpt setup
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = int(round(mlp_mult * dim / 8)) * 8
+        hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.prelu = nn.PReLU(num_parameters=1, init=0.1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
+        x = self.prelu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -784,15 +741,14 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: float,
+        mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        rope_partial_dims: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_partial_dims)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
@@ -808,13 +764,6 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    """Bigram-residual transformer.
-
-    Architecture: low-rank bigram logit base + compact transformer residual.
-    Input to the transformer is token embeddings only (no hidden-space n-gram augmentation).
-    Shared multi-trigram module: three ordered pair interactions (t-1,t-2), (t-1,t-3), (t-2,t-3)
-    through shared latent token factors and a single output projection.
-    """
     def __init__(
         self,
         vocab_size: int,
@@ -822,22 +771,14 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: float,
+        mlp_mult: int,
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        bigram_hash_size: int,
+        bigram_dim: int,
         logit_sharpen: float = 1.1,
-        rope_partial_dims: int = 8,
-        encoder_layer_frac: float = 0.35,
-        bigram_rank: int = 64,
-        use_multilag_bigram: bool = True,
-        bigram_lags: list[int] | None = None,
-        trigram_rank: int = 16,
-        trigram12_weight_init: float = 0.60,
-        trigram13_weight_init: float = 0.30,
-        trigram23_weight_init: float = 0.30,
-        bigram_base_scale: float = 0.5,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -846,35 +787,13 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.logit_sharpen = logit_sharpen
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-
-        # Multi-lag low-rank bigram base: sum_i alpha_i * bigram_i(token_{t-lag_i}).
-        # Lag-1 factors initialized from corpus SVD; other lag factors zero-initialized.
-        # Kept in fp32 for precision; cast to compute dtype in _compute_logits like CastedLinear.
-        self.bigram_rank = bigram_rank
-        self.bigram_lags: list[int] = bigram_lags if (use_multilag_bigram and bigram_lags is not None) else [1]
-        self.use_multilag_bigram = use_multilag_bigram
-        num_lags = len(self.bigram_lags)
-        self.bigram_prev_factors = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
-        self.bigram_next_factors = nn.Parameter(torch.zeros(num_lags, vocab_size, bigram_rank))
-        # Lag weights: init [1, 0, 0, ...] so model starts identical to single-lag baseline.
-        _lag_w = torch.zeros(num_lags, dtype=torch.float32)
-        _lag_w[0] = 1.0
-        self.bigram_lag_weights = nn.Parameter(_lag_w)
-
-        # Distillation teacher — set externally before training, not part of state_dict.
-        self._teacher: "GPT | None" = None
-        self._distill_alpha: float = 0.7
-        self._distill_temperature: float = 1.5
-
-        self.transformer_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
-
-        # LUTs registered as buffers so forward() can use them without passing as args.
-        self.register_buffer("has_leading_space_lut", torch.zeros(vocab_size, dtype=torch.bool))
-        self.register_buffer("is_boundary_token_lut", torch.zeros(vocab_size, dtype=torch.bool))
-
-        # Asymmetric U-Net — encoder uses encoder_layer_frac of total blocks.
+        self.bigram_hash_size = bigram_hash_size
+        self.bigram_dim = bigram_dim
+        self.bigram_emb = nn.Embedding(self.bigram_hash_size, self.bigram_dim)
+        self.bigram_proj = CastedLinear(self.bigram_dim, model_dim, bias=False)
+        self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
         n_blocks = num_layers
-        self.num_encoder_layers = max(1, round(n_blocks * encoder_layer_frac))
+        self.num_encoder_layers = n_blocks // 2
         self.num_decoder_layers = n_blocks - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
@@ -889,62 +808,41 @@ class GPT(nn.Module):
                     mlp_mults[i],
                     rope_base,
                     qk_gain_init,
-                    rope_partial_dims,
                 )
                 for i in range(n_blocks)
             ]
         )
         self.final_norm = RMSNorm()
         self.lm_head = None
-
-        # Shared multi-trigram interaction module: one latent space for all three ordered pairs.
-        # Pair interactions (t-1,t-2), (t-1,t-3), (t-2,t-3) share token factors and output projection;
-        # scalar weights learn the relative contribution of each pair.
-        self.trigram_prev_a = nn.Parameter(torch.zeros(vocab_size, trigram_rank))
-        self.trigram_prev_b = nn.Parameter(torch.zeros(vocab_size, trigram_rank))
-        self.trigram_mix_a = nn.Parameter(torch.zeros(trigram_rank, trigram_rank))
-        self.trigram_mix_b = nn.Parameter(torch.zeros(trigram_rank, trigram_rank))
-        self.trigram_out = nn.Parameter(torch.zeros(vocab_size, trigram_rank))
-        self.trigram12_weight = nn.Parameter(torch.tensor(trigram12_weight_init, dtype=torch.float32))
-        self.trigram13_weight = nn.Parameter(torch.tensor(trigram13_weight_init, dtype=torch.float32))
-        self.trigram23_weight = nn.Parameter(torch.tensor(trigram23_weight_init, dtype=torch.float32))
-
-        self.bigram_base_scale = nn.Parameter(torch.tensor(bigram_base_scale, dtype=torch.float32))
-
         self._init_weights()
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-
+        nn.init.normal_(self.bigram_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        nn.init.normal_(self.bigram_proj.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-        nn.init.normal_(self.trigram_prev_a, mean=0.0, std=0.002)
-        nn.init.normal_(self.trigram_prev_b, mean=0.0, std=0.002)
-        nn.init.normal_(self.trigram_mix_a, mean=0.0, std=0.02)
-        nn.init.normal_(self.trigram_mix_b, mean=0.0, std=0.02)
-        nn.init.normal_(self.trigram_out, mean=0.0, std=0.002)
+    def bigram_hash(self, input_ids: Tensor) -> Tensor:
+        # input_ids: (B, T)
+        next_ids = torch.roll(input_ids, shifts=-1, dims=1)
+        next_ids[:, -1] = 0
+        return (input_ids * 1315423911 + next_ids) % self.bigram_hash_size
 
-
-    def _compute_logits(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
-        """Shared forward computation.
-
-        Bigram-residual architecture:
-          - bigram base: low-rank prev_factors @ next_factors.T
-          - trigram-mul additive term: weight * (embed1[t-1] * embed2[t-2]) @ out.T
-          - transformer residual: small correction on top of bigram base
-          - transformer input: token embeddings only
-
-        Returns (full_logits, bigram_base_logits), both [B*T, V].
-        residual_logits = full_logits - bigram_base_logits (the transformer's contribution).
-        """
-        # Transformer input: token embeddings only (no hidden-space n-gram augmentation).
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         tok = self.tok_emb(input_ids)
-        x = tok
+        bi = self.bigram_emb(self.bigram_hash(input_ids))
+        bi = self.bigram_proj(bi)
+        x = tok + 0.5 * bi
+        x = x.transpose(1, 2)
+        x = self.token_mixer(x)
+        x = x[:, :, :input_ids.size(1)]
+        x = x.transpose(1, 2)
+        x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-
         skips: list[Tensor] = []
+
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
@@ -953,81 +851,46 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x_norm = self.final_norm(x)
-        x_flat = x_norm.reshape(-1, x.size(-1))
-        logits_proj = F.linear(x_flat, self.tok_emb.weight)
-        transformer_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        logits_proj = F.linear(x, self.tok_emb.weight)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        logits_f = logits.float() * self.logit_sharpen
 
-        # Multi-lag low-rank bigram base: sum_i weight_i * (prev_factors_i[t-lag_i] @ next_factors_i.T).
-        # Never materializes full [V×V]; each lag contributes [B*T, V] logits.
-        B, T = input_ids.shape
-        vocab_size = self.bigram_prev_factors.shape[1]
-        # fp32 accumulator — matches factor dtype; consistent with original single-lag behavior.
-        bigram_flat = torch.zeros(B * T, vocab_size, device=input_ids.device, dtype=torch.float32)
-        for i, lag in enumerate(self.bigram_lags):
-            if lag == 0:
-                prev_ids = input_ids
-            else:
-                pad = torch.zeros(B, lag, dtype=input_ids.dtype, device=input_ids.device)
-                prev_ids = torch.cat([pad, input_ids[:, :-lag]], dim=1)  # [B, T]
-            prev_f = self.bigram_prev_factors[i][prev_ids]  # [B, T, R]
-            logits_i = prev_f.reshape(-1, self.bigram_rank) @ self.bigram_next_factors[i].to(prev_f.dtype).T  # [B*T, V]
-            w = self.bigram_lag_weights[i].to(dtype=logits_i.dtype)
-            bigram_flat = bigram_flat + w * logits_i
+        if target_ids is None:
+            return logits_f
 
-        bigram_flat = self.bigram_base_scale.to(dtype=bigram_flat.dtype) * bigram_flat
-
-        # Shared multi-trigram interaction module.
-        # Build shifted context ids for lags 1, 2, 3.
-        pad1 = torch.zeros(B, 1, dtype=input_ids.dtype, device=input_ids.device)
-        pad2 = torch.zeros(B, 2, dtype=input_ids.dtype, device=input_ids.device)
-        pad3 = torch.zeros(B, 3, dtype=input_ids.dtype, device=input_ids.device)
-        prev1_ids = torch.cat([pad1, input_ids[:, :-1]], dim=1)  # [B, T]
-        prev2_ids = torch.cat([pad2, input_ids[:, :-2]], dim=1)  # [B, T]
-        prev3_ids = torch.cat([pad3, input_ids[:, :-3]], dim=1)  # [B, T]
-
-        # Shared projected factors for each lag via the same token embedding matrices.
-        _dt = bigram_flat.dtype
-        mix_a = self.trigram_mix_a.to(_dt)
-        mix_b = self.trigram_mix_b.to(_dt)
-        ma1 = self.trigram_prev_a[prev1_ids].to(_dt) @ mix_a  # [B, T, R]
-        ma2 = self.trigram_prev_a[prev2_ids].to(_dt) @ mix_a  # [B, T, R]
-        mb2 = self.trigram_prev_b[prev2_ids].to(_dt) @ mix_b  # [B, T, R]
-        mb3 = self.trigram_prev_b[prev3_ids].to(_dt) @ mix_b  # [B, T, R]
-
-        # Weighted sum of latent pair interactions; single projection to vocab.
-        w12 = self.trigram12_weight.to(_dt)
-        w13 = self.trigram13_weight.to(_dt)
-        w23 = self.trigram23_weight.to(_dt)
-        z = w12 * (ma1 * mb2) + w13 * (ma1 * mb3) + w23 * (ma2 * mb3)  # [B, T, R]
-        trigram_logits = z.reshape(-1, z.size(-1)) @ self.trigram_out.to(_dt).T  # [B*T, V]
-
-        bigram_flat = bigram_flat + trigram_logits
-
-        full_logits = self.transformer_scale * transformer_logits + bigram_flat
-        return full_logits, bigram_flat  # [B*T, V], [B*T, V]
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        full_logits, bigram_flat = self._compute_logits(input_ids)
         targets = target_ids.reshape(-1)
+        
+        log_probs = F.log_softmax(logits_f, dim=-1)
+        target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        ce_loss = -target_logp.mean()
 
-        if self._teacher is not None:
-            # Residual distillation: CE on full logits, KL on transformer residuals only.
-            # The bigram base is a deterministic corpus statistic; distilling it adds no signal.
-            # Each model's residual = full_logits - its own bigram_base.
-            T = self._distill_temperature
-            ce = F.cross_entropy(full_logits.float() * self.logit_sharpen, targets)
+        loss = ce_loss
+
+        # Self-distillation
+        if self.training and getattr(self, "distill_lambda", 0.0) > 0:
+            T = self.distill_temp
             with torch.no_grad():
-                t_full, t_bigram = self._teacher._compute_logits(input_ids)
-                t_residual = (t_full - t_bigram).float()
-            s_residual = (full_logits - bigram_flat).float()
-            s_lp = F.log_softmax(s_residual / T, dim=-1)
-            t_p = F.softmax(t_residual / T, dim=-1)
-            kl = F.kl_div(s_lp, t_p, reduction="batchmean") * (T * T)
-            return self._distill_alpha * ce + (1.0 - self._distill_alpha) * kl
+                teacher_logits = self._teacher_logits  # injected externally
+                teacher_probs = F.softmax(teacher_logits / T, dim=-1)
 
-        log_probs = F.log_softmax(full_logits.float() * self.logit_sharpen, dim=-1)
-        return -log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1).mean()
+            student_log_probs_T = F.log_softmax(logits_f / T, dim=-1)
+            distill_loss = F.kl_div(student_log_probs_T, teacher_probs, reduction="batchmean") * (T * T)
+
+            loss = loss + self.distill_lambda * distill_loss
+
+        # Bigram auxiliary loss
+        if self.training and getattr(self, "bigram_loss_lambda", 0.0) > 0:
+            # shift targets again (predict y_{t+1} from same logits)
+            next_targets = torch.roll(targets, shifts=-1)
+            next_targets[-1] = 0  # safe padding
+
+            next_logp = log_probs.gather(-1, next_targets.unsqueeze(-1)).squeeze(-1)
+            bigram_loss = -next_logp.mean()
+
+            loss = loss + self.bigram_loss_lambda * bigram_loss
+
+        return loss
 
 
 # -----------------------------
@@ -1108,20 +971,13 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
-        )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_byte_luts(
+        args.vocab_size, device
     )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0("val_bpb:enabled tokenizer_kind=byte")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
@@ -1140,102 +996,49 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        bigram_hash_size=args.bigram_hash_size,
+        bigram_dim=args.bigram_dim,
         logit_sharpen=args.logit_sharpen,
-        rope_partial_dims=args.rope_partial_dims,
-        encoder_layer_frac=args.encoder_layer_frac,
-        bigram_rank=args.bigram_rank,
-        use_multilag_bigram=args.use_multilag_bigram,
-        bigram_lags=args.bigram_lags,
-        trigram_rank=args.trigram_rank,
-        trigram12_weight_init=args.trigram12_weight_init,
-        trigram13_weight_init=args.trigram13_weight_init,
-        trigram23_weight_init=args.trigram23_weight_init,
-        bigram_base_scale=args.bigram_base_scale,
     ).to(device).bfloat16()
+    ema_model = copy.deepcopy(base_model).eval()
+    for p in ema_model.parameters():
+        p.requires_grad_(False)
+    base_model.distill_lambda = args.distill_lambda
+    base_model.distill_temp = args.distill_temp
+    base_model.bigram_loss_lambda = args.bigram_loss_lambda
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-
-    # Keep bigram factors in fp32 for precision; cast to compute dtype in _compute_logits.
-    base_model.bigram_prev_factors.data = base_model.bigram_prev_factors.data.float()
-    base_model.bigram_next_factors.data = base_model.bigram_next_factors.data.float()
-
-    log0(f"building_bigram_factors rank={args.bigram_rank}...")
-    prev_factors, next_factors = build_bigram_factors(args.train_files, args.vocab_size, args.bigram_rank)
-    # Initialize lag-0 (lag=1) with SVD factors; other lags stay zero-initialized.
-    base_model.bigram_prev_factors.data[0].copy_(prev_factors.float())
-    base_model.bigram_next_factors.data[0].copy_(next_factors.float())
-    bigram_init_prev = prev_factors.float().to(device=device)
-    bigram_init_next = next_factors.float().to(device=device)
-    if not args.bigram_trainable:
-        # Freeze factor tensors; bigram_lag_weights remains trainable via scalar optimizer.
-        base_model.bigram_prev_factors.requires_grad_(False)
-        base_model.bigram_next_factors.requires_grad_(False)
-    base_model.has_leading_space_lut.copy_(has_leading_space_lut)
-    base_model.is_boundary_token_lut.copy_(is_boundary_token_lut)
-
-    # Distillation teacher: stored as plain attribute so DDP/state_dict ignore it.
-    if args.use_distillation and args.distill_teacher_path:
-        log0(f"loading_teacher: {args.distill_teacher_path}")
-        teacher_sd = torch.load(args.distill_teacher_path, map_location="cpu", weights_only=True)
-        teacher_model = GPT(
-            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-            tied_embed_init_std=args.tied_embed_init_std, logit_softcap=args.logit_softcap,
-            rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-            logit_sharpen=args.logit_sharpen, rope_partial_dims=args.rope_partial_dims,
-            encoder_layer_frac=args.encoder_layer_frac, bigram_rank=args.bigram_rank,
-            use_multilag_bigram=args.use_multilag_bigram, bigram_lags=args.bigram_lags,
-            trigram_rank=args.trigram_rank,
-            trigram12_weight_init=args.trigram12_weight_init,
-            trigram13_weight_init=args.trigram13_weight_init,
-            trigram23_weight_init=args.trigram23_weight_init,
-            bigram_base_scale=args.bigram_base_scale,
-        ).to(device).bfloat16()
-        teacher_model.load_state_dict(teacher_sd, strict=False)
-        teacher_model.eval()
-        for p in teacher_model.parameters():
-            p.requires_grad_(False)
-        base_model._teacher = teacher_model
-        base_model._distill_alpha = args.distill_alpha
-        base_model._distill_temperature = args.distill_temperature
-        log0(f"distillation_enabled alpha={args.distill_alpha} temperature={args.distill_temperature}")
-    else:
-        teacher_model = None
-
-    # fullgraph=False required when distillation is active (conditional on self._teacher causes graph break)
-    fullgraph = not (args.use_distillation and bool(args.distill_teacher_path))
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=fullgraph)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
 
     # Optimizer split:
-    # - token embedding uses TIED_EMBED_LR via Adam
+    # - token embedding (Adam) uses TIED_EMBED_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
-    #   (includes all trigram prev_a/prev_b/out matrices which are 2D)
     # - vectors/scalars use SCALAR_LR via Adam
-    #   (includes trigram12/13/23_weight which are 0D)
-    # - bigram_prev/next_factors are frozen after initialization and excluded from all optimizers
-    named_params = list(base_model.named_parameters())
-
-    _SKIP_MATRIX_NAMES = {"tok_emb.weight", "bigram_prev_factors", "bigram_next_factors", "bigram_lag_weights"}
-
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
-        p for name, p in named_params
-        if p.ndim == 2
-        and name not in _SKIP_MATRIX_NAMES
-        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        and p.requires_grad
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-
     scalar_params = [
-        p for name, p in named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and p.requires_grad
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
+    scalar_params.extend(base_model.token_mixer.parameters())
+    matrix_params.append(base_model.bigram_proj.weight)
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{
+            "params": [base_model.tok_emb.weight, base_model.bigram_emb.weight],
+            "lr": token_lr,
+            "base_lr": token_lr,
+        }],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1255,32 +1058,10 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
-    if args.bigram_trainable:
-        optimizer_bigram = torch.optim.Adam(
-            [{"params": [base_model.bigram_prev_factors, base_model.bigram_next_factors],
-              "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
-        )
-        optimizers.append(optimizer_bigram)
-
     n_params = sum(p.numel() for p in base_model.parameters())
-    n_enc = base_model.num_encoder_layers
-    n_dec = base_model.num_decoder_layers
     log0(f"model_params:{n_params}")
-    log0("bigram_gate:disabled")
-    log0(
-        f"multitrigram:enabled shared_rank:{args.trigram_rank} "
-        f"w12_init:{args.trigram12_weight_init} w13_init:{args.trigram13_weight_init} w23_init:{args.trigram23_weight_init}"
-    )
-    log0(f"bigram_base_scale:init:{args.bigram_base_scale}")
-    if args.use_multilag_bigram:
-        log0(f"multilag_bigram:enabled lags={args.bigram_lags}")
-    else:
-        log0("multilag_bigram:disabled")
-    log0(f"bigram_residual_transformer:rope_partial_dims:{args.rope_partial_dims} encoder_layer_frac:{args.encoder_layer_frac} enc_layers:{n_enc} dec_layers:{n_dec}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1296,6 +1077,14 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"bigram_hash:hash_size={args.bigram_hash_size} bigram_dim={args.bigram_dim}")
+    log0(f"distill:lambda={args.distill_lambda} temp={args.distill_temp}")
+    log0(f"bigram_loss_lambda:{args.bigram_loss_lambda}")
+    log0(
+        f"qat:use_int6={args.use_int6} late_qat={args.late_qat} "
+        f"qat_start_frac={args.qat_start_frac} qat_full_frac={args.qat_full_frac} "
+        f"qat_embeddings={args.qat_embeddings}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1321,6 +1110,21 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    def qat_mix(step: int, total_steps: int) -> float:
+        if not args.use_int6:
+            return 0.0
+        if total_steps <= 0:
+            return 0.0
+
+        frac = step / total_steps
+        if frac < args.qat_start_frac:
+            return 0.0
+        if frac >= args.qat_full_frac:
+            return 1.0
+
+        span = max(args.qat_full_frac - args.qat_start_frac, 1e-8)
+        return (frac - args.qat_start_frac) / span
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -1338,10 +1142,16 @@ def main() -> None:
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
+            # EMA teacher update
+            with torch.no_grad():
+                decay = args.distill_ema_decay
+                for p, p_ema in zip(base_model.parameters(), ema_model.parameters()):
+                    p_ema.data.lerp_(p.data, 1.0 - decay)
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
+        ema_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
@@ -1383,8 +1193,6 @@ def main() -> None:
                 )
             break
 
-        base_model.current_step = step
-
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
@@ -1394,6 +1202,10 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                if args.distill_lambda > 0:
+                    with torch.no_grad():
+                        teacher_logits = ema_model(x, y=None)  # forward without loss
+                    base_model._teacher_logits = teacher_logits
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -1413,6 +1225,12 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
 
+        # EMA teacher update
+        with torch.no_grad():
+            decay = args.distill_ema_decay
+            for p, p_ema in zip(base_model.parameters(), ema_model.parameters()):
+                p_ema.data.lerp_(p.data, 1.0 - decay)
+
         if args.adam_weight_decay > 0:
             with torch.no_grad():
                 for opt in [optimizer_tok, optimizer_scalar]:
@@ -1422,34 +1240,21 @@ def main() -> None:
                             if p.requires_grad:
                                 p.mul_(1 - lr * args.adam_weight_decay)
 
-        # QAT: apply fake int6 quantization to large matrix weights based on selected mode.
-        # Backward compat: LATE_QAT=1 maps to QAT_MODE=late.
-        _qat_mode = args.qat_mode
-        if _qat_mode == "off" and args.late_qat:
-            _qat_mode = "late"
-        if args.use_int6 and _qat_mode != "off":
-            _do_qat = False
-            if _qat_mode == "late":
-                _do_qat = scale < args.late_qat_threshold
-            elif _qat_mode == "progressive":
-                _elapsed_frac = (elapsed_ms / max_wallclock_ms) if max_wallclock_ms else (step / max(args.iterations, 1))
-                _do_qat = min(_elapsed_frac, 1.0) >= args.qat_start_frac
-            if _do_qat:
-                with torch.no_grad():
-                    for name, param in base_model.named_parameters():
-                        if param.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
-                            param.data.copy_(fake_quantize_int6(param.data))
+        # Ramped QAT: gradually project weights toward their fake-int6 version.
+        mix = qat_mix(step + 1, args.iterations)
+        apply_ramped_int6_qat_(base_model, mix=mix, qat_embeddings=args.qat_embeddings)
 
-        # Bigram L2 regularization toward SVD initialization (only when trainable)
-        if args.bigram_trainable and args.bigram_reg_lambda > 0:
+        # Optional late hard projection can still be kept as a final shove near the end.
+        if args.late_qat and args.use_int6 and scale < args.late_qat_threshold:
             with torch.no_grad():
-                # Regularize only lag-0 (lag=1) factors toward SVD initialization.
-                base_model.bigram_prev_factors.data[0].sub_(
-                    args.bigram_reg_lambda * (base_model.bigram_prev_factors.data[0] - bigram_init_prev)
-                )
-                base_model.bigram_next_factors.data[0].sub_(
-                    args.bigram_reg_lambda * (base_model.bigram_next_factors.data[0] - bigram_init_next)
-                )
+                for name, param in base_model.named_parameters():
+                    if param.ndim != 2:
+                        continue
+                    if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                        continue
+                    if (not args.qat_embeddings) and ("tok_emb" in name or "bigram_emb" in name):
+                        continue
+                    param.data.copy_(fake_quantize_int6(param.data))
 
         zero_grad_all()
 
@@ -1486,23 +1291,6 @@ def main() -> None:
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
-        # Detailed parameter size breakdown by component.
-        _n_bigram = (base_model.bigram_prev_factors.numel() + base_model.bigram_next_factors.numel()
-                     + base_model.bigram_lag_weights.numel())
-        _n_tok = base_model.tok_emb.weight.numel()
-        _n_transformer = sum(
-            p.numel() for name, p in base_model.named_parameters()
-            if not any(k in name for k in ("bigram_", "tok_emb"))
-        )
-        _n_total = sum(p.numel() for p in base_model.parameters())
-        log0(
-            f"param_breakdown:"
-            f" tok_emb={_n_tok:,}"
-            f" bigram_lr={_n_bigram:,} (rank={args.bigram_rank})"
-            f" transformer={_n_transformer:,}"
-            f" total={_n_total:,}"
-        )
-
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
@@ -1530,13 +1318,7 @@ def main() -> None:
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        _submission_bytes = quant_file_bytes + code_bytes
-        _submission_mb = _submission_bytes / (1024 * 1024)
-        _limit_mb = 16.0
-        _status = "WITHIN_LIMIT" if _submission_mb <= _limit_mb else "OVER_LIMIT"
-        log0(f"SUBMISSION_SIZE_BYTES: {_submission_bytes}")
-        log0(f"SUBMISSION_SIZE_MB: {_submission_mb:.4f}")
-        log0(f"SUBMISSION_SIZE_STATUS: {_status} (limit={_limit_mb:.1f} MB)")
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
