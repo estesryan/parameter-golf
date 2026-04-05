@@ -895,8 +895,7 @@ class GPT(nn.Module):
         self.tri_gate_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
         self.mix_gate = nn.Linear(model_dim, 1, bias=True)
-        self.mix_gate_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.mix_gate_bias = nn.Parameter(torch.tensor(-1.5, dtype=torch.float32))
+        self.mix_gate_bias = nn.Parameter(torch.tensor(-1.0, dtype=torch.float32))
 
         self.transformer_scale = nn.Parameter(torch.tensor(transformer_scale_init))
 
@@ -929,7 +928,7 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         nn.init.zeros_(self.tri_gate_emb.weight)
-        nn.init.zeros_(self.mix_gate.weight)
+        nn.init.normal_(self.mix_gate.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.mix_gate.bias)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
@@ -1009,8 +1008,7 @@ class GPT(nn.Module):
             + tri23_mix * tri23
         )
 
-        # mix_logits = self.mix_gate_scale.float() * self.mix_gate(x.float()) + self.mix_gate_bias.float()
-        mix_logits = self.mix_gate_scale * self.mix_gate(x) + self.mix_gate_bias
+        mix_logits = self.mix_gate(x.float()) + self.mix_gate_bias.float()
         transformer_mix = torch.sigmoid(mix_logits)
         local_mix = 1.0 - transformer_mix
 
@@ -1230,7 +1228,6 @@ def main() -> None:
         base_model.tri23_w,
         base_model.tri_gate_bias,
         base_model.tri_gate_scale,
-        base_model.mix_gate_scale,
         base_model.mix_gate_bias,
     ])
 
@@ -1371,7 +1368,7 @@ def main() -> None:
                 log0(f"tri_weights:{[base_model.tri12_w.item(), base_model.tri13_w.item(), base_model.tri23_w.item()]}")
                 log0(f"transformer_scale:{base_model.transformer_scale.item():.4f}")
                 with torch.no_grad():
-                    log0(f"mix_gate_scale:{base_model.mix_gate_scale.item():.4f} mix_gate_bias:{base_model.mix_gate_bias.item():.4f}")
+                    log0(f"mix_gate_bias:{base_model.mix_gate_bias.item():.4f}")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
