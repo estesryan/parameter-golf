@@ -1239,6 +1239,8 @@ def main() -> None:
             )
             if args.debug_lag_weights:
                 log0(f"lag_weights:{base_model.bigram_lag_weights.detach().cpu().tolist()}")
+                log0(f"tri_weights:{[base_model.tri12_w.item(), base_model.tri13_w.item(), base_model.tri23_w.item()]}")
+                log0(f"transformer_scale:{base_model.transformer_scale.item():.4f}")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
