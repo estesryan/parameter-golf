@@ -58,7 +58,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -76,16 +76,16 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 448))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 1))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
     bigram_rank = int(os.environ.get("BIGRAM_RANK", 32))
-    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 16))
-    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 12))
-    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 8))
+    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 28))
+    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 20))
+    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 16))
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
@@ -103,7 +103,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    use_int6 = bool(int(os.environ.get("USE_INT6", "0")))
+    use_int6 = bool(int(os.environ.get("USE_INT6", "1")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     qat_mode = os.environ.get("QAT_MODE", "progressive")

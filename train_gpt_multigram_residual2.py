@@ -58,7 +58,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -76,16 +76,16 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 448))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 1))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
     bigram_rank = int(os.environ.get("BIGRAM_RANK", 32))
-    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 16))
-    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 12))
-    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 8))
+    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 28))
+    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 20))
+    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 16))
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
@@ -103,7 +103,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    use_int6 = bool(int(os.environ.get("USE_INT6", "0")))
+    use_int6 = bool(int(os.environ.get("USE_INT6", "1")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     qat_mode = os.environ.get("QAT_MODE", "progressive")
@@ -838,9 +838,9 @@ class GPT(nn.Module):
         self.tri12_w = nn.Parameter(torch.tensor(trigram12_weight_init))
         self.tri13_w = nn.Parameter(torch.tensor(trigram13_weight_init))
         self.tri23_w = nn.Parameter(torch.tensor(trigram23_weight_init))
+        self.trigram_gate = CastedLinear(model_dim, 3, bias=True)
 
         self.transformer_scale = nn.Parameter(torch.tensor(transformer_scale_init))
-        self.prior_hidden_scale = nn.Parameter(torch.tensor(0.1))
 
         self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
         n_blocks = num_layers
@@ -873,6 +873,8 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        nn.init.zeros_(self.trigram_gate.weight)
+        nn.init.zeros_(self.trigram_gate.bias)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -893,6 +895,7 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x)
+        transformer_logits = F.linear(x, self.tok_emb.weight)
 
         B, T = input_ids.shape
         device = input_ids.device
@@ -930,17 +933,19 @@ class GPT(nn.Module):
         z23 = (self.tri23_a[t2] * self.tri23_b[t3])
         tri23 = z23 @ self.tri23_out
 
-        prior_logits = (
+        tri_gates = torch.sigmoid(self.trigram_gate(x)).float()
+
+        tri12_term = self.tri12_w * tri_gates[..., 0:1] * tri12
+        tri13_term = self.tri13_w * tri_gates[..., 1:2] * tri13
+        tri23_term = self.tri23_w * tri_gates[..., 2:3] * tri23
+
+        logits = (
             self.bigram_scale * b
-            + self.tri12_w * tri12
-            + self.tri13_w * tri13
-            + self.tri23_w * tri23
+            + tri12_term
+            + tri13_term
+            + tri23_term
+            + self.transformer_scale * transformer_logits
         )
-        prior_hidden = F.linear(prior_logits.to(x.dtype), self.tok_emb.weight.t())
-        prior_hidden = F.rms_norm(prior_hidden, (prior_hidden.size(-1),))
-        x = x + self.prior_hidden_scale.to(dtype=x.dtype) * prior_hidden
-        transformer_logits = F.linear(x, self.tok_emb.weight)
-        logits = self.transformer_scale * transformer_logits
 
         logits = logits.reshape(-1, logits.size(-1))
         targets = target_ids.reshape(-1)
@@ -1116,10 +1121,10 @@ def main() -> None:
         p for p in [base_model.bigram_prev, base_model.bigram_next] if p.requires_grad
     ]
     scalar_params.extend([base_model.bigram_scale, base_model.transformer_scale,
-                           base_model.prior_hidden_scale,
-                           base_model.bigram_lag_weights,
-                           *_bigram_trainable_params,
-                           base_model.tri12_w, base_model.tri13_w, base_model.tri23_w])
+                        base_model.bigram_lag_weights,
+                        *_bigram_trainable_params,
+                        base_model.tri12_w, base_model.tri13_w, base_model.tri23_w,
+                        *base_model.trigram_gate.parameters()])
     matrix_params.extend([
         base_model.tri12_a, base_model.tri12_b, base_model.tri12_out,
         base_model.tri13_a, base_model.tri13_b, base_model.tri13_out,
