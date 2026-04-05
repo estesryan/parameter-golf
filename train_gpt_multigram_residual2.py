@@ -1,10 +1,17 @@
 """
-Multilag Bigram + Trigram Residual Transformer
+Multilag Bigram + Gated Trigram Residual Transformer
 
 Architecture: multilag bigram (lags 1/2/4, SVD init on lag-1) + three separate trigram heads
-(12, 13, 23) + shallow U-Net transformer with partial RoPE, tied embeddings, and bfloat16 training.
-Optimizer: Muon for matrix params, Adam for scalars/embeddings.
+(12, 13, 23) with token-dependent sigmoid gating (learned per-position mixing over heads) +
+shallow U-Net transformer with partial RoPE, tied embeddings, and bfloat16 training.
+
+Optimization: Muon for matrix parameters, Adam for scalars/embeddings, with separately tuned
+learning rate for bigram matrices.
+
 QAT: progressive INT6/INT8 quantization-aware training in the final phase.
+
+Design intent: dominant local n-gram modeling (bigram + trigram) with transformer as residual
+corrector; dynamic gating enables context-dependent specialization across trigram heads.
 """
 
 from __future__ import annotations
