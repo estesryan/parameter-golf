@@ -72,11 +72,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 8))
+    num_layers = int(os.environ.get("NUM_LAYERS", 5))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 448))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 8))
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -111,7 +111,7 @@ class Hyperparameters:
     bigram_trainable = bool(int(os.environ.get("BIGRAM_TRAINABLE", "0")))
     use_multilag_bigram = bool(int(os.environ.get("USE_MULTILAG_BIGRAM", "1")))
     bigram_lags = [1, 2, 4]
-    rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
+    rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 16))
     encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
     bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.22))
     trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.40))

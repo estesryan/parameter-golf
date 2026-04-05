@@ -6,7 +6,7 @@ artifact-size and wall-clock constraints.
 Architecture:
 - Compact GPT-style decoder-only transformer with RoPE attention, grouped-query
   attention (GQA), RMSNorm, residual mixing, and a minimal MLP.
-- Byte-level tokenizer (vocab_size=256), operating directly on UTF-8 encoded data.
+- Byte-level tokenizer (vocab_size=260), operating directly on UTF-8 encoded data.
 - Tied token embeddings reused for output projection to reduce parameter count.
 - BigramHash input augmentation:
   - Adjacent token pairs are hashed into a small embedding table.
@@ -103,7 +103,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 256))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
