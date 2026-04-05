@@ -59,6 +59,8 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    bigram_cache_dir = os.environ.get("BIGRAM_CACHE_DIR", "./cache")
+    use_bigram_cache = bool(int(os.environ.get("USE_BIGRAM_CACHE", "1")))
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -621,6 +623,49 @@ def build_bigram_factors(
     next_factors = (V[:, :rank] * S_sqrt.unsqueeze(0)).contiguous()
     return prev_factors, next_factors
 
+def _safe_cache_stem(path_str: str) -> str:
+    return (
+        str(path_str)
+        .replace("\\", "_")
+        .replace("/", "_")
+        .replace(":", "")
+        .replace("*", "_")
+        .replace("?", "_")
+    )
+
+def bigram_cache_path(cache_dir: str, train_files: str, vocab_size: int, rank: int) -> Path:
+    stem = _safe_cache_stem(train_files)
+    return Path(cache_dir) / f"bigram_svd_{stem}_v{vocab_size}_r{rank}.pt"
+
+def load_or_build_bigram_factors(
+    cache_dir: str,
+    use_cache: bool,
+    train_files: str,
+    vocab_size: int,
+    rank: int,
+    max_tokens: int = 50_000_000,
+):
+    cache_path = bigram_cache_path(cache_dir, train_files, vocab_size, rank)
+
+    if use_cache and cache_path.exists():
+        obj = torch.load(cache_path, map_location="cpu")
+        return obj["prev_factors"], obj["next_factors"]
+
+    prev_factors, next_factors = build_bigram_factors(
+        train_files=train_files,
+        vocab_size=vocab_size,
+        rank=rank,
+        max_tokens=max_tokens,
+    )
+
+    if use_cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "prev_factors": prev_factors.cpu(),
+            "next_factors": next_factors.cpu(),
+        }, cache_path)
+
+    return prev_factors, next_factors
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1101,8 +1146,36 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    log0("Building bigram factors via truncated SVD...")
-    _prev_factors, _next_factors = build_bigram_factors(args.train_files, args.vocab_size, args.bigram_rank)
+    cache_path = bigram_cache_path(args.bigram_cache_dir, args.train_files, args.vocab_size, args.bigram_rank)
+
+    if distributed:
+        if rank == 0:
+            log0(f"Building/loading bigram cache: {cache_path}")
+            _prev_factors, _next_factors = load_or_build_bigram_factors(
+                cache_dir=args.bigram_cache_dir,
+                use_cache=args.use_bigram_cache,
+                train_files=args.train_files,
+                vocab_size=args.vocab_size,
+                rank=args.bigram_rank,
+            )
+        dist.barrier()
+        if rank != 0:
+            _prev_factors, _next_factors = load_or_build_bigram_factors(
+                cache_dir=args.bigram_cache_dir,
+                use_cache=True,
+                train_files=args.train_files,
+                vocab_size=args.vocab_size,
+                rank=args.bigram_rank,
+            )
+    else:
+        log0(f"Building/loading bigram cache: {cache_path}")
+        _prev_factors, _next_factors = load_or_build_bigram_factors(
+            cache_dir=args.bigram_cache_dir,
+            use_cache=args.use_bigram_cache,
+            train_files=args.train_files,
+            vocab_size=args.vocab_size,
+            rank=args.bigram_rank,
+        )
     with torch.no_grad():
         base_model.bigram_prev.data[0].copy_(_prev_factors.to(device=device, dtype=base_model.bigram_prev.dtype))
         base_model.bigram_next.data[0].copy_(_next_factors.to(device=device, dtype=base_model.bigram_next.dtype))
@@ -1144,11 +1217,15 @@ def main() -> None:
         base_model.tri12_w,
         base_model.tri13_w,
         base_model.tri23_w,
+        base_model.tri_gate_bias,
+        base_model.tri_gate_scale,
     ])
+
     matrix_params.extend([
         base_model.tri12_a, base_model.tri12_b, base_model.tri12_out,
         base_model.tri13_a, base_model.tri13_b, base_model.tri13_out,
         base_model.tri23_a, base_model.tri23_b, base_model.tri23_out,
+        base_model.tri_gate_emb.weight,
     ])
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
