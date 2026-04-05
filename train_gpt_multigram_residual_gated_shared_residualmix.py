@@ -128,7 +128,7 @@ class Hyperparameters:
     trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.50))
     trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.30))
     trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.25))
-    transformer_scale_init = float(os.environ.get("TRANSFORMER_SCALE_INIT", 0.22))
+    transformer_scale_init = float(os.environ.get("TRANSFORMER_SCALE_INIT", 0.30))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
     debug_lag_weights = bool(int(os.environ.get("DEBUG_LAG_WEIGHTS", "0")))
 
