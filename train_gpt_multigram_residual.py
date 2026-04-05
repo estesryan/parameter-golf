@@ -82,8 +82,8 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
-    bigram_rank = int(os.environ.get("BIGRAM_RANK", 32))
-    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 28))
+    bigram_rank = int(os.environ.get("BIGRAM_RANK", 24))
+    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 24))
     trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 20))
     trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 16))
 
@@ -113,11 +113,11 @@ class Hyperparameters:
     bigram_lags = [1, 2, 4]
     rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 16))
     encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
-    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.22))
-    trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.40))
-    trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.20))
+    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.16))
+    trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.37))
+    trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.24))
     trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.20))
-    transformer_scale_init = float(os.environ.get("TRANSFORMER_SCALE_INIT", 0.9))
+    transformer_scale_init = float(os.environ.get("TRANSFORMER_SCALE_INIT", 0.22))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
     debug_lag_weights = bool(int(os.environ.get("DEBUG_LAG_WEIGHTS", "0")))
 
