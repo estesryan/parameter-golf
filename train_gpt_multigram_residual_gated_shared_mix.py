@@ -1366,22 +1366,22 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-        if args.debug_lag_weights:
-            log0(f"lag_weights:{base_model.bigram_lag_weights.detach().cpu().tolist()}")
-            log0(f"tri_weights:{[base_model.tri12_w.item(), base_model.tri13_w.item(), base_model.tri23_w.item()]}")
-            log0(f"transformer_scale:{base_model.transformer_scale.item():.4f}")
-            with torch.no_grad():
-                log0(f"mix_gate_scale:{base_model.mix_gate_scale.item():.4f} mix_gate_bias:{base_model.mix_gate_bias.item():.4f}")
+            if args.debug_lag_weights:
+                log0(f"lag_weights:{base_model.bigram_lag_weights.detach().cpu().tolist()}")
+                log0(f"tri_weights:{[base_model.tri12_w.item(), base_model.tri13_w.item(), base_model.tri23_w.item()]}")
+                log0(f"transformer_scale:{base_model.transformer_scale.item():.4f}")
+                with torch.no_grad():
+                    log0(f"mix_gate_scale:{base_model.mix_gate_scale.item():.4f} mix_gate_bias:{base_model.mix_gate_bias.item():.4f}")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-            if last_step:
-                if stop_after_step is not None and step < args.iterations:
-                    log0(
-                        f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                        f"step:{step}/{args.iterations}"
-                    )
-                break
+        if last_step:
+            if stop_after_step is not None and step < args.iterations:
+                log0(
+                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
+                    f"step:{step}/{args.iterations}"
+                )
+            break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
