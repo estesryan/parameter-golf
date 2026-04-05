@@ -83,9 +83,11 @@ class Hyperparameters:
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
     bigram_rank = int(os.environ.get("BIGRAM_RANK", 32))
-    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 28))
-    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 20))
-    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 16))
+    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 30))
+    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 22))
+    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 18))
+    fourgram_rank = int(os.environ.get("FOURGRAM_RANK", 16))
+    fourgram_weight_init = float(os.environ.get("FOURGRAM_WEIGHT_INIT", 0.15))
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
@@ -800,6 +802,8 @@ class GPT(nn.Module):
         trigram12_weight_init: float = 0.40,
         trigram13_weight_init: float = 0.20,
         trigram23_weight_init: float = 0.20,
+        fourgram_rank: int = 16,
+        fourgram_weight_init: float = 0.15,
         transformer_scale_init: float = 0.9,
     ):
         super().__init__()
@@ -838,7 +842,13 @@ class GPT(nn.Module):
         self.tri12_w = nn.Parameter(torch.tensor(trigram12_weight_init))
         self.tri13_w = nn.Parameter(torch.tensor(trigram13_weight_init))
         self.tri23_w = nn.Parameter(torch.tensor(trigram23_weight_init))
-        self.trigram_gate = CastedLinear(model_dim, 3, bias=True)
+
+        # --- Fourgram (t-1, t-2, t-3) ---
+        self.four_a = nn.Parameter(torch.randn(vocab_size, fourgram_rank) * 0.02)
+        self.four_b = nn.Parameter(torch.randn(vocab_size, fourgram_rank) * 0.02)
+        self.four_c = nn.Parameter(torch.randn(vocab_size, fourgram_rank) * 0.02)
+        self.four_out = nn.Parameter(torch.randn(fourgram_rank, vocab_size) * 0.02)
+        self.four_w = nn.Parameter(torch.tensor(fourgram_weight_init))
 
         self.transformer_scale = nn.Parameter(torch.tensor(transformer_scale_init))
 
@@ -873,8 +883,6 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
-        nn.init.zeros_(self.trigram_gate.weight)
-        nn.init.zeros_(self.trigram_gate.bias)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -933,17 +941,20 @@ class GPT(nn.Module):
         z23 = (self.tri23_a[t2] * self.tri23_b[t3])
         tri23 = z23 @ self.tri23_out
 
-        tri_gates = torch.sigmoid(self.trigram_gate(x)).float()
+        # --- Fourgram ---
+        z4 = (self.four_a[t1] * self.four_b[t2] * self.four_c[t3])
+        four = z4 @ self.four_out
 
-        tri12_term = self.tri12_w * tri_gates[..., 0:1] * tri12
-        tri13_term = self.tri13_w * tri_gates[..., 1:2] * tri13
-        tri23_term = self.tri23_w * tri_gates[..., 2:3] * tri23
+        tri12_term = self.tri12_w * tri12
+        tri13_term = self.tri13_w * tri13
+        tri23_term = self.tri23_w * tri23
 
         logits = (
             self.bigram_scale * b
             + tri12_term
             + tri13_term
             + tri23_term
+            + self.four_w * four
             + self.transformer_scale * transformer_logits
         )
 
@@ -1079,6 +1090,8 @@ def main() -> None:
         trigram12_weight_init=args.trigram12_weight_init,
         trigram13_weight_init=args.trigram13_weight_init,
         trigram23_weight_init=args.trigram23_weight_init,
+        fourgram_rank=args.fourgram_rank,
+        fourgram_weight_init=args.fourgram_weight_init,
         transformer_scale_init=args.transformer_scale_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -1124,11 +1137,12 @@ def main() -> None:
                         base_model.bigram_lag_weights,
                         *_bigram_trainable_params,
                         base_model.tri12_w, base_model.tri13_w, base_model.tri23_w,
-                        *base_model.trigram_gate.parameters()])
+                        base_model.four_w])
     matrix_params.extend([
         base_model.tri12_a, base_model.tri12_b, base_model.tri12_out,
         base_model.tri13_a, base_model.tri13_b, base_model.tri13_out,
         base_model.tri23_a, base_model.tri23_b, base_model.tri23_out,
+        base_model.four_a, base_model.four_b, base_model.four_c, base_model.four_out,
     ])
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
