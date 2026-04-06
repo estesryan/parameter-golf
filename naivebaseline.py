@@ -71,7 +71,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     trigram_rank = int(os.environ.get("TRIGRAM_RANK", 64))
     trigram12_scale_init = float(os.environ.get("TRIGRAM12_SCALE_INIT", 0.15))
-    trigram13_scale_init = float(os.environ.get("TRIGRAM13_SCALE_INIT", 0.08))
+    trigram13_scale_init = float(os.environ.get("TRIGRAM13_SCALE_INIT", 0.02))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -676,7 +676,7 @@ class GPT(nn.Module):
         self.tri_a = nn.Parameter(torch.randn(vocab_size, trigram_rank) * 0.02)
         self.tri_b = nn.Parameter(torch.randn(vocab_size, trigram_rank) * 0.02)
         self.tri12_out = nn.Parameter(torch.randn(trigram_rank, vocab_size) * 0.02)
-        self.tri13_out = nn.Parameter(torch.randn(trigram_rank, vocab_size) * 0.02)
+        self.tri13_out = nn.Parameter(torch.randn(trigram_rank, vocab_size) * 0.01)
         self.tri12_scale = nn.Parameter(torch.tensor(trigram12_scale_init, dtype=torch.float32))
         self.tri13_scale = nn.Parameter(torch.tensor(trigram13_scale_init, dtype=torch.float32))
         self.num_encoder_layers = num_layers // 2
@@ -742,8 +742,9 @@ class GPT(nn.Module):
         t2 = torch.cat([pad2, input_ids[:, :-2]], dim=1)
         t3 = torch.cat([pad3, input_ids[:, :-3]], dim=1)
 
-        tri12 = (self.tri_a[t1] * self.tri_b[t2]) @ self.tri12_out
-        tri13 = (self.tri_a[t1] * self.tri_b[t3]) @ self.tri13_out
+        tri_scale = math.sqrt(self.tri_a.size(1))
+        tri12 = ((self.tri_a[t1] * self.tri_b[t2]) @ self.tri12_out) / tri_scale
+        tri13 = ((self.tri_a[t1] * self.tri_b[t3]) @ self.tri13_out) / tri_scale
 
         logits_proj = (
             logits_proj
