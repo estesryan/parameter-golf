@@ -103,7 +103,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
-    bigram_lr = float(os.environ.get("BIGRAM_LR", 0.008))
+    bigram_lr = float(os.environ.get("BIGRAM_LR", 0.004))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_wd = float(os.environ.get("MUON_WD", 0.0))
@@ -1402,13 +1402,6 @@ def main() -> None:
                         for p in group["params"]:
                             if p.requires_grad:
                                 p.mul_(1 - lr * args.adam_weight_decay)
-
-        # Keep higher-order paths from collapsing into the bigram-only basin.
-        with torch.no_grad():
-            base_model.transformer_scale.clamp_(min=0.15)
-            base_model.tri12_w.clamp_(min=0.20)
-            base_model.tri13_w.clamp_(min=0.10)
-            base_model.tri23_w.clamp_(min=0.10)
 
         _qat_mode = args.qat_mode
         if _qat_mode == "off" and args.late_qat:
