@@ -798,14 +798,20 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash_size = bigram_hash_size
         self.bigram_dim = bigram_dim
-        self.bigram_emb = nn.Embedding(self.bigram_hash_size, self.bigram_dim)
-        self.bigram_proj = CastedLinear(self.bigram_dim, model_dim, bias=False)
-        self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
+        self.bigram_emb = nn.Embedding(self.bigram_hash_size, self.bigram_dim) if use_bigram else None
+        self.bigram_proj = CastedLinear(self.bigram_dim, model_dim, bias=False) if use_bigram else None
+        self.token_mixer = (
+            nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
+            if use_token_mixer else None
+        )
         n_blocks = num_layers
         self.num_encoder_layers = n_blocks // 2
         self.num_decoder_layers = n_blocks - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_weights = (
+            nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+            if use_skip_weights else None
+        )
         mlp_mults = [mlp_mult] * n_blocks
 
         self.blocks = nn.ModuleList(
@@ -827,8 +833,10 @@ class GPT(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        nn.init.normal_(self.bigram_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        nn.init.normal_(self.bigram_proj.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.bigram_emb is not None:
+            nn.init.normal_(self.bigram_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.bigram_proj is not None:
+            nn.init.normal_(self.bigram_proj.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -863,7 +871,7 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             if skips:
                 skip = skips.pop()
-                if self.use_skip_weights:
+                if self.skip_weights is not None:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
                 else:
                     x = x + skip
@@ -1030,18 +1038,8 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    ddp_find_unused = not (
-        args.use_bigram
-        and args.use_token_mixer
-        and args.use_skip_weights
-    )
     model: nn.Module = (
-        DDP(
-            compiled_model,
-            device_ids=[local_rank],
-            broadcast_buffers=False,
-            find_unused_parameters=ddp_find_unused,
-        )
+        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed
         else compiled_model
     )
@@ -1061,7 +1059,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
+    if base_model.skip_weights is not None:
         scalar_params.append(base_model.skip_weights)
     if args.use_token_mixer:
         scalar_params.extend(base_model.token_mixer.parameters())
