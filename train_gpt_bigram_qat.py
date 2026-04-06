@@ -865,7 +865,7 @@ class GPT(nn.Module):
         next_ids[:, -1] = 0
         return (input_ids * 1315423911 + next_ids) % self.bigram_hash_size
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor | None, return_logits: bool = False):
         tok = self.tok_emb(input_ids)
         x = tok
 
@@ -911,18 +911,6 @@ class GPT(nn.Module):
 
         loss = ce_loss
 
-        # Self-distillation
-        if self.training and getattr(self, "use_distill", True) and getattr(self, "distill_lambda", 0.0) > 0:
-            T = self.distill_temp
-            with torch.no_grad():
-                teacher_logits = self._teacher_logits  # injected externally
-                teacher_probs = F.softmax(teacher_logits / T, dim=-1)
-
-            student_log_probs_T = F.log_softmax(logits_f / T, dim=-1)
-            distill_loss = F.kl_div(student_log_probs_T, teacher_probs, reduction="batchmean") * (T * T)
-
-            loss = loss + self.distill_lambda * distill_loss
-
         # Bigram auxiliary loss
         if self.training and getattr(self, "use_bigram_loss", True) and getattr(self, "bigram_loss_lambda", 0.0) > 0:
             # shift targets again (predict y_{t+1} from same logits)
@@ -934,6 +922,8 @@ class GPT(nn.Module):
 
             loss = loss + self.bigram_loss_lambda * bigram_loss
 
+        if return_logits:
+            return loss, logits_f
         return loss
 
 
@@ -1057,10 +1047,7 @@ def main() -> None:
     ema_model = copy.deepcopy(base_model).eval()
     for p in ema_model.parameters():
         p.requires_grad_(False)
-    base_model.distill_lambda = args.distill_lambda
-    base_model.distill_temp = args.distill_temp
     base_model.bigram_loss_lambda = args.bigram_loss_lambda
-    base_model.use_distill = args.use_distill
     base_model.use_bigram_loss = args.use_bigram_loss
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1283,9 +1270,15 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 if args.use_distill and args.distill_lambda > 0:
                     with torch.no_grad():
-                        teacher_logits = ema_model(x, y=None)  # forward without loss
-                    base_model._teacher_logits = teacher_logits
-                loss = model(x, y)
+                        teacher_logits = ema_model(x, y=None).detach()
+                    ce_loss, student_logits = model(x, y, return_logits=True)
+                    T = args.distill_temp
+                    teacher_probs = F.softmax(teacher_logits / T, dim=-1)
+                    student_log_probs_T = F.log_softmax(student_logits / T, dim=-1)
+                    distill_loss = F.kl_div(student_log_probs_T, teacher_probs, reduction="batchmean") * (T * T)
+                    loss = ce_loss + args.distill_lambda * distill_loss
+                else:
+                    loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
