@@ -1,11 +1,8 @@
 """
-ARCHITECTURE: 
-Mamba2 SSM + Topic-conditioned MoE + BigramHash + AR Self-Gen GPTQ architecture
-The proposed Mamba2 SSM + Topic-conditioned MoE + BigramHash + AR Self-Gen GPTQ architecture is fully allowed under the official rules.
 
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+ARCHITECTURE:
+MambaLite (gated depthwise-conv mixer) + Topic-conditioned MoE + BigramHash + AR Self-Gen GPTQ architecture
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
 """
 
 from __future__ import annotations
@@ -34,11 +31,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -61,17 +53,13 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -537,92 +525,50 @@ class MLP(nn.Module):
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
-class Mamba2(nn.Module):
-    def __init__(self, dim: int, d_state: int = 16):
+class MambaLite(nn.Module):
+    def __init__(self, dim: int, kernel_size: int = 15):
         super().__init__()
         self.dim = dim
-        self.d_state = d_state
-        self.chunk_size = 64
 
-        # expand channels
-        self.in_proj = CastedLinear(dim, 2 * dim + 3 * d_state, bias=False)
+        self.in_proj = CastedLinear(dim, 3 * dim, bias=False)
 
-        # SSM params
-        self.A = nn.Parameter(torch.zeros(d_state))
-        self.D = nn.Parameter(torch.ones(dim))
+        padding = kernel_size - 1
 
-        # output
+        self.dwconv = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            groups=dim,
+            padding=padding,
+            bias=False,
+        )
+
         self.out_proj = CastedLinear(dim, dim, bias=False)
         self.out_proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, D = x.shape
 
-        # split projection
         proj = self.in_proj(x)
-        xz, xdt, xb, xc = torch.split(proj, [2 * D, self.d_state, self.d_state, self.d_state], dim=-1)
+        x_main, gate, mix = proj.chunk(3, dim=-1)
 
-        x_main, z = xz.chunk(2, dim=-1)
+        gate = torch.sigmoid(gate)
 
-        dt = F.softplus(xdt)
-        Bp = xb
-        Cp = xc
+        # depthwise conv (convert to B,D,T)
+        y = self.dwconv(x_main.transpose(1, 2))[:, :, :T]
+        y = y.transpose(1, 2)
 
-        # stable A
-        A = -torch.exp(self.A.float()).to(x.dtype)
+        # channel mixing
+        y = y + 0.5 * mix
 
-        u = x_main[..., : self.d_state]
-
-        y_state = torch.zeros_like(u)
-        state = torch.zeros(B, self.d_state, device=x.device, dtype=x.dtype)
-
-        chunk = self.chunk_size
-
-        for start in range(0, T, chunk):
-            end = min(start + chunk, T)
-
-            dt_chunk = dt[:, start:end]           # (B, L, d_state)
-            B_chunk = Bp[:, start:end]
-            C_chunk = Cp[:, start:end]
-            u_chunk = u[:, start:end]
-
-            A_dt = torch.exp(A[None, None, :] * dt_chunk)
-
-            # sequential inside chunk (small loop)
-            h = state
-            ys = []
-
-            for t in range(end - start):
-                h = h * A_dt[:, t] + B_chunk[:, t] * u_chunk[:, t]
-                ys.append(C_chunk[:, t] * h)
-
-            y_chunk = torch.stack(ys, dim=1)
-
-            y_state[:, start:end] = y_chunk
-            state = h
-            
-        y = self.D.to(x.dtype) * x_main
-        y[..., : self.d_state] = y[..., : self.d_state] + y_state
-
-        # gate
-        y = y * z
-
-        return self.out_proj(y)
+        return self.out_proj(y * gate)
     
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.ssm = Mamba2(dim)
+        self.ssm = MambaLite(dim)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -643,14 +589,10 @@ class GPT(nn.Module):
         vocab_size: int,
         num_layers: int,
         model_dim: int,
-        num_heads: int,
-        num_kv_heads: int,
         mlp_mult: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
-        rope_base: float,
-        qk_gain_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -665,14 +607,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
+                Block(model_dim, mlp_mult)
                 for i in range(num_layers)
             ]
         )
@@ -725,7 +660,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    #zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -819,14 +753,10 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -888,7 +818,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0("sequence_mixer:mamba_lite depthwise_conv=True kernel_size:15")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
