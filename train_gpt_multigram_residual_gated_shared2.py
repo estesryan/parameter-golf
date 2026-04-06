@@ -1,21 +1,14 @@
 """
-Multilag Bigram + Gated Shared-Basis Trigram Residual Transformer
+Multilag bigram + shared-basis trigram residual transformer.
 
-Architecture: multilag bigram (lags 1/2/4, SVD init on lag-1) + shared-basis trigram modeling
-with three pairwise views (12, 13, 23), separate per-head output projections, and token-dependent
-sigmoid gating over head contributions + shallow U-Net transformer with partial RoPE, tied
-embeddings, and bfloat16 training.
+Novelty:
+- multilag bigram modeling over lags 1/2/4, with SVD initialization on lag-1
+- shared-basis trigram modeling using three pairwise views (12, 13, 23)
+- separate output projections for each trigram view
+- token-dependent sigmoid gating over trigram head contributions
 
-Optimization: Muon for matrix parameters, Adam for scalars/embeddings, with separately tuned
-learning rate for bigram matrices.
-
-QAT: progressive INT6/INT8 quantization-aware training in the final phase.
-
-Results:
-A 1-layer causal Conv1d front-end produced no meaningful improvement over
-the baseline under the standard parameter-golf constraints (val_bpb ~1.346–1.348).
-The baseline already captures local n-gram structure efficiently, and the
-additional conv layer did not provide measurable gains.
+Everything else is kept close to the baseline script where possible.
+The transformer acts as a residual corrector on top of explicit local n-gram modeling.
 """
 
 from __future__ import annotations
@@ -32,18 +25,6 @@ import time
 import uuid
 import zlib
 from pathlib import Path
-
-# Import zstandard for better compression than zlib, installing if needed
-try:
-    import zstandard as zstd
-    HAS_ZSTD = True
-except ImportError:
-    subprocess.run(["pip", "install", "zstandard", "-q"], check=False)
-    try:
-        import zstandard as zstd
-        HAS_ZSTD = True
-    except ImportError:
-        HAS_ZSTD = False
 
 import numpy as np
 import sentencepiece as spm
@@ -71,12 +52,11 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.35))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -85,26 +65,27 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 5))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
-    model_dim = int(os.environ.get("MODEL_DIM", 448))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 8))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
 
     bigram_rank = int(os.environ.get("BIGRAM_RANK", 24))
-    trigram12_rank = int(os.environ.get("TRIGRAM12_RANK", 24))
-    trigram13_rank = int(os.environ.get("TRIGRAM13_RANK", 20))
-    trigram23_rank = int(os.environ.get("TRIGRAM23_RANK", 16))
+    trigram_rank = int(os.environ.get("TRIGRAM_RANK", 24))
+    bigram_trainable = bool(int(os.environ.get("BIGRAM_TRAINABLE", "1")))
+    use_multilag_bigram = bool(int(os.environ.get("USE_MULTILAG_BIGRAM", "1")))
+    bigram_lags = [1, 2, 4]
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     bigram_lr = float(os.environ.get("BIGRAM_LR", 0.008))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -117,23 +98,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    use_int6 = bool(int(os.environ.get("USE_INT6", "1")))
-    late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
-    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
-    qat_mode = os.environ.get("QAT_MODE", "progressive")
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.6))
-    bigram_trainable = bool(int(os.environ.get("BIGRAM_TRAINABLE", "1")))
-    use_multilag_bigram = bool(int(os.environ.get("USE_MULTILAG_BIGRAM", "1")))
-    bigram_lags = [1, 2, 4]
-    rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 16))
-    encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
-    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.16))
-    trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.50))
-    trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.30))
-    trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.25))
-    transformer_scale_init = float(os.environ.get("TRANSFORMER_SCALE_INIT", 0.22))
-    use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
-    debug_lag_weights = bool(int(os.environ.get("DEBUG_LAG_WEIGHTS", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -739,7 +703,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        rope_partial_dims: int = 8,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -751,11 +714,6 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        if rope_partial_dims % 2 != 0:
-            raise ValueError("rope_partial_dims must be even")
-        if rope_partial_dims > self.head_dim:
-            raise ValueError("rope_partial_dims must be <= head_dim")
-        self.rope_partial_dims = rope_partial_dims
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -763,7 +721,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.rope_partial_dims, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -773,8 +731,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin, self.rope_partial_dims)
-        k = apply_rotary_emb(k, cos, sin, self.rope_partial_dims)
+        q = apply_rotary_emb(q, cos, sin, self.head_dim)
+        k = apply_rotary_emb(k, cos, sin, self.head_dim)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -796,10 +754,9 @@ class MLP(nn.Module):
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
-        self.act = nn.LeakyReLU(negative_slope=0.1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.act(self.fc(x))
+        x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -812,15 +769,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        rope_partial_dims: int = 8,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_partial_dims)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -847,17 +803,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         logit_sharpen: float = 1.1,
         bigram_rank: int = 32,
-        bigram_lags: list = None,
-        trigram12_rank: int = 16,
-        trigram13_rank: int = 16,
-        trigram23_rank: int = 16,
-        rope_partial_dims: int = 8,
-        encoder_layer_frac: float = 0.35,
-        bigram_base_scale: float = 0.22,
-        trigram12_weight_init: float = 0.40,
-        trigram13_weight_init: float = 0.20,
-        trigram23_weight_init: float = 0.20,
-        transformer_scale_init: float = 0.9,
+        bigram_lags: list | None = None,
+        trigram_rank: int = 24,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -877,35 +824,30 @@ class GPT(nn.Module):
             _lag_w = torch.ones(num_lags, dtype=torch.float32)
             _lag_w[1:] *= 0.15
         self.bigram_lag_weights = nn.Parameter(_lag_w)
-        self.bigram_scale = nn.Parameter(torch.tensor(bigram_base_scale))
+        self.bigram_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
-        # Shared trigram token factors, separate per-head output projections.
-        shared_tri_rank = max(trigram12_rank, trigram13_rank, trigram23_rank)
+        # Shared trigram token factors, separate pairwise output projections.
+        self.tri_a = nn.Parameter(torch.randn(vocab_size, trigram_rank) * 0.02)
+        self.tri_b = nn.Parameter(torch.randn(vocab_size, trigram_rank) * 0.02)
 
-        self.tri_a = nn.Parameter(torch.randn(vocab_size, shared_tri_rank) * 0.02)
-        self.tri_b = nn.Parameter(torch.randn(vocab_size, shared_tri_rank) * 0.02)
+        self.tri12_out = nn.Parameter(torch.randn(trigram_rank, vocab_size) * 0.02)
+        self.tri13_out = nn.Parameter(torch.randn(trigram_rank, vocab_size) * 0.02)
+        self.tri23_out = nn.Parameter(torch.randn(trigram_rank, vocab_size) * 0.02)
 
-        self.tri12_out = nn.Parameter(torch.randn(shared_tri_rank, vocab_size) * 0.02)
-        self.tri13_out = nn.Parameter(torch.randn(shared_tri_rank, vocab_size) * 0.02)
-        self.tri23_out = nn.Parameter(torch.randn(shared_tri_rank, vocab_size) * 0.02)
-
-        self.tri12_w = nn.Parameter(torch.tensor(trigram12_weight_init))
-        self.tri13_w = nn.Parameter(torch.tensor(trigram13_weight_init))
-        self.tri23_w = nn.Parameter(torch.tensor(trigram23_weight_init))
+        self.tri12_w = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.tri13_w = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.tri23_w = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
         self.tri_gate_emb = nn.Embedding(vocab_size, 3)
         self.tri_gate_bias = nn.Parameter(torch.tensor([0.0, -0.2, -0.4], dtype=torch.float32))
         self.tri_gate_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
-        self.transformer_scale = nn.Parameter(torch.tensor(transformer_scale_init))
+        self.transformer_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
-        self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
-        n_blocks = num_layers
-        self.num_encoder_layers = max(1, round(n_blocks * encoder_layer_frac))
-        self.num_decoder_layers = n_blocks - self.num_encoder_layers
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        mlp_mults = [mlp_mult] * n_blocks
 
         self.blocks = nn.ModuleList(
             [
@@ -913,12 +855,11 @@ class GPT(nn.Module):
                     model_dim,
                     num_heads,
                     num_kv_heads,
-                    mlp_mults[i],
+                    mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    rope_partial_dims,
                 )
-                for i in range(n_blocks)
+                for _ in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -934,10 +875,6 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-        x = x.transpose(1, 2)
-        x = self.token_mixer(x)
-        x = x[:, :, :input_ids.size(1)]
-        x = x.transpose(1, 2)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -972,20 +909,21 @@ class GPT(nn.Module):
         gate_logits = self.tri_gate_scale.float() * gate_logits + self.tri_gate_bias.float()[None, None, :]
         tri_gates = torch.sigmoid(gate_logits)
 
-        # --- Bigram (multilag) ---
-        _rank = self.bigram_prev.size(2)
-        _scale = math.sqrt(_rank)
-        _lag_shifted = {}
-        for _lag in self.bigram_lags:
-            _pad = torch.zeros(B, _lag, dtype=input_ids.dtype, device=device)
-            _lag_shifted[_lag] = torch.cat([_pad, input_ids[:, :-_lag]], dim=1)
-        b = torch.zeros(B, T, self.bigram_next.size(1), dtype=torch.float32, device=device)
-        for _i, _lag in enumerate(self.bigram_lags):
-            _sid = _lag_shifted[_lag]
-            _contrib = (self.bigram_prev[_i][_sid].float() @ self.bigram_next[_i].float().t()) / _scale
-            b = b + self.bigram_lag_weights[_i] * _contrib
+        # Multilag bigram
+        rank = self.bigram_prev.size(2)
+        scale = math.sqrt(rank)
+        lag_shifted = {}
+        for lag in self.bigram_lags:
+            pad = torch.zeros(B, lag, dtype=input_ids.dtype, device=device)
+            lag_shifted[lag] = torch.cat([pad, input_ids[:, :-lag]], dim=1)
 
-        # --- Shared trigram basis with separate pairwise outputs ---
+        b = torch.zeros(B, T, self.bigram_next.size(1), dtype=torch.float32, device=device)
+        for i, lag in enumerate(self.bigram_lags):
+            sid = lag_shifted[lag]
+            contrib = (self.bigram_prev[i][sid].float() @ self.bigram_next[i].float().t()) / scale
+            b = b + self.bigram_lag_weights[i] * contrib
+
+        # Shared trigram basis with separate pairwise outputs
         z12 = self.tri_a[t1] * self.tri_b[t2]
         tri12 = z12 @ self.tri12_out
 
@@ -1130,16 +1068,7 @@ def main() -> None:
         logit_sharpen=args.logit_sharpen,
         bigram_rank=args.bigram_rank,
         bigram_lags=args.bigram_lags if args.use_multilag_bigram else [1],
-        trigram12_rank=args.trigram12_rank,
-        trigram13_rank=args.trigram13_rank,
-        trigram23_rank=args.trigram23_rank,
-        rope_partial_dims=args.rope_partial_dims,
-        encoder_layer_frac=args.encoder_layer_frac,
-        bigram_base_scale=args.bigram_base_scale,
-        trigram12_weight_init=args.trigram12_weight_init,
-        trigram13_weight_init=args.trigram13_weight_init,
-        trigram23_weight_init=args.trigram23_weight_init,
-        transformer_scale_init=args.transformer_scale_init,
+        trigram_rank=args.trigram_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1204,7 +1133,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_params.extend(base_model.token_mixer.parameters())
     bigram_matrix_params = [
         p for p in [base_model.bigram_prev, base_model.bigram_next] if p.requires_grad
     ]
@@ -1292,11 +1220,10 @@ def main() -> None:
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
-            # Fallback for uncapped runs: step-count based (unchanged)
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        # Wall-clock aware: warmdown occupies the last warmdown_frac of total budget
-        warmdown_ms = args.warmdown_frac * max_wallclock_ms
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
@@ -1351,10 +1278,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            if args.debug_lag_weights:
-                log0(f"lag_weights:{base_model.bigram_lag_weights.detach().cpu().tolist()}")
-                log0(f"tri_weights:{[base_model.tri12_w.item(), base_model.tri13_w.item(), base_model.tri23_w.item()]}")
-                log0(f"transformer_scale:{base_model.transformer_scale.item():.4f}")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1405,23 +1328,6 @@ def main() -> None:
                             if p.requires_grad:
                                 p.mul_(1 - lr * args.adam_weight_decay)
 
-        _qat_mode = args.qat_mode
-        if _qat_mode == "off" and args.late_qat:
-            _qat_mode = "late"
-
-        if args.use_int6 and _qat_mode != "off":
-            _do_qat = False
-            if _qat_mode == "late":
-                _do_qat = scale < args.late_qat_threshold
-            elif _qat_mode == "progressive":
-                _elapsed_frac = (elapsed_ms / max_wallclock_ms) if max_wallclock_ms else (step / max(args.iterations, 1))
-                _do_qat = min(_elapsed_frac, 1.0) >= args.qat_start_frac
-            if _do_qat:
-                with torch.no_grad():
-                    for name, param in base_model.named_parameters():
-                        if param.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
-                            param.data.copy_(fake_quantize_int6(param.data))
-
         zero_grad_all()
 
         step += 1
@@ -1464,15 +1370,11 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), use_int6=args.use_int6)
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    if args.use_zstd and HAS_ZSTD:
-        cctx = zstd.ZstdCompressor(level=22)
-        quant_blob = cctx.compress(quant_raw)
-    else:
-        quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1490,12 +1392,7 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    try:
-        quant_blob_decompressed = zlib.decompress(quant_blob_disk)
-    except zlib.error:
-        dctx = zstd.ZstdDecompressor()
-        quant_blob_decompressed = dctx.decompress(quant_blob_disk)
-    quant_state = torch.load(io.BytesIO(quant_blob_decompressed), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
