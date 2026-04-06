@@ -91,7 +91,6 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.35))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -127,7 +126,6 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_wd = float(os.environ.get("MUON_WD", 0.0))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
     adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.0))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -204,54 +202,32 @@ class Muon(torch.optim.Optimizer):
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
 
-            # Partition params across ranks
-            my_params = [p for i, p in enumerate(params) if i % world_size == rank and p.grad is not None]
-
-            # Compute momentum-adjusted gradients for my params
-            grads = []
-            for p in my_params:
-                g = p.grad
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-                grads.append(g)
-
-            # Parallel Newton-Schulz: pad all grads to same shape and process in batch
-            if grads:
-                # Process each grad through Newton-Schulz (parallelized via torch.compile)
-                ortho_grads = [zeropower_via_newtonschulz5(g, steps=backend_steps) for g in grads]
-                # Apply scale correction
-                for i, (p, g) in enumerate(zip(my_params, ortho_grads)):
-                    ortho_grads[i] = g * max(1, g.size(0) / g.size(1)) ** 0.5
-            else:
-                ortho_grads = []
-
-            # Assemble flat update buffer
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
             curr = 0
-            my_idx = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
-                    updates_flat[curr: curr + p.numel()] = ortho_grads[my_idx].reshape(-1)
-                    my_idx += 1
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    updates_flat[curr: curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            wd = group.get("wd", 0.0)
             curr = 0
             for p in params:
                 g = updates_flat[curr: curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
-                if wd > 0.0:
-                    p.mul_(1.0 - lr * wd)
                 curr += p.numel()
 
         return loss
@@ -1111,7 +1087,6 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-        group["wd"] = args.muon_weight_decay
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -1130,7 +1105,6 @@ def main() -> None:
         f"head_lr:0.0 "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(f"muon_weight_decay:{args.muon_weight_decay} adam_weight_decay:{args.adam_weight_decay}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1167,11 +1141,10 @@ def main() -> None:
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
-            # Fallback for uncapped runs: step-count based (unchanged)
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        # Wall-clock aware: warmdown occupies the last warmdown_frac of total budget
-        warmdown_ms = args.warmdown_frac * max_wallclock_ms
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
