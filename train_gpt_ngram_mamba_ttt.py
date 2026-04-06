@@ -527,30 +527,42 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class MambaLite(nn.Module):
-    def __init__(self, dim: int, kernel_size: int = 15):
+    def __init__(self, dim: int):
         super().__init__()
+
+        # 3-way projection
         self.in_proj = CastedLinear(dim, 3 * dim, bias=False)
 
-        padding = kernel_size - 1
-        self.dwconv = nn.Conv1d(
-            dim,
-            dim,
-            kernel_size=kernel_size,
-            groups=dim,
-            padding=padding,
-            bias=False,
+        # multi-scale depthwise conv (cheap)
+        self.dwconv_short = nn.Conv1d(
+            dim, dim, kernel_size=7, groups=dim, padding=6, bias=False
         )
+        self.dwconv_mid = nn.Conv1d(
+            dim, dim, kernel_size=15, groups=dim, padding=14, bias=False
+        )
+
+        # lightweight channel mixing
+        self.mix_proj = CastedLinear(dim, dim, bias=False)
 
         self.out_proj = CastedLinear(dim, dim, bias=False)
         self.out_proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, D = x.shape
+
         proj = self.in_proj(x)
         x_main, gate, mix = proj.chunk(3, dim=-1)
+
+        # stronger gate (important)
         gate = F.silu(gate)
-        y = self.dwconv(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
-        y = x_main + y + 0.25 * mix
+
+        # multi-scale conv
+        xs = self.dwconv_short(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
+        xm = self.dwconv_mid(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
+
+        # combine (balanced)
+        y = x_main + xs + 0.5 * xm + 0.25 * self.mix_proj(mix)
+
         return self.out_proj(gate * y)
     
 class Block(nn.Module):
