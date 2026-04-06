@@ -1,10 +1,6 @@
 {
   "tokenizers": [
     {
-      "name": "byte260",
-      "dataset_suffix": "byte260"
-    },
-    {
       "name": "sp_bpe_1024",
       "dataset_suffix": "sp1024",
       "vocab_size": 1024
