@@ -107,8 +107,8 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 1))
+    num_heads = int(os.environ.get("NUM_HEADS", 4))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
     bigram_hash_size = int(os.environ.get("BIGRAM_HASH_SIZE", 512))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 64))
 
