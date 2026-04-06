@@ -110,7 +110,7 @@ class Hyperparameters:
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
+    logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.0))
 
     # Ablations / feature switches.
     use_bigram = bool(int(os.environ.get("USE_BIGRAM", "1")))
@@ -1043,9 +1043,11 @@ def main() -> None:
         use_skip_weights=args.use_skip_weights,
         logit_sharpen=args.logit_sharpen,
     ).to(device).bfloat16()
-    ema_model = copy.deepcopy(base_model).eval()
-    for p in ema_model.parameters():
-        p.requires_grad_(False)
+    ema_model = None
+    if args.use_distill:
+        ema_model = copy.deepcopy(base_model).eval()
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
     base_model.bigram_loss_lambda = args.bigram_loss_lambda
     base_model.use_bigram_loss = args.use_bigram_loss
     for module in base_model.modules():
@@ -1208,15 +1210,17 @@ def main() -> None:
             for opt in optimizers:
                 opt.step()
             # EMA teacher update
-            with torch.no_grad():
-                decay = args.distill_ema_decay
-                for p, p_ema in zip(base_model.parameters(), ema_model.parameters()):
-                    p_ema.data.lerp_(p.data.to(dtype=p_ema.dtype), 1.0 - decay)
+            if args.use_distill and ema_model is not None:
+                with torch.no_grad():
+                    decay = args.distill_ema_decay
+                    for p, p_ema in zip(base_model.parameters(), ema_model.parameters()):
+                        p_ema.data.lerp_(p.data.to(dtype=p_ema.dtype), 1.0 - decay)
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
-        ema_model.load_state_dict(initial_model_state, strict=True)
+        if args.use_distill and ema_model is not None:
+            ema_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
@@ -1268,6 +1272,7 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 if args.use_distill and args.distill_lambda > 0:
+                    assert ema_model is not None
                     with torch.no_grad():
                         teacher_logits = ema_model(x, y=None).detach()
                     ce_loss, student_logits = model(x, y, return_logits=True)
@@ -1297,10 +1302,11 @@ def main() -> None:
             opt.step()
 
         # EMA teacher update
-        with torch.no_grad():
-            decay = args.distill_ema_decay
-            for p, p_ema in zip(base_model.parameters(), ema_model.parameters()):
-                p_ema.data.lerp_(p.data.to(dtype=p_ema.dtype), 1.0 - decay)
+        if args.use_distill and ema_model is not None:
+            with torch.no_grad():
+                decay = args.distill_ema_decay
+                for p, p_ema in zip(base_model.parameters(), ema_model.parameters()):
+                    p_ema.data.lerp_(p.data.to(dtype=p_ema.dtype), 1.0 - decay)
 
         if args.adam_weight_decay > 0:
             with torch.no_grad():
