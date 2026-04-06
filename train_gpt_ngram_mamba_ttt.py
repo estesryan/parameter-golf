@@ -529,19 +529,11 @@ class MambaLite(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
 
-        # 3-way projection
         self.in_proj = CastedLinear(dim, 3 * dim, bias=False)
 
-        # multi-scale depthwise conv (cheap)
-        self.dwconv_short = nn.Conv1d(
-            dim, dim, kernel_size=7, groups=dim, padding=6, bias=False
-        )
-        self.dwconv_mid = nn.Conv1d(
+        self.dwconv = nn.Conv1d(
             dim, dim, kernel_size=15, groups=dim, padding=14, bias=False
         )
-
-        # lightweight channel mixing
-        self.mix_proj = CastedLinear(dim, dim, bias=False)
 
         self.out_proj = CastedLinear(dim, dim, bias=False)
         self.out_proj._zero_init = True
@@ -552,15 +544,10 @@ class MambaLite(nn.Module):
         proj = self.in_proj(x)
         x_main, gate, mix = proj.chunk(3, dim=-1)
 
-        # stronger gate (important)
         gate = F.silu(gate)
 
-        # multi-scale conv
-        xs = self.dwconv_short(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
-        xm = self.dwconv_mid(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
-
-        # combine (balanced)
-        y = x_main + xs + 0.5 * xm + 0.25 * self.mix_proj(mix)
+        y = self.dwconv(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
+        y = x_main + y + 0.25 * mix
 
         return self.out_proj(gate * y)
     
@@ -819,7 +806,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0("sequence_mixer:mamba_lite depthwise_conv=True kernels:[7,15]")
+    log0("sequence_mixer:mamba_lite depthwise_conv=True kernel_size:15")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
