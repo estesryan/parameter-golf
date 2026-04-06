@@ -83,11 +83,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 5))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
-    model_dim = int(os.environ.get("MODEL_DIM", 448))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 8))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -817,8 +817,8 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_partial_dims)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -892,8 +892,8 @@ class GPT(nn.Module):
         self.tri23_w = nn.Parameter(torch.tensor(trigram23_weight_init))
 
         self.tri_gate_emb = nn.Embedding(vocab_size, 3)
-        self.tri_gate_bias = nn.Parameter(torch.tensor([0.0, -0.2, -0.4], dtype=torch.float32))
-        self.tri_gate_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        self.tri_gate_bias = nn.Parameter(torch.zeros(3, dtype=torch.float32))
+        self.tri_gate_scale = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
 
         self.transformer_scale = nn.Parameter(torch.tensor(transformer_scale_init))
 
