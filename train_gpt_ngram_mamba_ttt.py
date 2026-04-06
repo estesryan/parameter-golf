@@ -538,40 +538,56 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class Mamba2(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, d_state: int = 16):
         super().__init__()
         self.dim = dim
-        self.in_proj = CastedLinear(dim, 2 * dim, bias=False)
+        self.d_state = d_state
 
-        self.A = nn.Parameter(torch.zeros(dim))
-        self.B = nn.Parameter(torch.ones(dim))
-        self.C = nn.Parameter(torch.ones(dim))
+        # expand channels
+        self.in_proj = CastedLinear(dim, 2 * dim + 3 * d_state, bias=False)
+
+        # SSM params
+        self.A = nn.Parameter(torch.randn(d_state))
         self.D = nn.Parameter(torch.ones(dim))
 
+        # output
         self.out_proj = CastedLinear(dim, dim, bias=False)
         self.out_proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, D = x.shape
 
-        x_proj = self.in_proj(x)
-        x_gate, x_val = x_proj.chunk(2, dim=-1)
-        gate = torch.sigmoid(x_gate)
+        # split projection
+        proj = self.in_proj(x)
+        xz, xdt, xb, xc = torch.split(proj, [2 * D, self.d_state, self.d_state, self.d_state], dim=-1)
 
-        y = torch.zeros_like(x_val)
-        state = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+        x_main, z = xz.chunk(2, dim=-1)
 
-        A = torch.sigmoid(self.A.float()).to(x.dtype)
-        Bp = self.B.to(x.dtype)
-        Cp = self.C.to(x.dtype)
-        Dp = self.D.to(x.dtype)
+        dt = F.softplus(xdt)
+        Bp = xb
+        Cp = xc
+
+        # stable A
+        A = -torch.exp(self.A.float()).to(x.dtype)
+
+        u = x_main[..., : self.d_state]
+
+        y_state = torch.zeros_like(u)
+        state = torch.zeros(B, self.d_state, device=x.device, dtype=x.dtype)
 
         for t in range(T):
-            u = x_val[:, t]
-            state = state * A + Bp * u
-            y[:, t] = Cp * state + Dp * u
+            dt_t = dt[:, t]                         # (B, d_state)
+            A_dt = torch.exp(A * dt_t)              # correct discretization
 
-        y = y * gate
+            state = state * A_dt + Bp[:, t] * u[:, t]
+            y_state[:, t] = Cp[:, t] * state
+            
+        y = self.D.to(x.dtype) * x_main
+        y[..., : self.d_state] = y[..., : self.d_state] + y_state
+
+        # gate
+        y = y * z
+
         return self.out_proj(y)
     
 class Block(nn.Module):
