@@ -57,7 +57,9 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_attn_layers = int(os.environ.get("NUM_ATTN_LAYERS", 3))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -532,7 +534,12 @@ class MambaLite(nn.Module):
         self.in_proj = CastedLinear(dim, 3 * dim, bias=False)
 
         self.dwconv = nn.Conv1d(
-            dim, dim, kernel_size=15, groups=dim, padding=14, bias=False
+            dim,
+            dim,
+            kernel_size=15,
+            groups=dim,
+            padding=14,
+            bias=False,
         )
 
         self.out_proj = CastedLinear(dim, dim, bias=False)
@@ -544,19 +551,55 @@ class MambaLite(nn.Module):
         proj = self.in_proj(x)
         x_main, gate, mix = proj.chunk(3, dim=-1)
 
-        gate = F.silu(gate)
+        gate = torch.sigmoid(gate)
 
-        y = self.dwconv(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
-        y = x_main + y + 0.25 * mix
+        y = self.dwconv(x_main.transpose(1, 2))[:, :, :T]
+        y = y.transpose(1, 2)
 
-        return self.out_proj(gate * y)
+        y = y + 0.5 * mix
+
+        return self.out_proj(y * gate)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.qkv = CastedLinear(dim, 3 * dim, bias=False)
+        self.out_proj = CastedLinear(dim, dim, bias=False)
+        self.out_proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, T, D = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, D)
+
+        return self.out_proj(y)
     
 class Block(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, mixer_type: str, num_heads: int):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.ssm = MambaLite(dim)
+        self.mixer_type = mixer_type
+
+        if mixer_type == "mamba":
+            self.mixer = MambaLite(dim)
+        elif mixer_type == "attn":
+            self.mixer = CausalSelfAttention(dim, num_heads)
+        else:
+            raise ValueError(f"unknown mixer_type: {mixer_type}")
+
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -565,18 +608,19 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        ssm_out = self.ssm(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * ssm_out
+        mixer_out = self.mixer(self.attn_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * mixer_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
-
 
 class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
         num_layers: int,
+        num_attn_layers: int,
         model_dim: int,
+        num_heads: int,
         mlp_mult: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
@@ -593,9 +637,18 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        num_mamba_layers = num_layers - num_attn_layers
+        if num_mamba_layers < 0:
+            raise ValueError(f"num_attn_layers={num_attn_layers} cannot exceed num_layers={num_layers}")
+
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, mlp_mult)
+                Block(
+                    model_dim,
+                    mlp_mult,
+                    mixer_type=("mamba" if i < num_mamba_layers else "attn"),
+                    num_heads=num_heads,
+                )
                 for i in range(num_layers)
             ]
         )
@@ -740,7 +793,9 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_attn_layers=args.num_attn_layers,
         model_dim=args.model_dim,
+        num_heads=args.num_heads,
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
@@ -806,7 +861,10 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0("sequence_mixer:mamba_lite depthwise_conv=True kernel_size:15")
+    log0(
+        f"sequence_mixer:hybrid mamba_layers:{args.num_layers - args.num_attn_layers} "
+        f"attn_layers:{args.num_attn_layers} num_heads:{args.num_heads}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
