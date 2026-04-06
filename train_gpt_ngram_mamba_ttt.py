@@ -529,8 +529,7 @@ class MLP(nn.Module):
 class MambaLite(nn.Module):
     def __init__(self, dim: int, kernel_size: int = 15):
         super().__init__()
-
-        self.in_proj = CastedLinear(dim, 4 * dim, bias=False)
+        self.in_proj = CastedLinear(dim, 3 * dim, bias=False)
 
         padding = kernel_size - 1
         self.dwconv = nn.Conv1d(
@@ -542,25 +541,17 @@ class MambaLite(nn.Module):
             bias=False,
         )
 
-        self.mix_proj = CastedLinear(dim, dim, bias=False)
         self.out_proj = CastedLinear(dim, dim, bias=False)
         self.out_proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, D = x.shape
-
         proj = self.in_proj(x)
-        x_main, gate, mix, skip = proj.chunk(4, dim=-1)
-
+        x_main, gate, mix = proj.chunk(3, dim=-1)
         gate = F.silu(gate)
-
-        y = self.dwconv(x_main.transpose(1, 2))[:, :, :T]
-        y = y.transpose(1, 2)
-
-        y = x_main + y + 0.25 * self.mix_proj(mix)
-        y = gate * y + 0.1 * skip
-
-        return self.out_proj(y)
+        y = self.dwconv(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
+        y = x_main + y + 0.25 * mix
+        return self.out_proj(gate * y)
     
 class Block(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
