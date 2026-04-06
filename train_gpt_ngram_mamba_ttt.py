@@ -542,12 +542,13 @@ class Mamba2(nn.Module):
         super().__init__()
         self.dim = dim
         self.d_state = d_state
+        self.chunk_size = 64
 
         # expand channels
         self.in_proj = CastedLinear(dim, 2 * dim + 3 * d_state, bias=False)
 
         # SSM params
-        self.A = nn.Parameter(torch.randn(d_state))
+        self.A = nn.Parameter(torch.zeros(d_state))
         self.D = nn.Parameter(torch.ones(dim))
 
         # output
@@ -575,12 +576,30 @@ class Mamba2(nn.Module):
         y_state = torch.zeros_like(u)
         state = torch.zeros(B, self.d_state, device=x.device, dtype=x.dtype)
 
-        for t in range(T):
-            dt_t = dt[:, t]                         # (B, d_state)
-            A_dt = torch.exp(A * dt_t)              # correct discretization
+        chunk = self.chunk_size
 
-            state = state * A_dt + Bp[:, t] * u[:, t]
-            y_state[:, t] = Cp[:, t] * state
+        for start in range(0, T, chunk):
+            end = min(start + chunk, T)
+
+            dt_chunk = dt[:, start:end]           # (B, L, d_state)
+            B_chunk = Bp[:, start:end]
+            C_chunk = Cp[:, start:end]
+            u_chunk = u[:, start:end]
+
+            A_dt = torch.exp(A[None, None, :] * dt_chunk)
+
+            # sequential inside chunk (small loop)
+            h = state
+            ys = []
+
+            for t in range(end - start):
+                h = h * A_dt[:, t] + B_chunk[:, t] * u_chunk[:, t]
+                ys.append(C_chunk[:, t] * h)
+
+            y_chunk = torch.stack(ys, dim=1)
+
+            y_state[:, start:end] = y_chunk
+            state = h
             
         y = self.D.to(x.dtype) * x_main
         y[..., : self.d_state] = y[..., : self.d_state] + y_state
