@@ -125,7 +125,7 @@ class Hyperparameters:
     bigram_lags = [1, 2, 4]
     rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 16))
     encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
-    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.16))
+    bigram_base_scale = float(os.environ.get("BIGRAM_BASE_SCALE", 0.12))
     trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.50))
     trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.30))
     trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.25))
@@ -1402,6 +1402,13 @@ def main() -> None:
                         for p in group["params"]:
                             if p.requires_grad:
                                 p.mul_(1 - lr * args.adam_weight_decay)
+
+        # Keep higher-order paths from collapsing into the bigram-only basin.
+        with torch.no_grad():
+            base_model.transformer_scale.clamp_(min=0.15)
+            base_model.tri12_w.clamp_(min=0.20)
+            base_model.tri13_w.clamp_(min=0.10)
+            base_model.tri23_w.clamp_(min=0.10)
 
         _qat_mode = args.qat_mode
         if _qat_mode == "off" and args.late_qat:
