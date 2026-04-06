@@ -757,10 +757,9 @@ class MLP(nn.Module):
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
-        self.prelu = nn.PReLU(num_parameters=1, init=0.1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.prelu(self.fc(x))
+        x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -779,8 +778,8 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32) * 0.1)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
