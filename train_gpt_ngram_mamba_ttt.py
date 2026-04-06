@@ -528,20 +528,17 @@ class MLP(nn.Module):
 class MambaLite(nn.Module):
     def __init__(self, dim: int, kernel_size: int = 15):
         super().__init__()
-        self.dim = dim
 
-        self.in_proj = CastedLinear(dim, 3 * dim, bias=False)
+        self.in_proj = CastedLinear(dim, 4 * dim, bias=False)
 
-        padding = kernel_size - 1
-
-        self.dwconv = nn.Conv1d(
-            dim,
-            dim,
-            kernel_size=kernel_size,
-            groups=dim,
-            padding=padding,
-            bias=False,
+        self.dwconv_short = nn.Conv1d(
+            dim, dim, kernel_size=7, groups=dim, padding=6, bias=False
         )
+        self.dwconv_long = nn.Conv1d(
+            dim, dim, kernel_size=31, groups=dim, padding=30, bias=False
+        )
+
+        self.mix_proj = CastedLinear(dim, dim, bias=False)
 
         self.out_proj = CastedLinear(dim, dim, bias=False)
         self.out_proj._zero_init = True
@@ -550,18 +547,17 @@ class MambaLite(nn.Module):
         B, T, D = x.shape
 
         proj = self.in_proj(x)
-        x_main, gate, mix = proj.chunk(3, dim=-1)
+        x_main, gate, mix, skip = proj.chunk(4, dim=-1)
 
-        gate = torch.sigmoid(gate)
+        gate = F.silu(gate)
 
-        # depthwise conv (convert to B,D,T)
-        y = self.dwconv(x_main.transpose(1, 2))[:, :, :T]
-        y = y.transpose(1, 2)
+        xs = self.dwconv_short(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
+        xl = self.dwconv_long(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
 
-        # channel mixing
-        y = y + 0.5 * mix
+        y = x_main + xs + 0.5 * xl + self.mix_proj(mix)
+        y = gate * y + 0.25 * skip
 
-        return self.out_proj(y * gate)
+        return self.out_proj(y)
     
 class Block(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
