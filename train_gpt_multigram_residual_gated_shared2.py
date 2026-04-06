@@ -1,18 +1,19 @@
 """
-Multilag Bigram + Gated Shared-Basis Trigram Residual Transformer with Gated Transformer Residual
+Multilag Bigram + Gated Shared-Basis Trigram Residual Transformer
 
 Architecture: multilag bigram (lags 1/2/4, SVD init on lag-1) + shared-basis trigram modeling
-with three pairwise views (12, 13, 23), token-dependent sigmoid gating over trigram head
-contributions, and a learned per-position gate on the transformer residual contribution +
-shallow U-Net transformer with partial RoPE, tied embeddings, and bfloat16 training.
+with three pairwise views (12, 13, 23), separate per-head output projections, and token-dependent
+sigmoid gating over head contributions + shallow U-Net transformer with partial RoPE, tied
+embeddings, and bfloat16 training.
 
 Optimization: Muon for matrix parameters, Adam for scalars/embeddings, with separately tuned
 learning rate for bigram matrices.
 
 QAT: progressive INT6/INT8 quantization-aware training in the final phase.
 
-Design intent: dominant local n-gram modeling with transformer as adaptive residual corrector;
-the model learns when to add transformer-based corrections on top of the local logits.
+Design intent: dominant local n-gram modeling (bigram + trigram) with transformer as residual
+corrector; shared trigram factors reduce redundant local learning while gating enables
+context-dependent specialization across pairwise heads.
 """
 
 from __future__ import annotations
@@ -128,7 +129,7 @@ class Hyperparameters:
     trigram12_weight_init = float(os.environ.get("TRIGRAM12_WEIGHT_INIT", 0.50))
     trigram13_weight_init = float(os.environ.get("TRIGRAM13_WEIGHT_INIT", 0.30))
     trigram23_weight_init = float(os.environ.get("TRIGRAM23_WEIGHT_INIT", 0.25))
-    transformer_scale_init = float(os.environ.get("TRANSFORMER_SCALE_INIT", 0.30))
+    transformer_scale_init = float(os.environ.get("TRANSFORMER_SCALE_INIT", 0.22))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
     debug_lag_weights = bool(int(os.environ.get("DEBUG_LAG_WEIGHTS", "0")))
 
@@ -894,9 +895,6 @@ class GPT(nn.Module):
         self.tri_gate_bias = nn.Parameter(torch.tensor([0.0, -0.2, -0.4], dtype=torch.float32))
         self.tri_gate_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
-        self.mix_gate = nn.Linear(model_dim, 1, bias=True)
-        self.mix_gate_bias = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
-
         self.transformer_scale = nn.Parameter(torch.tensor(transformer_scale_init))
 
         self.token_mixer = nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
@@ -928,8 +926,6 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         nn.init.zeros_(self.tri_gate_emb.weight)
-        nn.init.normal_(self.mix_gate.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.mix_gate.bias)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -1001,18 +997,12 @@ class GPT(nn.Module):
         tri13_mix = (self.tri13_w.float() * tri_gates[..., 1])[..., None]
         tri23_mix = (self.tri23_w.float() * tri_gates[..., 2])[..., None]
 
-        local_logits = (
+        logits = (
             self.bigram_scale * b
             + tri12_mix * tri12
             + tri13_mix * tri13
             + tri23_mix * tri23
-        )
-
-        transformer_gate = torch.sigmoid(self.mix_gate(x.float()) + self.mix_gate_bias.float())
-
-        logits = (
-            local_logits
-            + transformer_gate * (self.transformer_scale * transformer_logits)
+            + self.transformer_scale * transformer_logits
         )
 
         logits = logits.reshape(-1, logits.size(-1))
@@ -1226,14 +1216,12 @@ def main() -> None:
         base_model.tri23_w,
         base_model.tri_gate_bias,
         base_model.tri_gate_scale,
-        base_model.mix_gate_bias,
     ])
 
     matrix_params.extend([
         base_model.tri_a, base_model.tri_b,
         base_model.tri12_out, base_model.tri13_out, base_model.tri23_out,
         base_model.tri_gate_emb.weight,
-        base_model.mix_gate.weight,
     ])
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -1365,8 +1353,6 @@ def main() -> None:
                 log0(f"lag_weights:{base_model.bigram_lag_weights.detach().cpu().tolist()}")
                 log0(f"tri_weights:{[base_model.tri12_w.item(), base_model.tri13_w.item(), base_model.tri23_w.item()]}")
                 log0(f"transformer_scale:{base_model.transformer_scale.item():.4f}")
-                with torch.no_grad():
-                    log0(f"transformer_gate_mean:{torch.sigmoid(base_model.mix_gate_bias).item():.4f}")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
