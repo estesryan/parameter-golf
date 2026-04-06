@@ -126,7 +126,6 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
     adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.0))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -785,7 +784,7 @@ class GPT(nn.Module):
         use_bigram: bool,
         use_token_mixer: bool,
         use_skip_weights: bool,
-        logit_sharpen: float = 1.1,
+        logit_sharpen: float = 1.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
