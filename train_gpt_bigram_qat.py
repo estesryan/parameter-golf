@@ -1212,7 +1212,7 @@ def main() -> None:
             with torch.no_grad():
                 decay = args.distill_ema_decay
                 for p, p_ema in zip(base_model.parameters(), ema_model.parameters()):
-                    p_ema.data.lerp_(p.data, 1.0 - decay)
+                    p_ema.data.lerp_(p.data.to(dtype=p_ema.dtype), 1.0 - decay)
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
@@ -1301,7 +1301,7 @@ def main() -> None:
         with torch.no_grad():
             decay = args.distill_ema_decay
             for p, p_ema in zip(base_model.parameters(), ema_model.parameters()):
-                p_ema.data.lerp_(p.data, 1.0 - decay)
+                p_ema.data.lerp_(p.data.to(dtype=p_ema.dtype), 1.0 - decay)
 
         if args.adam_weight_decay > 0:
             with torch.no_grad():
