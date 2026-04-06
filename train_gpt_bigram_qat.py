@@ -9,8 +9,9 @@ Architecture:
 - Tied token embeddings reused for output projection to reduce parameter count.
 - BigramHash input augmentation:
   - Adjacent token pairs are hashed into a small embedding table.
-  - A low-dimensional bigram embedding is projected to model_dim and added to
-    the token embedding (scaled), injecting local n-gram structure at low cost.
+  - A low-dimensional bigram embedding is projected to model_dim.
+  - A learned gate conditions on token embeddings to modulate the bigram contribution.
+  - The gated bigram signal is added to the token representation.
 - Lightweight depthwise token-mixing convolution applied before the transformer
   stack to improve local context mixing.
 
@@ -800,6 +801,7 @@ class GPT(nn.Module):
         self.bigram_dim = bigram_dim
         self.bigram_emb = nn.Embedding(self.bigram_hash_size, self.bigram_dim) if use_bigram else None
         self.bigram_proj = CastedLinear(self.bigram_dim, model_dim, bias=False) if use_bigram else None
+        self.bigram_gate = CastedLinear(model_dim, model_dim, bias=False) if use_bigram else None
         self.token_mixer = (
             nn.Conv1d(model_dim, model_dim, kernel_size=2, padding=1, groups=model_dim, bias=False)
             if use_token_mixer else None
@@ -837,6 +839,8 @@ class GPT(nn.Module):
             nn.init.normal_(self.bigram_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         if self.bigram_proj is not None:
             nn.init.normal_(self.bigram_proj.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.bigram_gate is not None:
+            nn.init.zeros_(self.bigram_gate.weight)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -854,7 +858,8 @@ class GPT(nn.Module):
         if self.use_bigram:
             bi = self.bigram_emb(self.bigram_hash(input_ids))
             bi = self.bigram_proj(bi)
-            x = x + 0.5 * bi
+            gate = torch.sigmoid(self.bigram_gate(x))
+            x = x + gate * bi
 
         if self.use_token_mixer:
             x = x.transpose(1, 2)
