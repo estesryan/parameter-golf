@@ -19,11 +19,12 @@ Training:
 - Optimized for short wall-clock training using bf16 compute, torch.compile,
   FlashAttention-backed SDPA, Muon for matrix parameters, and Adam for embeddings
   and scalar/control parameters.
-- Optional ramped int6-aware quantization (QAT-style) during training to improve
-  compressibility of weights.
-- Auxiliary bigram loss encourages modeling of local token transitions to improve
-  convergence speed and compression efficiency.
-- EMA-based self-distillation is enabled by default to accelerate convergence under short training budgets.
+- Supports optional ramped int6-aware quantization (QAT-style) during training to
+  improve compressibility of weights.
+- Supports an optional auxiliary bigram loss to encourage local token-transition
+  modeling and improve convergence speed.
+- Supports optional EMA-based self-distillation to accelerate convergence under
+  short training budgets.
 
 Compression / export:
 - Post-training quantization to int8 (or int6-in-int8) with per-row scaling.
@@ -73,15 +74,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 8 KV heads (GQA) and 1x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
-
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_byte")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_byte260")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
@@ -105,9 +100,9 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 4))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     bigram_hash_size = int(os.environ.get("BIGRAM_HASH_SIZE", 512))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 64))
@@ -115,6 +110,14 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.1))
+
+    # Ablations / feature switches.
+    use_bigram = bool(int(os.environ.get("USE_BIGRAM", "1")))
+    use_token_mixer = bool(int(os.environ.get("USE_TOKEN_MIXER", "1")))
+    use_skip_weights = bool(int(os.environ.get("USE_SKIP_WEIGHTS", "1")))
+    use_bigram_loss = bool(int(os.environ.get("USE_BIGRAM_LOSS", "1")))
+    use_distill = bool(int(os.environ.get("USE_DISTILL", "1")))
+    use_qat = bool(int(os.environ.get("USE_QAT", "1")))
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
@@ -132,16 +135,22 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Quantization / compression-aware training.
     use_int6 = bool(int(os.environ.get("USE_INT6", "0")))
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.35))
     qat_full_frac = float(os.environ.get("QAT_FULL_FRAC", 0.75))
     qat_embeddings = bool(int(os.environ.get("QAT_EMBEDDINGS", "0")))
+
+    # Distillation / auxiliary losses.
     distill_lambda = float(os.environ.get("DISTILL_LAMBDA", 0.2))
     distill_temp = float(os.environ.get("DISTILL_TEMP", 1.5))
     distill_ema_decay = float(os.environ.get("DISTILL_EMA_DECAY", 0.999))
     bigram_loss_lambda = float(os.environ.get("BIGRAM_LOSS_LAMBDA", 0.1))
+
+    # Export.
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
 
 # -----------------------------
@@ -257,8 +266,13 @@ class Muon(torch.optim.Optimizer):
 # Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
 
 def build_byte_luts(vocab_size: int, device: torch.device):
-    # Byte-level tokenizer: each token = 1 byte
-    base_bytes = torch.ones(vocab_size, dtype=torch.int16, device=device)
+    # Repo-native byte260:
+    # 0=pad, 1=bos, 2=eos, 3=unk, 4..259 = actual bytes
+    base_bytes = torch.zeros(vocab_size, dtype=torch.int16, device=device)
+    if vocab_size >= 260:
+        base_bytes[4:260] = 1
+    else:
+        base_bytes[:] = 1
     has_leading_space = torch.zeros(vocab_size, dtype=torch.bool, device=device)
     is_boundary_token = torch.zeros(vocab_size, dtype=torch.bool, device=device)
     return base_bytes, has_leading_space, is_boundary_token
@@ -778,6 +792,9 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_hash_size: int,
         bigram_dim: int,
+        use_bigram: bool,
+        use_token_mixer: bool,
+        use_skip_weights: bool,
         logit_sharpen: float = 1.1,
     ):
         super().__init__()
@@ -786,6 +803,9 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.logit_sharpen = logit_sharpen
+        self.use_bigram = use_bigram
+        self.use_token_mixer = use_token_mixer
+        self.use_skip_weights = use_skip_weights
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash_size = bigram_hash_size
         self.bigram_dim = bigram_dim
@@ -832,13 +852,18 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         tok = self.tok_emb(input_ids)
-        bi = self.bigram_emb(self.bigram_hash(input_ids))
-        bi = self.bigram_proj(bi)
-        x = tok + 0.5 * bi
-        x = x.transpose(1, 2)
-        x = self.token_mixer(x)
-        x = x[:, :, :input_ids.size(1)]
-        x = x.transpose(1, 2)
+        x = tok
+
+        if self.use_bigram:
+            bi = self.bigram_emb(self.bigram_hash(input_ids))
+            bi = self.bigram_proj(bi)
+            x = x + 0.5 * bi
+
+        if self.use_token_mixer:
+            x = x.transpose(1, 2)
+            x = self.token_mixer(x)
+            x = x[:, :, :input_ids.size(1)]
+            x = x.transpose(1, 2)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -848,7 +873,11 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                skip = skips.pop()
+                if self.use_skip_weights:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
+                else:
+                    x = x + skip
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -868,7 +897,7 @@ class GPT(nn.Module):
         loss = ce_loss
 
         # Self-distillation
-        if self.training and getattr(self, "distill_lambda", 0.0) > 0:
+        if self.training and getattr(self, "use_distill", True) and getattr(self, "distill_lambda", 0.0) > 0:
             T = self.distill_temp
             with torch.no_grad():
                 teacher_logits = self._teacher_logits  # injected externally
@@ -880,7 +909,7 @@ class GPT(nn.Module):
             loss = loss + self.distill_lambda * distill_loss
 
         # Bigram auxiliary loss
-        if self.training and getattr(self, "bigram_loss_lambda", 0.0) > 0:
+        if self.training and getattr(self, "use_bigram_loss", True) and getattr(self, "bigram_loss_lambda", 0.0) > 0:
             # shift targets again (predict y_{t+1} from same logits)
             next_targets = torch.roll(targets, shifts=-1)
             next_targets[-1] = 0  # safe padding
@@ -998,6 +1027,9 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_hash_size=args.bigram_hash_size,
         bigram_dim=args.bigram_dim,
+        use_bigram=args.use_bigram,
+        use_token_mixer=args.use_token_mixer,
+        use_skip_weights=args.use_skip_weights,
         logit_sharpen=args.logit_sharpen,
     ).to(device).bfloat16()
     ema_model = copy.deepcopy(base_model).eval()
@@ -1006,12 +1038,28 @@ def main() -> None:
     base_model.distill_lambda = args.distill_lambda
     base_model.distill_temp = args.distill_temp
     base_model.bigram_loss_lambda = args.bigram_loss_lambda
+    base_model.use_distill = args.use_distill
+    base_model.use_bigram_loss = args.use_bigram_loss
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False) if distributed else compiled_model
+    ddp_find_unused = not (
+        args.use_bigram
+        and args.use_token_mixer
+        and args.use_skip_weights
+    )
+    model: nn.Module = (
+        DDP(
+            compiled_model,
+            device_ids=[local_rank],
+            broadcast_buffers=False,
+            find_unused_parameters=ddp_find_unused,
+        )
+        if distributed
+        else compiled_model
+    )
 
     # Optimizer split:
     # - token embedding (Adam) uses TIED_EMBED_LR
@@ -1030,12 +1078,14 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_params.extend(base_model.token_mixer.parameters())
-    matrix_params.append(base_model.bigram_proj.weight)
+    if args.use_token_mixer:
+        scalar_params.extend(base_model.token_mixer.parameters())
+    if args.use_bigram:
+        matrix_params.append(base_model.bigram_proj.weight)
     token_lr = args.tied_embed_lr
     optimizer_tok = torch.optim.Adam(
         [{
-            "params": [base_model.tok_emb.weight, base_model.bigram_emb.weight],
+            "params": [base_model.tok_emb.weight] + ([base_model.bigram_emb.weight] if args.use_bigram else []),
             "lr": token_lr,
             "base_lr": token_lr,
         }],
@@ -1081,6 +1131,11 @@ def main() -> None:
     log0(f"distill:lambda={args.distill_lambda} temp={args.distill_temp}")
     log0(f"bigram_loss_lambda:{args.bigram_loss_lambda}")
     log0(
+        f"ablations:bigram={args.use_bigram} token_mixer={args.use_token_mixer} "
+        f"skip_weights={args.use_skip_weights} bigram_loss={args.use_bigram_loss} "
+        f"distill={args.use_distill} qat={args.use_qat}"
+    )
+    log0(
         f"qat:use_int6={args.use_int6} late_qat={args.late_qat} "
         f"qat_start_frac={args.qat_start_frac} qat_full_frac={args.qat_full_frac} "
         f"qat_embeddings={args.qat_embeddings}"
@@ -1111,6 +1166,8 @@ def main() -> None:
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     def qat_mix(step: int, total_steps: int) -> float:
+        if not args.use_qat:
+            return 0.0
         if not args.use_int6:
             return 0.0
         if total_steps <= 0:
@@ -1202,7 +1259,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                if args.distill_lambda > 0:
+                if args.use_distill and args.distill_lambda > 0:
                     with torch.no_grad():
                         teacher_logits = ema_model(x, y=None)  # forward without loss
                     base_model._teacher_logits = teacher_logits
@@ -1245,7 +1302,7 @@ def main() -> None:
         apply_ramped_int6_qat_(base_model, mix=mix, qat_embeddings=args.qat_embeddings)
 
         # Optional late hard projection can still be kept as a final shove near the end.
-        if args.late_qat and args.use_int6 and scale < args.late_qat_threshold:
+        if args.use_qat and args.late_qat and args.use_int6 and scale < args.late_qat_threshold:
             with torch.no_grad():
                 for name, param in base_model.named_parameters():
                     if param.ndim != 2:
