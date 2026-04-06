@@ -843,9 +843,9 @@ class GPT(nn.Module):
 
     def bigram_hash(self, input_ids: Tensor) -> Tensor:
         # input_ids: (B, T)
-        next_ids = torch.roll(input_ids, shifts=-1, dims=1)
-        next_ids[:, -1] = 0
-        return (input_ids * 1315423911 + next_ids) % self.bigram_hash_size
+        prev_ids = torch.roll(input_ids, shifts=1, dims=1)
+        prev_ids[:, 0] = 0
+        return (prev_ids * 1315423911 + input_ids) % self.bigram_hash_size
 
     def forward(self, input_ids: Tensor, target_ids: Tensor | None, return_logits: bool = False):
         tok = self.tok_emb(input_ids)
