@@ -69,9 +69,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    trigram_rank = int(os.environ.get("TRIGRAM_RANK", 64))
-    trigram12_scale_init = float(os.environ.get("TRIGRAM12_SCALE_INIT", 0.15))
-    trigram13_scale_init = float(os.environ.get("TRIGRAM13_SCALE_INIT", 0.02))
+    trigram_rank = int(os.environ.get("TRIGRAM_RANK", 96))
+    trigram_scale_init = float(os.environ.get("TRIGRAM_SCALE_INIT", 0.20))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -663,8 +662,7 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         trigram_rank: int,
-        trigram12_scale_init: float,
-        trigram13_scale_init: float,
+        trigram_scale_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -675,10 +673,8 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.tri_a = nn.Parameter(torch.randn(vocab_size, trigram_rank) * 0.02)
         self.tri_b = nn.Parameter(torch.randn(vocab_size, trigram_rank) * 0.02)
-        self.tri12_out = nn.Parameter(torch.randn(trigram_rank, vocab_size) * 0.02)
-        self.tri13_out = nn.Parameter(torch.randn(trigram_rank, vocab_size) * 0.01)
-        self.tri12_scale = nn.Parameter(torch.tensor(trigram12_scale_init, dtype=torch.float32))
-        self.tri13_scale = nn.Parameter(torch.tensor(trigram13_scale_init, dtype=torch.float32))
+        self.tri_out = nn.Parameter(torch.randn(trigram_rank, vocab_size) * 0.02)
+        self.tri_scale = nn.Parameter(torch.tensor(trigram_scale_init, dtype=torch.float32))
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -736,21 +732,11 @@ class GPT(nn.Module):
         device = input_ids.device
         pad1 = torch.zeros(B, 1, dtype=input_ids.dtype, device=device)
         pad2 = torch.zeros(B, 2, dtype=input_ids.dtype, device=device)
-        pad3 = torch.zeros(B, 3, dtype=input_ids.dtype, device=device)
-
         t1 = torch.cat([pad1, input_ids[:, :-1]], dim=1)
         t2 = torch.cat([pad2, input_ids[:, :-2]], dim=1)
-        t3 = torch.cat([pad3, input_ids[:, :-3]], dim=1)
 
-        tri_scale = math.sqrt(self.tri_a.size(1))
-        tri12 = ((self.tri_a[t1] * self.tri_b[t2]) @ self.tri12_out) / tri_scale
-        tri13 = ((self.tri_a[t1] * self.tri_b[t3]) @ self.tri13_out) / tri_scale
-
-        logits_proj = (
-            logits_proj
-            + self.tri12_scale.to(dtype=tri12.dtype) * tri12
-            + self.tri13_scale.to(dtype=tri13.dtype) * tri13
-        )
+        tri = ((self.tri_a[t1] * self.tri_b[t2]) @ self.tri_out) / math.sqrt(self.tri_a.size(1))
+        logits_proj = logits_proj + self.tri_scale.to(dtype=tri.dtype) * tri
 
         logits = logits_proj.reshape(-1, logits_proj.size(-1))
         targets = target_ids.reshape(-1)
@@ -870,8 +856,7 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         trigram_rank=args.trigram_rank,
-        trigram12_scale_init=args.trigram12_scale_init,
-        trigram13_scale_init=args.trigram13_scale_init,
+        trigram_scale_init=args.trigram_scale_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -898,16 +883,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    matrix_params.extend([
-        base_model.tri_a,
-        base_model.tri_b,
-        base_model.tri12_out,
-        base_model.tri13_out,
-    ])
-    scalar_params.extend([
-        base_model.tri12_scale,
-        base_model.tri13_scale,
-    ])
+    matrix_params.extend([base_model.tri_a, base_model.tri_b, base_model.tri_out])
+    scalar_params.append(base_model.tri_scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -949,11 +926,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        f"trigram_rank:{args.trigram_rank} "
-        f"trigram12_scale_init:{args.trigram12_scale_init} "
-        f"trigram13_scale_init:{args.trigram13_scale_init}"
-    )
+    log0(f"trigram_rank:{args.trigram_rank} trigram_scale_init:{args.trigram_scale_init}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
