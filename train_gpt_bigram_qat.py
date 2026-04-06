@@ -144,7 +144,7 @@ class Hyperparameters:
     qat_embeddings = bool(int(os.environ.get("QAT_EMBEDDINGS", "0")))
 
     # Distillation / auxiliary losses.
-    distill_lambda = float(os.environ.get("DISTILL_LAMBDA", 0.2))
+    distill_lambda = float(os.environ.get("DISTILL_LAMBDA", 0.05))
     distill_temp = float(os.environ.get("DISTILL_TEMP", 1.5))
     distill_ema_decay = float(os.environ.get("DISTILL_EMA_DECAY", 0.999))
     bigram_loss_lambda = float(os.environ.get("BIGRAM_LOSS_LAMBDA", 0.1))
@@ -1249,7 +1249,7 @@ def main() -> None:
                 if args.use_distill and args.distill_lambda > 0:
                     assert ema_model is not None
                     with torch.no_grad():
-                        teacher_logits = ema_model(x, y=None).detach()
+                        teacher_logits = ema_model(x, target_ids=None).detach()
                     ce_loss, student_logits = model(x, y, return_logits=True)
                     T = args.distill_temp
                     teacher_probs = F.softmax(teacher_logits / T, dim=-1)
