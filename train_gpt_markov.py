@@ -85,10 +85,10 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 1))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2))
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -96,9 +96,9 @@ class Hyperparameters:
 
     # --- Markov Transformer hyperparameters ---
     # Number of causal conv layers in the encoder (1=bigram only, 2=+trigram, 3=+pointwise mix).
-    num_conv_layers = int(os.environ.get("NUM_CONV_LAYERS", 3))
+    num_conv_layers = int(os.environ.get("NUM_CONV_LAYERS", 1))
     # Head dimensions that receive positional encoding. Flat position entropy justifies keeping this small.
-    rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 8))
+    rope_partial_dims = int(os.environ.get("ROPE_PARTIAL_DIMS", 16))
     # Fraction of transformer blocks used as encoder in the U-Net. 0.35 → 3 enc / 6 dec for 9 layers.
     encoder_layer_frac = float(os.environ.get("ENCODER_LAYER_FRAC", 0.35))
 
