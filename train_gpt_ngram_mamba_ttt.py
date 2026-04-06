@@ -60,6 +60,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    max_seq_len = int(os.environ.get("MAX_SEQ_LEN", 1024))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -531,15 +532,17 @@ class MambaLite(nn.Module):
 
         self.in_proj = CastedLinear(dim, 4 * dim, bias=False)
 
-        self.dwconv_short = nn.Conv1d(
-            dim, dim, kernel_size=7, groups=dim, padding=6, bias=False
-        )
-        self.dwconv_long = nn.Conv1d(
-            dim, dim, kernel_size=31, groups=dim, padding=30, bias=False
+        padding = kernel_size - 1
+        self.dwconv = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            groups=dim,
+            padding=padding,
+            bias=False,
         )
 
         self.mix_proj = CastedLinear(dim, dim, bias=False)
-
         self.out_proj = CastedLinear(dim, dim, bias=False)
         self.out_proj._zero_init = True
 
@@ -551,11 +554,11 @@ class MambaLite(nn.Module):
 
         gate = F.silu(gate)
 
-        xs = self.dwconv_short(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
-        xl = self.dwconv_long(x_main.transpose(1, 2))[:, :, :T].transpose(1, 2)
+        y = self.dwconv(x_main.transpose(1, 2))[:, :, :T]
+        y = y.transpose(1, 2)
 
-        y = x_main + xs + 0.5 * xl + self.mix_proj(mix)
-        y = gate * y + 0.25 * skip
+        y = x_main + y + 0.25 * self.mix_proj(mix)
+        y = gate * y + 0.1 * skip
 
         return self.out_proj(y)
     
@@ -589,6 +592,7 @@ class GPT(nn.Module):
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
+        max_seq_len: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -597,6 +601,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.pos_emb = nn.Embedding(max_seq_len, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -621,7 +626,9 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        B, T = input_ids.shape
+        pos = torch.arange(T, device=input_ids.device)
+        x = self.tok_emb(input_ids) + self.pos_emb(pos)[None, :, :]
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -753,6 +760,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
+        max_seq_len=args.max_seq_len,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
