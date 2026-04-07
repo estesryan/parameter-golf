@@ -666,7 +666,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        local_attn_window=args.local_attn_window,
+        local_attn_window=int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -837,6 +837,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        local_attn_window=args.local_attn_window,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
