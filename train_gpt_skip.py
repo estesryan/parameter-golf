@@ -578,6 +578,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.attn_temp = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -591,6 +592,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q = q * self.attn_temp.to(dtype=q.dtype)
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -1064,6 +1066,7 @@ def main() -> None:
                 f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                 f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
             )
+            log0(f"layer:{i} attn_temp:{block.attn.attn_temp.item():.6f}")
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
