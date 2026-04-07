@@ -632,13 +632,9 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.register_buffer("attn_scale", torch.ones(dim, dtype=torch.float32), persistent=False)
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.register_buffer(
-            "resid_mix",
-            torch.stack((torch.ones(dim), torch.zeros(dim))).float(),
-            persistent=False,
-        )
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
