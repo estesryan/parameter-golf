@@ -626,6 +626,8 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        layer_idx: int,
+        num_layers: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -634,7 +636,8 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+        layer_ratio = layer_idx / (num_layers - 1) if num_layers > 1 else 0.0
+        self.resid_mix = nn.Parameter(torch.tensor([1.0 - 0.5 * (1 - layer_ratio), 0.5 * (1 - layer_ratio)], dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -678,6 +681,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    layer_idx=i,
+                    num_layers=num_layers,
                 )
                 for i in range(num_layers)
             ]
