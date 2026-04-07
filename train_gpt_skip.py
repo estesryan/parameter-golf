@@ -1022,6 +1022,21 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        trigger_ms = max_wallclock_ms * (1.0 - args.warmdown_fraction) if max_wallclock_ms is not None else float("inf")
+        if step <= 10 or step % 100 == 0:
+            log0(
+                f"step:{step} elapsed_ms:{elapsed_ms:.0f} trigger_ms:{trigger_ms:.0f} "
+                f"remaining_ms:{(max_wallclock_ms - elapsed_ms) if max_wallclock_ms is not None else float('inf'):.0f} "
+                f"lr_scale:{scale:.9f}"
+            )
+
+        if max_wallclock_ms is not None and elapsed_ms < trigger_ms and scale != 1.0:
+            raise RuntimeError(
+                f"Warmdown activated early at step={step}: "
+                f"elapsed_ms={elapsed_ms:.3f} trigger_ms={trigger_ms:.3f} scale={scale}"
+            )
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1043,6 +1058,15 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        if step <= 10 or step % 100 == 0:
+            log0(
+                "lrs "
+                + " ".join(
+                    f"opt{i}:{group['lr']:.9f}"
+                    for i, opt in enumerate(optimizers)
+                    for group in opt.param_groups
+                )
+            )
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
