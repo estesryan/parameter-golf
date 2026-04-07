@@ -634,11 +634,8 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0] * x + mix[1] * x0
+    def forward(self, x: Tensor) -> Tensor:
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -698,9 +695,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
         for block in self.blocks:
-            x = block(x, x0)
+            x = block(x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
