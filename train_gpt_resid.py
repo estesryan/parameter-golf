@@ -634,7 +634,11 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.register_buffer(
+            "resid_mix",
+            torch.stack((torch.ones(dim), torch.zeros(dim))).float(),
+            persistent=False,
+        )
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -720,7 +724,8 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        return F.cross_entropy(logits_proj.float(), targets, reduction="mean")
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
