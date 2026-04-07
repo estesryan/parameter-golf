@@ -666,7 +666,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        local_attn_window=int,
+        local_attn_window: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
