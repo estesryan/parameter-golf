@@ -699,11 +699,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        for i, block in enumerate(self.blocks):
-            if i % 2 == 0:
-                x = block(x, x0)
-            else:
-                x = block(x, x)
+        for block in self.blocks:
+            x = block(x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
