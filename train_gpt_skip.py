@@ -78,6 +78,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     control_lr = float(os.environ.get("CONTROL_LR", 0.08))
+    gain_lr = float(os.environ.get("GAIN_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -848,10 +849,18 @@ def main() -> None:
     ]
 
     control_param_names = ("resid_mix", "q_gain")
+    gain_param_names = ("attn_scale", "mlp_scale")
+
     fast_control_params = [
         p
         for name, p in block_named_params
         if any(control_name in name for control_name in control_param_names)
+    ]
+
+    slow_gain_params = [
+        p
+        for name, p in block_named_params
+        if any(gain_name in name for gain_name in gain_param_names)
     ]
 
     scalar_params = [
@@ -859,6 +868,7 @@ def main() -> None:
         for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         and not any(control_name in name for control_name in control_param_names)
+        and not any(gain_name in name for gain_name in gain_param_names)
     ]
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -885,6 +895,13 @@ def main() -> None:
         fused=True,
     )
 
+    optimizer_gain = torch.optim.Adam(
+        [{"params": slow_gain_params, "lr": args.gain_lr, "base_lr": args.gain_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -892,7 +909,7 @@ def main() -> None:
         fused=True,
     )
 
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_control, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_control, optimizer_gain, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -910,7 +927,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} control_lr:{args.control_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} control_lr:{args.control_lr} "
+        f"gain_lr:{args.gain_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
