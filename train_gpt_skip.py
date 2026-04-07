@@ -682,6 +682,7 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        self.depth_bias = nn.Parameter(0.01 * torch.randn(num_layers, model_dim, dtype=torch.float32))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -699,8 +700,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        for block in self.blocks:
-            x = block(x, x0)
+        for i, block in enumerate(self.blocks):
+            x = block(x, x0 + self.depth_bias[i].to(dtype=x.dtype)[None, None, :])
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
