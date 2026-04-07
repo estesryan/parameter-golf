@@ -585,20 +585,35 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
+
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
+
+        if self.num_kv_heads != self.num_heads:
+            repeat = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
+
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        mask = torch.triu(
+            torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool),
+            diagonal=1,
         )
+        attn = attn.masked_fill(mask[None, None, :, :], float("-inf"))
+
+        pos = torch.arange(seqlen, device=x.device)
+        dist = (pos[None, :] - pos[:, None]).abs().to(dtype=attn.dtype)
+        attn = attn - 0.01 * dist[None, None, :, :]
+
+        attn = torch.softmax(attn, dim=-1)
+        y = attn @ v
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
