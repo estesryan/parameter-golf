@@ -52,7 +52,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_fraction = float(os.environ.get("WARMDOWN_FRACTION", 0.12))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 20000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -915,8 +915,7 @@ def main() -> None:
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
-        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f} "
-        f"warmdown_fraction:{args.warmdown_fraction:.4f}"
+        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
 
@@ -933,20 +932,15 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        if args.warmdown_iters <= 0:
+            return 1.0
         if max_wallclock_ms is None:
-            return 1.0
-
-        warmdown_fraction = min(max(args.warmdown_fraction, 0.0), 1.0)
-        if warmdown_fraction <= 0.0:
-            return 1.0
-
-        warmdown_ms = max_wallclock_ms * warmdown_fraction
+            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-
-        if remaining_ms >= warmdown_ms:
-            return 1.0
-
-        return max(remaining_ms / max(warmdown_ms, 1e-9), 0.0)
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1022,21 +1016,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-
-        trigger_ms = max_wallclock_ms * (1.0 - args.warmdown_fraction) if max_wallclock_ms is not None else float("inf")
-        if step <= 10 or step % 100 == 0:
-            log0(
-                f"step:{step} elapsed_ms:{elapsed_ms:.0f} trigger_ms:{trigger_ms:.0f} "
-                f"remaining_ms:{(max_wallclock_ms - elapsed_ms) if max_wallclock_ms is not None else float('inf'):.0f} "
-                f"lr_scale:{scale:.9f}"
-            )
-
-        if max_wallclock_ms is not None and elapsed_ms < trigger_ms and scale != 1.0:
-            raise RuntimeError(
-                f"Warmdown activated early at step={step}: "
-                f"elapsed_ms={elapsed_ms:.3f} trigger_ms={trigger_ms:.3f} scale={scale}"
-            )
-
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1058,15 +1037,6 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
-        if step <= 10 or step % 100 == 0:
-            log0(
-                "lrs "
-                + " ".join(
-                    f"opt{i}:{group['lr']:.9f}"
-                    for i, opt in enumerate(optimizers)
-                    for group in opt.param_groups
-                )
-            )
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
