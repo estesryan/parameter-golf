@@ -572,7 +572,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.register_buffer("q_gain", torch.ones(num_heads, dtype=torch.float32), persistent=False)
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -863,12 +863,14 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = torch.optim.Adam(
-        [{"params": matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
+    optimizer_muon = Muon(
+        matrix_params,
+        lr=args.matrix_lr,
+        momentum=args.muon_momentum,
+        backend_steps=args.muon_backend_steps,
     )
+    for group in optimizer_muon.param_groups:
+        group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -1010,6 +1012,11 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        for group in optimizer_muon.param_groups:
+            group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
