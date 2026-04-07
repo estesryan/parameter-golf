@@ -289,7 +289,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain",
     ).split(",")
     if pattern
 )
@@ -1047,6 +1047,23 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
+    if master_process:
+        log0("=== CONTROL TENSORS ===")
+        for i, block in enumerate(base_model.blocks):
+            rm = block.resid_mix.detach().cpu().tolist()
+            log0(f"layer:{i} resid_mix:{rm}")
+            log0(
+                f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
+                f"attn_scale_std:{block.attn_scale.std().item():.6f}"
+            )
+            log0(
+                f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
+                f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
+            )
+            log0(
+                f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
+                f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
+            )
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
