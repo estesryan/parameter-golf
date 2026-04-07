@@ -591,14 +591,30 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
+        if self.num_kv_heads != self.num_heads:
+            repeat = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
+
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # causal mask
+        mask = torch.triu(
+            torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool),
+            diagonal=1,
         )
+        attn = attn.masked_fill(mask[None, None, :, :], float("-inf"))
+
+        # TOP-K SPARSITY (NEW)
+        k_top = min(64, seqlen)
+        topk_vals, topk_idx = torch.topk(attn, k_top, dim=-1)
+
+        sparse_attn = torch.full_like(attn, float("-inf"))
+        sparse_attn.scatter_(-1, topk_idx, topk_vals)
+
+        attn = torch.softmax(sparse_attn, dim=-1)
+
+        y = attn @ v
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
