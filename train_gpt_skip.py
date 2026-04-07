@@ -667,6 +667,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.embed_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.num_encoder_layers = num_layers
         self.num_decoder_layers = 0
         self.blocks = nn.ModuleList(
@@ -696,7 +697,7 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        x = self.embed_scale * self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         for block in self.blocks:
