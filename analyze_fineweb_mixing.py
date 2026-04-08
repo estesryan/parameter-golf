@@ -3,7 +3,7 @@ import numpy as np
 import os
 
 # Configure via env var if needed
-data_path = os.environ.get("DATA_PATH", r".\data\datasets\fineweb10B_sp1024")
+data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
 DATA = os.path.join(data_path, "fineweb_train_*.bin")
 HEADER = 256 * 4
 
