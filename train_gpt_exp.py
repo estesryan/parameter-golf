@@ -72,6 +72,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    mixer_kernel_size = int(os.environ.get("MIXER_KERNEL_SIZE", 5))
+    mixer_gain_init = float(os.environ.get("MIXER_GAIN_INIT", 0.05))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -606,25 +608,42 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
+class CausalDepthwiseConv1d(nn.Module):
+    def __init__(self, dim: int, kernel_size: int = 5):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size,
+            groups=dim,
+            bias=False,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, T, C]
+        x = x.transpose(1, 2)  # [B, C, T]
+        x = F.pad(x, (self.kernel_size - 1, 0))
+        x = self.conv(x)
+        return x.transpose(1, 2)
+
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    # relu^2 MLP + learned causal token mixer
+    def __init__(self, dim: int, mlp_mult: int, mixer_kernel_size: int = 5, mixer_gain_init: float = 0.05):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
+        self.mixer = CausalDepthwiseConv1d(hidden, kernel_size=mixer_kernel_size)
+        self.mix_gain = nn.Parameter(torch.full((hidden,), mixer_gain_init, dtype=torch.float32))
+
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         x = x.square()
-        x = (
-            x
-            + 0.08 * torch.roll(x, shifts=1, dims=1)
-            + 0.04 * torch.roll(x, shifts=2, dims=1)
-            + 0.02 * torch.roll(x, shifts=3, dims=1)
-        )
+        x = x + self.mix_gain.to(dtype=x.dtype)[None, None, :] * self.mixer(x)
         return self.proj(x)
 
 
@@ -637,12 +656,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mixer_kernel_size: int,
+        mixer_gain_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, mixer_kernel_size, mixer_gain_init)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
@@ -666,6 +687,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mixer_kernel_size: int,
+        mixer_gain_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -685,6 +708,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    mixer_kernel_size,
+                    mixer_gain_init,
                 )
                 for i in range(num_layers)
             ]
@@ -831,6 +856,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        mixer_kernel_size=args.mixer_kernel_size,
+        mixer_gain_init=args.mixer_gain_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -850,6 +877,12 @@ def main() -> None:
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+
+    conv_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 3 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
     qgain_params = [
@@ -879,6 +912,14 @@ def main() -> None:
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
+
+    optimizer_conv = torch.optim.Adam(
+        [{"params": conv_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
 
@@ -896,7 +937,7 @@ def main() -> None:
         fused=True,
     )
 
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_qgain, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_conv, optimizer_qgain, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -909,8 +950,12 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"mixer_kernel_size:{args.mixer_kernel_size} mixer_gain_init:{args.mixer_gain_init}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+
+    log0(f"conv_params:{sum(p.numel() for p in conv_params)}")
+    log0(f"matrix_params:{sum(p.numel() for p in matrix_params)}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
