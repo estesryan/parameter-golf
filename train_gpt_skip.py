@@ -294,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain",
+        "mlp_scale,mlp_scales,q_gain",
     ).split(",")
     if pattern
 )
@@ -637,12 +637,11 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -1072,16 +1071,20 @@ def main() -> None:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
             log0(
-                f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
-                f"attn_scale_std:{block.attn_scale.std().item():.6f}"
-            )
-            log0(
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
             log0(
+                f"layer:{i} mlp_scale_min:{block.mlp_scale.min().item():.6f} "
+                f"mlp_scale_max:{block.mlp_scale.max().item():.6f}"
+            )
+            log0(
                 f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                 f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
+            )
+            log0(
+                f"layer:{i} q_gain_min:{block.attn.q_gain.min().item():.6f} "
+                f"q_gain_max:{block.attn.q_gain.max().item():.6f}"
             )
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
