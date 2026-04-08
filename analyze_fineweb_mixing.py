@@ -3,7 +3,8 @@ import numpy as np
 import os
 
 # Configure via env var if needed
-DATA = r".\data\datasets\fineweb10B_sp1024\fineweb_train_*.bin"
+data_path = os.environ.get("DATA_PATH", r".\data\datasets\fineweb10B_sp1024")
+DATA = os.path.join(data_path, "fineweb_train_*.bin")
 HEADER = 256 * 4
 
 def load_shard(f):
@@ -15,7 +16,12 @@ def load_shard(f):
 
 files = sorted(glob.glob(DATA))[:3]
 if not files:
-    raise SystemExit(f"No shards found for: {DATA}")
+    raise SystemExit(
+        f"No shards found.\n"
+        f"Tried: {DATA}\n"
+        f"CWD: {os.getcwd()}\n"
+        f"Hint: set DATA_PATH or run from repo root."
+    )
 
 tokens = np.concatenate([load_shard(f) for f in files])[:5_000_000]
 
