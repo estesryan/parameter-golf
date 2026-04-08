@@ -626,8 +626,7 @@ class CausalDepthwiseConv1d(nn.Module):
         x = F.pad(x, (self.kernel_size - 1, 0))
         x = self.conv(x)
         return x.transpose(1, 2)
-
-
+    
 class MLP(nn.Module):
     # relu^2 MLP + learned causal token mixer
     def __init__(self, dim: int, mlp_mult: int, mixer_kernel_size: int = 5, mixer_gain_init: float = 0.05):
@@ -863,7 +862,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = base_model
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -953,9 +952,6 @@ def main() -> None:
     log0(f"mixer_kernel_size:{args.mixer_kernel_size} mixer_gain_init:{args.mixer_gain_init}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-
-    log0(f"conv_params:{sum(p.numel() for p in conv_params)}")
-    log0(f"matrix_params:{sum(p.numel() for p in matrix_params)}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
