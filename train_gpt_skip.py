@@ -294,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,mlp_gain,resid_mix,resid_mixes,q_gain",
     ).split(",")
     if pattern
 )
@@ -637,6 +637,7 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
+        self.mlp_gain = nn.Parameter(torch.tensor(1.5, dtype=torch.float32))
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
@@ -646,7 +647,9 @@ class Block(nn.Module):
         x = mix[0] * x + mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp_gain.to(dtype=x.dtype) * mlp_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 class GPT(nn.Module):
@@ -1099,6 +1102,7 @@ def main() -> None:
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
+            log0(f"layer:{i} mlp_gain:{block.mlp_gain.item():.6f}")
             log0(
                 f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                 f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
