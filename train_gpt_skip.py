@@ -639,11 +639,11 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+        self.resid_gate = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = torch.softmax(self.resid_mix, dim=0).to(dtype=x.dtype)
-        x = mix[0] * x + mix[1] * x0
+        gate = torch.sigmoid(self.resid_gate).to(dtype=x.dtype)
+        x = (1.0 - gate) * x + gate * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
