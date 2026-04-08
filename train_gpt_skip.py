@@ -61,7 +61,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1100))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -86,7 +86,8 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    control_lr = float(os.environ.get("CONTROL_LR", 0.08))
+    qgain_lr = float(os.environ.get("QGAIN_LR", 0.08))
+    resid_lr = float(os.environ.get("RESID_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -856,19 +857,24 @@ def main() -> None:
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
-    control_param_names = ("resid_mix", "q_gain")
-
-    fast_control_params = [
+    resid_params = [
         p
         for name, p in block_named_params
-        if any(control_name in name for control_name in control_param_names)
+        if "resid_mix" in name
+    ]
+
+    qgain_params = [
+        p
+        for name, p in block_named_params
+        if "q_gain" in name
     ]
 
     scalar_params = [
         p
         for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and not any(control_name in name for control_name in control_param_names)
+        and "resid_mix" not in name
+        and "q_gain" not in name
     ]
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -888,8 +894,15 @@ def main() -> None:
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
 
-    optimizer_control = torch.optim.Adam(
-        [{"params": fast_control_params, "lr": args.control_lr, "base_lr": args.control_lr}],
+    optimizer_resid = torch.optim.Adam(
+        [{"params": resid_params, "lr": args.resid_lr, "base_lr": args.resid_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+
+    optimizer_qgain = torch.optim.Adam(
+        [{"params": qgain_params, "lr": args.qgain_lr, "base_lr": args.qgain_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -902,7 +915,7 @@ def main() -> None:
         fused=True,
     )
 
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_control, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_resid, optimizer_qgain, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -920,11 +933,13 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} control_lr:{args.control_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} resid_lr:{args.resid_lr} "
+        f"qgain_lr:{args.qgain_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"warmdown_iters:{args.warmdown_iters} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
