@@ -61,7 +61,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_fraction = float(os.environ.get("WARMDOWN_FRACTION", 0.9))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -644,11 +644,11 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.zeros(2, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        gate = torch.sigmoid(self.resid_mix).to(dtype=x.dtype)
-        x = x + gate * (x0 - x)
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0] * x + mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -941,24 +941,16 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
-    def lr_mul(step, elapsed_ms):
+    def lr_mul(step: int, elapsed_ms: float) -> float:
+        if args.warmdown_iters <= 0:
+            return 1.0
         if max_wallclock_ms is None:
-            return 1.0
-
-        frac = args.warmdown_fraction
-        if frac <= 0.0:
-            return 1.0
-
-        # clamp for safety
-        frac = min(max(frac, 0.0), 1.0)
-
-        warmdown_ms = max_wallclock_ms * frac
+            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-
-        if remaining_ms >= warmdown_ms:
-            return 1.0
-
-        return remaining_ms / max(warmdown_ms, 1e-9)
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1089,7 +1081,7 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
-            rm = torch.softmax(block.resid_mix.detach().cpu(), dim=0).tolist()
+            rm = block.resid_mix.detach().cpu().tolist()
             log0(f"layer:{i} resid_mix:{rm}")
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
