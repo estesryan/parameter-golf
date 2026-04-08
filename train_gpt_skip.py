@@ -294,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_gate,q_gain",
     ).split(",")
     if pattern
 )
@@ -853,7 +853,7 @@ def main() -> None:
     resid_params = [
         p
         for name, p in block_named_params
-        if "resid_mix" in name
+        if "resid_gate" in name
     ]
 
     qgain_params = [
@@ -866,7 +866,7 @@ def main() -> None:
         p
         for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and "resid_mix" not in name
+        and "resid_gate" not in name
         and "q_gain" not in name
     ]
 
@@ -1089,8 +1089,8 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
-            rm = block.resid_mix.detach().cpu().tolist()
-            log0(f"layer:{i} resid_mix:{rm}")
+            gate = torch.sigmoid(block.resid_gate.detach()).item()
+            log0(f"layer:{i} resid_gate:{block.resid_gate.item():.6f} resid_x0_frac:{gate:.6f}")
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
                 f"attn_scale_std:{block.attn_scale.std().item():.6f}"
