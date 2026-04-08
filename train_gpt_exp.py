@@ -619,7 +619,7 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         x = x.square()
-        x = x + 0.1 * torch.roll(x, shifts=1, dims=1)
+        x = x + 0.08 * torch.roll(x, shifts=1, dims=1) + 0.04 * torch.roll(x, shifts=2, dims=1)
         return self.proj(x)
 
 
