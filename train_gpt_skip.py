@@ -644,18 +644,18 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), 1.2, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0] * x + mix[1] * x0
+        mix = torch.tanh(self.resid_mix).to(dtype=x.dtype)
+        x = (1.0 + 0.5 * mix[0]) * x + 0.5 * mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
         mlp_out = self.mlp(self.mlp_norm(x))
 
-        attn_scale = self.attn_scale.to(dtype=x.dtype)[None, None, :]
-        mlp_scale = self.mlp_scale.to(dtype=x.dtype)[None, None, :]
-        scale_sum = attn_scale + mlp_scale + 1e-6
+        attn_scale = F.softplus(self.attn_scale).to(dtype=x.dtype)[None, None, :]
+        mlp_scale = (1.5 * F.softplus(self.mlp_scale)).to(dtype=x.dtype)[None, None, :]
+        scale_sum = attn_scale + mlp_scale + 1e-4
 
         attn_w = attn_scale / scale_sum
         mlp_w = mlp_scale / scale_sum
