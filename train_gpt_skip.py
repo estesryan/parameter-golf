@@ -1,7 +1,16 @@
 """
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+Naive baseline optimization.
 
-Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
+This configuration reflects empirical improvements to the standard GPT baseline
+under a strict time budget, without adding architectural complexity.
+
+Key ideas:
+- Keep the model simple; avoid unnecessary structures (e.g. skip blending with x0).
+- Let scalar control tensors (resid_mix, q_gain, attn_scale, mlp_scale) learn routing naturally.
+- Separate fast control parameters (resid_mix, q_gain) from other scalars via higher LR.
+- Use warmdown to improve late-stage convergence and overall compression.
+
+Overall: prioritize clean dynamics and efficient learning over added mechanisms.
 """
 
 from __future__ import annotations
@@ -635,10 +644,10 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.zeros(2, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
+        mix = torch.softmax(self.resid_mix, dim=0).to(dtype=x.dtype)
         x = mix[0] * x + mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
