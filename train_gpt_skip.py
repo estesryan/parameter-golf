@@ -649,12 +649,12 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = torch.tanh(self.resid_mix).to(dtype=x.dtype)
-        x = (1.0 + 0.5 * mix[0]) * x + 0.5 * mix[1] * x0
+        x = x + 0.2 * mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
         mlp_out = self.mlp(self.mlp_norm(x))
 
-        mix = torch.sigmoid(self.branch_mix).to(dtype=x.dtype)[None, None, :]
-        gain = F.softplus(self.branch_gain).to(dtype=x.dtype)[None, None, :]
+        mix = torch.sigmoid(self.branch_mix.clamp(-2.0, 2.0)).to(dtype=x.dtype)[None, None, :]
+        gain = F.softplus(self.branch_gain.clamp(-2.0, 2.0)).to(dtype=x.dtype)[None, None, :]
 
         x = x + gain * (mix * attn_out + (1.0 - mix) * mlp_out)
         return x
