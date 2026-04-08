@@ -638,8 +638,8 @@ class MLP(nn.Module):
 
         self.mixer = CausalDepthwiseConv1d(hidden, kernel_size=mixer_kernel_size)
         self.mix_gain = nn.Parameter(torch.full((hidden,), mixer_gain_init, dtype=torch.float32))
-
         self.decay_logit = nn.Parameter(torch.full((hidden,), 2.0, dtype=torch.float32))
+        self.rec_gain = nn.Parameter(torch.full((hidden,), 0.5, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
@@ -666,7 +666,7 @@ class MLP(nn.Module):
         state = torch.cumsum(x_weighted, dim=1)
 
         # reapply decay
-        x = state * cum_decay
+        x = x + self.rec_gain.to(dtype=x.dtype)[None, None, :] * (state * cum_decay)
 
         return self.proj(x)
 
