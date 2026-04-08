@@ -39,23 +39,46 @@ def mi_lag(x, lag, V=1024):
 
 mis = [mi_lag(tokens, k) for k in range(1, 17)]
 
-print("MI lags 1–16:")
+print("MI lags 1-32:")
+mis = [mi_lag(tokens, k) for k in range(1, 33)]
 for i, m in enumerate(mis, 1):
     print(i, round(float(m), 4))
 
-short = sum(mis[:4])
-mid   = sum(mis[4:8])
-long  = sum(mis[8:16])
+def window_score(lags):
+    return sum(mis[k - 1] for k in lags)
 
-print("\nSummary:")
-print("short(1–4):", round(float(short), 4))
-print("mid(5–8):  ", round(float(mid), 4))
-print("long(9–16):", round(float(long), 4))
+windows = {
+    "k3"        : [1, 2, 3],
+    "k5"        : [1, 2, 3, 4, 5],
+    "k7"        : [1, 2, 3, 4, 5, 6, 7],
+    "dilated_1_2_4": [1, 2, 4],
+    "dilated_1_2_4_8": [1, 2, 4, 8],
+    "mid_2_4_8" : [2, 4, 8],
+    "long_4_8_16": [4, 8, 16],
+}
 
-print("\nRecommendation:")
-if short > 3 * mid:
-    print("→ small local mixer (kernel 3–5)")
-elif mid > 0.3 * short:
-    print("→ local + dilated mixer")
+print("\nWindow scores:")
+for name, lags in windows.items():
+    print(f"{name:14s} {round(float(window_score(lags)), 4)}   lags={lags}")
+
+print("\nIncremental gains:")
+for k in [3, 5, 7]:
+    vals = mis[:k]
+    inc = [vals[0]] + [vals[i] - vals[i+1] for i in range(len(vals)-1)]
+    print(f"k={k}: {[round(float(x), 4) for x in inc]}")
+
+print("\nKernel recommendation:")
+k3 = window_score([1,2,3])
+k5 = window_score([1,2,3,4,5])
+k7 = window_score([1,2,3,4,5,6,7])
+d124 = window_score([1,2,4])
+d1248 = window_score([1,2,4,8])
+
+if k5 > 1.15 * k3 and k7 < 1.08 * k5:
+    print("Use contiguous kernel 5")
+elif k7 > 1.10 * k5:
+    print("Use contiguous kernel 7")
+elif d124 > 0.95 * k5 or d1248 > k5:
+    print("Use local + dilated mixer")
 else:
-    print("→ local weak → focus on long-range state")
+    print("Use contiguous kernel 3 or 5")
