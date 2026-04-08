@@ -643,20 +643,16 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.branch_mix = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-        self.branch_gain = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = torch.tanh(self.resid_mix).to(dtype=x.dtype)
-        x = x + 0.2 * mix[1] * x0
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0] * x + mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
-        mlp_out = self.mlp(self.mlp_norm(x))
-
-        mix = torch.sigmoid(self.branch_mix.clamp(-2.0, 2.0)).to(dtype=x.dtype)[None, None, :]
-        gain = F.softplus(self.branch_gain.clamp(-2.0, 2.0)).to(dtype=x.dtype)[None, None, :]
-
-        x = x + gain * (mix * attn_out + (1.0 - mix) * mlp_out)
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -1103,12 +1099,12 @@ def main() -> None:
             rm = block.resid_mix.detach().cpu().tolist()
             log0(f"layer:{i} resid_mix:{rm}")
             log0(
-                f"layer:{i} branch_mix_mean:{block.branch_mix.mean().item():.6f} "
-                f"branch_mix_std:{block.branch_mix.std().item():.6f}"
+                f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
+                f"attn_scale_std:{block.attn_scale.std().item():.6f}"
             )
             log0(
-                f"layer:{i} branch_gain_mean:{block.branch_gain.mean().item():.6f} "
-                f"branch_gain_std:{block.branch_gain.std().item():.6f}"
+                f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
+                f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
             log0(
                 f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
