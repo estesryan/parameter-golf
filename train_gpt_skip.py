@@ -644,7 +644,7 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.zeros(2, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.tensor([4.0, 0.0], dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = torch.softmax(self.resid_mix, dim=0).to(dtype=x.dtype)
@@ -1089,7 +1089,7 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
-            rm = block.resid_mix.detach().cpu().tolist()
+            rm = torch.softmax(block.resid_mix.detach().cpu(), dim=0).tolist()
             log0(f"layer:{i} resid_mix:{rm}")
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
