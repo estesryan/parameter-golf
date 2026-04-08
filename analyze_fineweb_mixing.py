@@ -3,7 +3,7 @@ import numpy as np
 import os
 
 # Configure via env var if needed
-DATA = os.environ.get("DATA", r".\data\datasets\fineweb10B_sp1024\fineweb_train_*.bin")
+DATA = r".\data\datasets\fineweb10B_sp1024\fineweb_train_*.bin"
 HEADER = 256 * 4
 
 def load_shard(f):
