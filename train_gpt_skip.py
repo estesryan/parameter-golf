@@ -639,7 +639,7 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_gate = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.resid_gate = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         gate = torch.sigmoid(self.resid_gate).to(dtype=x.dtype)
