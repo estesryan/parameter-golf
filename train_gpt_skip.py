@@ -294,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_gate,q_gain",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain",
     ).split(",")
     if pattern
 )
@@ -639,11 +639,12 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_gate = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        gate = torch.sigmoid(self.resid_gate).to(dtype=x.dtype)
-        x = (1.0 - gate) * x + gate * x0
+        mix = self.resid_mix.to(dtype=x.dtype)
+        mix = torch.clamp(mix, -2.0, 3.0)
+        x = mix[0] * x + mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -853,7 +854,7 @@ def main() -> None:
     resid_params = [
         p
         for name, p in block_named_params
-        if "resid_gate" in name
+        if "resid_mix" in name
     ]
 
     qgain_params = [
@@ -866,7 +867,7 @@ def main() -> None:
         p
         for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and "resid_gate" not in name
+        and "resid_mix" not in name
         and "q_gain" not in name
     ]
 
@@ -1089,8 +1090,8 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
-            gate = torch.sigmoid(block.resid_gate.detach()).item()
-            log0(f"layer:{i} resid_gate:{block.resid_gate.item():.6f} resid_x0_frac:{gate:.6f}")
+            rm = block.resid_mix.detach().cpu().tolist()
+            log0(f"layer:{i} resid_mix:{rm}")
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
                 f"attn_scale_std:{block.attn_scale.std().item():.6f}"
