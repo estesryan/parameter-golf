@@ -649,7 +649,6 @@ class Block(nn.Module):
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
-
 class GPT(nn.Module):
     def __init__(
         self,
