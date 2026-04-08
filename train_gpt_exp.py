@@ -638,36 +638,11 @@ class MLP(nn.Module):
 
         self.mixer = CausalDepthwiseConv1d(hidden, kernel_size=mixer_kernel_size)
         self.mix_gain = nn.Parameter(torch.full((hidden,), mixer_gain_init, dtype=torch.float32))
-        self.decay_logit = nn.Parameter(torch.full((hidden,), 2.0, dtype=torch.float32))
-        self.rec_gain = nn.Parameter(torch.full((hidden,), 0.5, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         x = x.square()
-
-        # local mixer (unchanged)
         x = x + self.mix_gain.to(dtype=x.dtype)[None, None, :] * self.mixer(x)
-
-        # --- NEW: EMA-style recurrence (CORRECT) ---
-        decay = torch.sigmoid(self.decay_logit).to(dtype=x.dtype)[None, None, :]
-
-        T = x.size(1)
-        decay = decay.expand(x.size(0), T, x.size(2))
-
-        # cumulative decay
-        cum_decay = torch.cumprod(decay, dim=1)
-
-        # shift for normalization
-        shifted = torch.roll(cum_decay, shifts=1, dims=1)
-        shifted[:, 0, :] = 1.0
-
-        # weighted accumulation
-        x_weighted = x / shifted
-        state = torch.cumsum(x_weighted, dim=1)
-
-        # reapply decay
-        x = x + self.rec_gain.to(dtype=x.dtype)[None, None, :] * (state * cum_decay)
-
         return self.proj(x)
 
 
