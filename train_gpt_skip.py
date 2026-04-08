@@ -294,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain",
     ).split(",")
     if pattern
 )
@@ -637,15 +637,11 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0] * x + mix[1] * x0
+    def forward(self, x: Tensor) -> Tensor:
         attn_out = self.attn(self.attn_norm(x))
-        attn_out = 0.85 * attn_out
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -703,9 +699,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
         for block in self.blocks:
-            x = block(x, x0)
+            x = block(x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -851,12 +846,6 @@ def main() -> None:
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
-    resid_params = [
-        p
-        for name, p in block_named_params
-        if "resid_mix" in name
-    ]
-
     qgain_params = [
         p
         for name, p in block_named_params
@@ -867,7 +856,6 @@ def main() -> None:
         p
         for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and "resid_mix" not in name
         and "q_gain" not in name
     ]
 
@@ -888,13 +876,6 @@ def main() -> None:
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
 
-    optimizer_resid = torch.optim.Adam(
-        [{"params": resid_params, "lr": args.resid_lr, "base_lr": args.resid_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-
     optimizer_qgain = torch.optim.Adam(
         [{"params": qgain_params, "lr": args.qgain_lr, "base_lr": args.qgain_lr}],
         betas=(args.beta1, args.beta2),
@@ -909,7 +890,7 @@ def main() -> None:
         fused=True,
     )
 
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_resid, optimizer_qgain, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_qgain, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1090,8 +1071,6 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
-            rm = block.resid_mix.detach().cpu().tolist()
-            log0(f"layer:{i} resid_mix:{rm}")
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
                 f"attn_scale_std:{block.attn_scale.std().item():.6f}"
