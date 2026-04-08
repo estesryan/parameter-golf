@@ -651,8 +651,16 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0] * x + mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(self.mlp_norm(x))
+
+        attn_scale = self.attn_scale.to(dtype=x.dtype)[None, None, :]
+        mlp_scale = self.mlp_scale.to(dtype=x.dtype)[None, None, :]
+        scale_sum = attn_scale + mlp_scale + 1e-6
+
+        attn_w = attn_scale / scale_sum
+        mlp_w = mlp_scale / scale_sum
+
+        x = x + attn_w * attn_out + mlp_w * mlp_out
         return x
 
 
