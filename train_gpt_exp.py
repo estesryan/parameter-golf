@@ -79,8 +79,8 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.038))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.035))
     qgain_lr = float(os.environ.get("QGAIN_LR", 0.065))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -639,6 +639,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
+        for i, block in enumerate(self.blocks):
+            if block.attn is not None:
+                block.attn_scale.data.mul_(1.0 - 0.5 * (i / len(self.blocks)))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
