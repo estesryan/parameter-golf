@@ -642,8 +642,18 @@ class Block(nn.Module):
         self.num_layers = num_layers
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
-        #attn_init = 1.0 - 0.5 * (layer_idx / max(num_layers - 1, 1))
-        attn_init = 1.0 - 0.7 * (layer_idx / max(num_layers - 1, 1))
+
+        if self.attn is None:
+            self.seq_mix = nn.Conv1d(
+                dim,
+                dim,
+                kernel_size=3,
+                padding=0,
+                groups=dim,
+                bias=False,
+            )
+
+        attn_init = 1.0 - 0.5 * (layer_idx / max(num_layers - 1, 1))
         self.attn_scale = nn.Parameter(torch.full((dim,), attn_init, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
@@ -652,7 +662,13 @@ class Block(nn.Module):
             attn_out = self.attn(self.attn_norm(x))
             attn_scale = 4.0 * torch.tanh(self.attn_scale / 4.0)
             x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            mlp_in = x
+        else:
+            # Strictly causal depthwise k=3 conv over sequence for MLP-only layers.
+            x_pad = F.pad(x.transpose(1, 2), (2, 0))
+            mlp_in = self.seq_mix(x_pad).transpose(1, 2)
+
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(mlp_in))
         return x
 
 class GPT(nn.Module):
