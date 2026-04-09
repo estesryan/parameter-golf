@@ -599,9 +599,11 @@ class CausalSelfAttention(nn.Module):
 
         pos = torch.arange(seqlen, device=x.device)
         dist = pos[:, None] - pos[None, :]
+        causal_mask = dist >= 0
         dist = dist.clamp_min(0).to(dtype=q.dtype)
 
         attn_bias = (-0.04 * dist).clamp_min(-2.0)
+        attn_bias = attn_bias.masked_fill(~causal_mask, float("-inf"))
         attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
 
         y = F.scaled_dot_product_attention(
@@ -609,7 +611,7 @@ class CausalSelfAttention(nn.Module):
             k,
             v,
             attn_mask=attn_bias,
-            is_causal=True,
+            is_causal=False,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -767,8 +769,8 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(True)
-    enable_math_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
