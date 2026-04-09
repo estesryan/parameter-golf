@@ -583,6 +583,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.k_lag_mix_logit = nn.Parameter(torch.tensor(-2.4, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -590,18 +591,15 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        # --- LONG-RANGE K MEMORY (causal EMA) ---
-        alpha = 0.98
 
-        k_mem = torch.zeros_like(k)
-        k_mem[:, :, 0] = k[:, :, 0]
+        lag = 8
+        k_lag = F.pad(k[:, :, :-lag, :], (0, 0, lag, 0))
+        k_lag_mix = torch.sigmoid(self.k_lag_mix_logit).to(dtype=k.dtype)
+        k = k + k_lag_mix * (k_lag - k)
 
-        for t in range(1, k.size(2)):
-            k_mem[:, :, t] = alpha * k_mem[:, :, t-1] + (1 - alpha) * k[:, :, t]
-
-        k = k + 0.08 * k_mem
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
