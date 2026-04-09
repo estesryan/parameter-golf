@@ -578,6 +578,7 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
+        self.q_gate = CastedLinear(dim, self.num_heads, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
@@ -588,6 +589,9 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        q_gate = torch.sigmoid(self.q_gate(x))  # (B, T, H)
+        q_gate = q_gate.transpose(1, 2).unsqueeze(-1)  # (B, H, T, 1)
+        q = q * q_gate
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
@@ -596,22 +600,12 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-
-        pos = torch.arange(seqlen, device=x.device)
-        dist = pos[:, None] - pos[None, :]
-        causal_mask = dist >= 0
-        dist = dist.clamp_min(0).to(dtype=q.dtype)
-
-        attn_bias = (-0.04 * dist).clamp_min(-2.0)
-        attn_bias = attn_bias.masked_fill(~causal_mask, float("-inf"))
-        attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
-
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=attn_bias,
-            is_causal=False,
+            attn_mask=None,
+            is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
