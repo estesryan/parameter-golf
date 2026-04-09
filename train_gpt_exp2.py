@@ -598,8 +598,8 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         if self.use_local_k3:
-            k_pad = F.pad(k, (0, 0, 2, 0))
-            k = 0.5 * k + 0.3 * k_pad[:, :, 1:-1, :] + 0.2 * k_pad[:, :, :-2, :]
+            v_pad = F.pad(v, (0, 0, 2, 0))
+            v = 0.5 * v + 0.3 * v_pad[:, :, 1:-1, :] + 0.2 * v_pad[:, :, :-2, :]
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -696,7 +696,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
-                    use_local_k3=(i in (0, 1)),
+                    use_local_k3=(i == 0),
                 )
                 for i in range(num_layers)
             ]
