@@ -644,7 +644,10 @@ class Block(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        else:
+            attn_out = 0.0 * x  # dummy use to keep graph consistent
+
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -840,7 +843,7 @@ def main() -> None:
         compiled_model,
         device_ids=[local_rank],
         broadcast_buffers=False,
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     ) if distributed else compiled_model
 
     # Optimizer split:
