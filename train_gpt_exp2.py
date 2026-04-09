@@ -649,7 +649,7 @@ class Block(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            attn_scale = 4.0 * torch.tanh(self.attn_scale / 4.0)
+            attn_scale = 3.0 * torch.tanh(self.attn_scale / 3.0)
             x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
