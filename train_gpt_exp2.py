@@ -642,10 +642,17 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
+        # Compute RMS of residual stream (per token)
+        rms = x.float().pow(2).mean(dim=-1, keepdim=True).sqrt().to(x.dtype)
+
+        # Smooth gating: early ~1.0, late <1.0
+        scale = 1.0 / (1.0 + rms)
+
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            x = x + (self.attn_scale * scale).to(dtype=x.dtype) * attn_out
+
+        x = x + (self.mlp_scale * scale).to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
         return x
 
 class GPT(nn.Module):
