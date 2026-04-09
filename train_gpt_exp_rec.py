@@ -643,7 +643,14 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
-            attn_out = self.attn(self.attn_norm(x))
+            h = self.attn_norm(x)
+
+            if getattr(self, "_block_index", 999) < 3:
+                h_t = h.transpose(1, 2)
+                h_mix = F.avg_pool1d(F.pad(h_t, (2, 0)), kernel_size=3, stride=1).transpose(1, 2)
+                h = 0.85 * h + 0.15 * h_mix
+
+            attn_out = self.attn(h)
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -687,6 +694,8 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        for i, block in enumerate(self.blocks):
+            block._block_index = i
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
