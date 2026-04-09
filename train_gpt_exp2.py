@@ -767,8 +767,8 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
