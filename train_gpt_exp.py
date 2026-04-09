@@ -73,6 +73,8 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111011101")
+    local_mix_layers = int(os.environ.get("LOCAL_MIX_LAYERS", 3))
+    local_mix_init = float(os.environ.get("LOCAL_MIX_INIT", 0.25))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -294,7 +296,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,local_scale,local_scales,q_gain",
     ).split(",")
     if pattern
 )
@@ -632,6 +634,8 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
+        use_local_mix: bool,
+        local_mix_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -639,9 +643,18 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
+        self.local_norm = RMSNorm() if use_local_mix else None
+        self.local_scale = (
+            nn.Parameter(torch.full((dim,), local_mix_init, dtype=torch.float32))
+            if use_local_mix else None
+        )
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.local_scale is not None:
+            h = self.local_norm(x).transpose(1, 2)
+            h = F.avg_pool1d(F.pad(h, (2, 0)), kernel_size=3, stride=1).transpose(1, 2)
+            x = x + self.local_scale.to(dtype=x.dtype)[None, None, :] * h
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
@@ -663,6 +676,8 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         attn_layer_pattern: str,
+        local_mix_layers: int,
+        local_mix_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -683,6 +698,8 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
+                    use_local_mix=(i < local_mix_layers),
+                    local_mix_init=local_mix_init,
                 )
                 for i in range(num_layers)
             ]
@@ -830,6 +847,8 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         attn_layer_pattern=args.attn_layer_pattern,
+        local_mix_layers=args.local_mix_layers,
+        local_mix_init=args.local_mix_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1089,6 +1108,13 @@ def main() -> None:
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
+            if block.local_scale is not None:
+                log0(
+                    f"layer:{i} local_scale_mean:{block.local_scale.mean().item():.6f} "
+                    f"local_scale_std:{block.local_scale.std().item():.6f}"
+                )
+            else:
+                log0(f"layer:{i} local_scale_mean:NA local_scale_std:NA")
             if block.attn is not None:
                 log0(
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
