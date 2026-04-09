@@ -643,7 +643,7 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
-            attn_out = self.attn(x)
+            attn_out = self.attn(self.attn_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
