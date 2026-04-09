@@ -647,11 +647,9 @@ class Block(nn.Module):
             attn_out = self.attn(self.attn_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         else:
-            # force usage of ALL attention params
-            dummy = 0.0
-            for p in self.attn.parameters():
-                dummy = dummy + p.view(-1)[0] * 0.0
-            x = x + dummy
+            # run attention but zero its contribution (keeps full graph + grads)
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + attn_out * 0.0
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
