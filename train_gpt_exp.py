@@ -639,9 +639,6 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
-        for i, block in enumerate(self.blocks):
-            if block.attn is not None:
-                block.attn_scale.data.mul_(1.0 - 0.5 * (i / len(self.blocks)))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
@@ -690,6 +687,9 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        for i, block in enumerate(self.blocks):
+            if block.attn is not None:
+                block.attn_scale.data.mul_(1.0 - 0.5 * (i / len(self.blocks)))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
