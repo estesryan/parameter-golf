@@ -845,7 +845,7 @@ def main() -> None:
         compiled_model,
         device_ids=[local_rank],
         broadcast_buffers=False,
-        find_unused_parameters=False,
+        find_unused_parameters=True,
     ) if distributed else compiled_model
 
     if master_process:
