@@ -72,7 +72,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    attn_every_n_layers = int(os.environ.get("ATTN_EVERY_N_LAYERS", 2))
+    attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "110110110")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -662,7 +662,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        attn_every_n_layers: int,
+        attn_layer_pattern: str,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -682,7 +682,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    use_attention=(i % attn_every_n_layers == 0),
+                    use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
                 )
                 for i in range(num_layers)
             ]
@@ -829,7 +829,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        attn_every_n_layers=args.attn_every_n_layers,
+        attn_layer_pattern=args.attn_layer_pattern,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -914,7 +914,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa_sparse(n={args.attn_every_n_layers}) num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:gqa_pattern({args.attn_layer_pattern}) num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1089,10 +1089,13 @@ def main() -> None:
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
-            log0(
-                f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
-                f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
-            )
+            if block.attn is not None:
+                log0(
+                    f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
+                    f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
+                )
+            else:
+                log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
