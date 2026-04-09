@@ -565,6 +565,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_local_k3: bool,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -583,6 +584,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.use_local_k3 = use_local_k3
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -595,10 +597,9 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        # --- LOCAL K SMOOTHING (k=3 contiguous kernel) ---
-        k_pad = F.pad(k, (0, 0, 2, 0))  # pad time dim on the left by 2
-        k = 0.5 * k + 0.3 * k_pad[:, :, 1:-1, :] + 0.2 * k_pad[:, :, :-2, :]
-        # ------------------------------------------------
+        if self.use_local_k3:
+            k_pad = F.pad(k, (0, 0, 2, 0))
+            k = 0.5 * k + 0.3 * k_pad[:, :, 1:-1, :] + 0.2 * k_pad[:, :, :-2, :]
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -636,11 +637,19 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
+        use_local_k3: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            use_local_k3=use_local_k3,
+        ) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -687,6 +696,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
+                    use_local_k3=(i in (0, 1)),
                 )
                 for i in range(num_layers)
             ]
