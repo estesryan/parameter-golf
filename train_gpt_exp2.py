@@ -595,6 +595,10 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+        # --- LOCAL K SMOOTHING (k=3 contiguous kernel) ---
+        k_pad = F.pad(k, (0, 0, 2, 0))  # pad time dim on the left by 2
+        k = 0.5 * k + 0.3 * k_pad[:, :, 1:-1, :] + 0.2 * k_pad[:, :, :-2, :]
+        # ------------------------------------------------
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
