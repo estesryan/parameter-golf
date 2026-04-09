@@ -71,6 +71,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    local_attn_window = int(os.environ.get("LOCAL_ATTN_WINDOW", 5))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -555,6 +556,14 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
+def make_local_causal_mask(seqlen: int, window: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    idx = torch.arange(seqlen, device=device)
+    q_idx = idx[:, None]
+    k_idx = idx[None, :]
+    allowed = (k_idx <= q_idx) & (k_idx >= (q_idx - window + 1))
+    mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=dtype)
+    mask.masked_fill_(allowed, 0.0)
+    return mask
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -564,6 +573,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        local_attn_window: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -584,6 +594,13 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
+        if local_attn_window <= 0:
+            raise ValueError(f"local_attn_window must be positive, got {local_attn_window}")
+        self.local_attn_window = local_attn_window
+        self._local_mask_cache: Tensor | None = None
+        self._local_mask_seq_len = 0
+        self._local_mask_dtype: torch.dtype | None = None
+
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -595,12 +612,22 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        if (
+            self._local_mask_cache is None
+            or self._local_mask_seq_len != seqlen
+            or self._local_mask_cache.device != x.device
+            or self._local_mask_dtype != q.dtype
+        ):
+            self._local_mask_cache = make_local_causal_mask(seqlen, self.local_attn_window, x.device, q.dtype)
+            self._local_mask_dtype = q.dtype
+            self._local_mask_seq_len = seqlen
+
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=None,
-            is_causal=True,
+            attn_mask=self._local_mask_cache,
+            is_causal=False,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -618,14 +645,7 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
-        x = x.square()
-        x = (
-            x
-            + 0.08 * torch.roll(x, shifts=1, dims=1)
-            + 0.04 * torch.roll(x, shifts=2, dims=1)
-            + 0.02 * torch.roll(x, shifts=3, dims=1)
-        )
-        return self.proj(x)
+        return self.proj(x.square())
 
 
 class Block(nn.Module):
@@ -637,11 +657,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        local_attn_window: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, local_attn_window)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -666,6 +687,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        local_attn_window: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -685,6 +707,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    local_attn_window,
                 )
                 for i in range(num_layers)
             ]
@@ -760,9 +783,9 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_flash_sdp(False)
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
@@ -831,6 +854,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        local_attn_window=args.local_attn_window,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -910,7 +934,8 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:local_gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"local_attn_window:{args.local_attn_window}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
