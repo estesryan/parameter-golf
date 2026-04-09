@@ -71,7 +71,6 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    recency_bias_slope = float(os.environ.get("RECENCY_BIAS_SLOPE", 0.03))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -556,14 +555,6 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
-def make_recency_bias(seqlen: int, slope: float, device: torch.device, dtype: torch.dtype) -> Tensor:
-    idx = torch.arange(seqlen, device=device)
-    q_idx = idx[:, None]
-    k_idx = idx[None, :]
-    dist = (q_idx - k_idx).clamp_min(0).to(dtype)
-    bias = -slope * dist
-    bias.masked_fill_(k_idx > q_idx, float("-inf"))
-    return bias
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -573,7 +564,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        recency_bias_slope: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -594,13 +584,6 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-        if recency_bias_slope < 0:
-            raise ValueError(f"recency_bias_slope must be non-negative, got {recency_bias_slope}")
-        self.recency_bias_slope = recency_bias_slope
-        self._attn_bias_cache: Tensor | None = None
-        self._attn_bias_seq_len = 0
-        self._attn_bias_dtype: torch.dtype | None = None
-
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -612,22 +595,12 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        if (
-            self._attn_bias_cache is None
-            or self._attn_bias_seq_len != seqlen
-            or self._attn_bias_cache.device != x.device
-            or self._attn_bias_dtype != q.dtype
-        ):
-            self._attn_bias_cache = make_recency_bias(seqlen, self.recency_bias_slope, x.device, q.dtype)
-            self._attn_bias_dtype = q.dtype
-            self._attn_bias_seq_len = seqlen
-
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=self._attn_bias_cache,
-            is_causal=False,
+            attn_mask=None,
+            is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -647,7 +620,26 @@ class MLP(nn.Module):
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
+class LocalMix(nn.Module):
+    def __init__(self, dim: int, kernel_size: int = 5):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size,
+            padding=kernel_size - 1,
+            groups=dim,
+            bias=False,
+        )
 
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, T, D)
+        x = x.transpose(1, 2)  # (B, D, T)
+        y = self.conv(x)
+        y = y[:, :, :- (self.kernel_size - 1)]  # enforce causality
+        return y.transpose(1, 2)
+    
 class Block(nn.Module):
     def __init__(
         self,
@@ -657,19 +649,23 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        recency_bias_slope: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, recency_bias_slope)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.local_mix = LocalMix(dim, kernel_size=5)
+        self.local_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        h = self.attn_norm(x)
+        attn_out = self.attn(h)
+        local_out = self.local_mix(h)
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out \
+            + self.local_scale.to(dtype=x.dtype)[None, None, :] * local_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -687,7 +683,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        recency_bias_slope: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -707,7 +702,6 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    recency_bias_slope,
                 )
                 for i in range(num_layers)
             ]
@@ -783,9 +777,9 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
-    enable_flash_sdp(False)
-    enable_mem_efficient_sdp(True)
-    enable_math_sdp(True)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -854,7 +848,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        recency_bias_slope=args.recency_bias_slope,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -882,11 +875,18 @@ def main() -> None:
         if "q_gain" in name
     ]
 
+    localmix_params = [
+        p
+        for name, p in block_named_params
+        if "local_mix" in name
+    ]
+
     scalar_params = [
         p
         for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         and "q_gain" not in name
+        and "local_mix" not in name
     ]
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -913,6 +913,13 @@ def main() -> None:
         fused=True,
     )
 
+    optimizer_localmix = torch.optim.Adam(
+        [{"params": localmix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -920,7 +927,13 @@ def main() -> None:
         fused=True,
     )
 
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_qgain, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [
+        optimizer_tok,
+        optimizer_muon,
+        optimizer_qgain,
+        optimizer_localmix,
+        optimizer_scalar,
+    ]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -933,9 +946,8 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=False mem_efficient=True math=True")
-    log0(f"attention_mode:recency_bias_gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(f"recency_bias_slope:{args.recency_bias_slope}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
