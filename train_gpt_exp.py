@@ -636,20 +636,19 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
+        self.use_attention = use_attention
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.full((dim,), 0.5, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.attn is not None:
+        if self.use_attention:
             attn_out = self.attn(self.attn_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         else:
-            # force param usage so DDP doesn't mark unused
-            _ = 0.0
-            for p in self.mlp.parameters():
-                _ = _ + p.view(-1)[0] * 0.0
+            # keep attention params in graph for DDP
+            x = x + 0.0 * self.attn.q_gain.sum()
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -847,6 +846,10 @@ def main() -> None:
         broadcast_buffers=False,
         find_unused_parameters=False,
     ) if distributed else compiled_model
+
+    if master_process:
+        m = model.module if isinstance(model, DDP) else model
+        print([int(b.use_attention) for b in m.blocks])
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1094,13 +1097,13 @@ def main() -> None:
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
-            if block.attn is not None:
+            if block.use_attention:
                 log0(
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                     f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
                 )
             else:
-                log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
+                log0(f"layer:{i} q_gain_mean:SKIPPED q_gain_std:SKIPPED")
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
