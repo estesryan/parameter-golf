@@ -643,8 +643,6 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
         attn_init = 1.0 - 0.5 * (layer_idx / max(num_layers - 1, 1))
-        if layer_idx in (2, 6):
-            attn_init *= 0.8
         self.attn_scale = nn.Parameter(torch.full((dim,), attn_init, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
