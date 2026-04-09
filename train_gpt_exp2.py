@@ -294,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,trailing_mlp_scale,q_gain",
     ).split(",")
     if pattern
 )
@@ -679,6 +679,9 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers
         self.num_decoder_layers = 0
+        self.trailing_mlp = MLP(model_dim, mlp_mult)
+        self.trailing_mlp_norm = RMSNorm()
+        self.trailing_mlp_scale = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -713,6 +716,9 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         for block in self.blocks:
             x = block(x)
+
+        x_norm = self.trailing_mlp_norm(x)
+        x = x + self.trailing_mlp_scale.to(x.dtype)[None, None, :] * self.trailing_mlp(x_norm)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
