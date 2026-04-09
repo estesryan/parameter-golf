@@ -590,16 +590,25 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+
+        pos = torch.arange(seqlen, device=x.device)
+        dist = pos[:, None] - pos[None, :]
+        dist = dist.clamp_min(0).to(dtype=q.dtype)
+
+        attn_bias = (-0.04 * dist).clamp_min(-2.0)
+        attn_bias = attn_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=None,
+            attn_mask=attn_bias,
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
@@ -637,8 +646,7 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
-        init = 1.5 if use_attention else 0.0
-        self.attn_scale = nn.Parameter(torch.full((dim,), init, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
