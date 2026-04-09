@@ -565,8 +565,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        layer_idx: int,
-        num_layers: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -579,8 +577,6 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.layer_idx = layer_idx
-        self.num_layers = num_layers
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
@@ -589,11 +585,6 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def get_layer_scale(self):
-        # nonlinear ramp: soft early, sharp late
-        t = self.layer_idx / max(self.num_layers - 1, 1)
-        return 0.3 + 0.7 * (t ** 2)
-    
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -604,8 +595,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        layer_scale = self.get_layer_scale()
-        q = q * (self.q_gain * layer_scale).to(dtype=q.dtype)[None, :, None, None]
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -642,21 +632,11 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
-        layer_idx: int,
-        num_layers: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(
-            dim,
-            num_heads,
-            num_kv_heads,
-            rope_base,
-            qk_gain_init,
-            layer_idx,
-            num_layers,
-        ) if use_attention else None
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -703,8 +683,6 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
-                    layer_idx=i,
-                    num_layers=num_layers,
                 )
                 for i in range(num_layers)
             ]
