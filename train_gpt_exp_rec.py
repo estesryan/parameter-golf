@@ -73,8 +73,6 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111011101")
-    history_state = bool(int(os.environ.get("HISTORY_STATE", "1")))
-    history_init_scale = float(os.environ.get("HISTORY_INIT_SCALE", 0.25))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -253,7 +251,6 @@ def eval_val(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    memory_state = None
     model.eval()
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
@@ -264,8 +261,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss, memory_state = model(x, y, memory=memory_state)
-                batch_loss = batch_loss.detach()
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -298,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,memory_scale,memory_scales,q_gain",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain",
     ).split(",")
     if pattern
 )
@@ -667,8 +663,6 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         attn_layer_pattern: str,
-        history_state: bool,
-        history_init_scale: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -677,10 +671,6 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.memory_scale = (
-            nn.Parameter(torch.full((model_dim,), history_init_scale, dtype=torch.float32))
-            if history_state else None
-        )
         self.num_encoder_layers = num_layers
         self.num_decoder_layers = 0
         self.blocks = nn.ModuleList(
@@ -710,44 +700,22 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, memory: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-
-        bsz = x.size(0)
-        if self.memory_scale is not None:
-            if memory is None:
-                mem_tok = torch.zeros((bsz, 1, x.size(-1)), device=x.device, dtype=x.dtype)
-            else:
-                mem_vec = self.memory_scale.to(dtype=x.dtype)[None, :] * memory.to(dtype=x.dtype)[None, :]
-                mem_tok = mem_vec[:, None, :].expand(bsz, 1, -1)
-            x = torch.cat([mem_tok, x], dim=1)
-
         for block in self.blocks:
             x = block(x)
 
-        x = self.final_norm(x)
-
-        if self.memory_scale is not None:
-            new_memory = x[:, 0, :].mean(dim=0).detach()
-            x_logits = x[:, 1:, :]
-        else:
-            new_memory = None
-            x_logits = x
-
-        x_logits = x_logits.reshape(-1, x_logits.size(-1))
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-
         if self.tie_embeddings:
-            logits_proj = F.linear(x_logits, self.tok_emb.weight)
+            logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x_logits)
-
+            logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        return loss, new_memory
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -862,8 +830,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         attn_layer_pattern=args.attn_layer_pattern,
-        history_state=args.history_state,
-        history_init_scale=args.history_init_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -992,7 +958,6 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
-        memory_state = None
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -1000,7 +965,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss, memory_state = model(x, y, memory=memory_state)
+                    warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1014,7 +979,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-        memory_state = None
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1025,7 +989,6 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    memory_state = None
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
@@ -1070,7 +1033,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss, memory_state = model(x, y, memory=memory_state)
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1117,11 +1080,6 @@ def main() -> None:
     )
     if master_process:
         log0("=== CONTROL TENSORS ===")
-        if getattr(base_model, "memory_scale", None) is not None:
-            log0(
-                f"memory_scale_mean:{base_model.memory_scale.mean().item():.6f} "
-                f"memory_scale_std:{base_model.memory_scale.std().item():.6f}"
-            )
         for i, block in enumerate(base_model.blocks):
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
