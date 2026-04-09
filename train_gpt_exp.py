@@ -645,6 +645,11 @@ class Block(nn.Module):
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        else:
+            # force param usage so DDP doesn't mark unused
+            _ = 0.0
+            for p in self.mlp.parameters():
+                _ = _ + p.view(-1)[0] * 0.0
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -840,7 +845,7 @@ def main() -> None:
         compiled_model,
         device_ids=[local_rank],
         broadcast_buffers=False,
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     ) if distributed else compiled_model
 
     # Optimizer split:
