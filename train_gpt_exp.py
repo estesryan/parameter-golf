@@ -72,6 +72,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    local_mix_layers = int(os.environ.get("LOCAL_MIX_LAYERS", 3))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -649,6 +650,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_local_mix: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -657,15 +659,16 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.local_mix = LocalMix(dim, kernel_size=5)
-        self.local_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self.local_mix = LocalMix(dim, kernel_size=5) if use_local_mix else None
+        self.local_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32)) if use_local_mix else None
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.attn_norm(x)
         attn_out = self.attn(h)
-        local_out = self.local_mix(h)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out \
-            + self.local_scale.to(dtype=x.dtype)[None, None, :] * local_out
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        if self.local_mix is not None and self.local_scale is not None:
+            local_out = self.local_mix(h)
+            x = x + self.local_scale.to(dtype=x.dtype)[None, None, :] * local_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -683,6 +686,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        local_mix_layers: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -702,6 +706,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_local_mix=(i < local_mix_layers),
                 )
                 for i in range(num_layers)
             ]
@@ -848,6 +853,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        local_mix_layers=args.local_mix_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -889,6 +895,7 @@ def main() -> None:
         and "local_mix" not in name
     ]
 
+    localmix_numel = sum(p.numel() for p in localmix_params)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -947,7 +954,8 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:gqa+lmix({args.local_mix_layers}) num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"local_mix_layers:{args.local_mix_layers} localmix_params:{localmix_numel}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
