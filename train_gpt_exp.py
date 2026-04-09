@@ -622,7 +622,7 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class LocalMix(nn.Module):
-    def __init__(self, dim: int, kernel_size: int = 5):
+    def __init__(self, dim: int, kernel_size: int = 3):
         super().__init__()
         self.kernel_size = kernel_size
         self.conv = nn.Conv1d(
@@ -659,7 +659,7 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.local_mix = LocalMix(dim, kernel_size=5) if use_local_mix else None
+        self.local_mix = LocalMix(dim, kernel_size=3) if use_local_mix else None
         self.local_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32)) if use_local_mix else None
 
     def forward(self, x: Tensor) -> Tensor:
