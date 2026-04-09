@@ -71,7 +71,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    local_attn_window = int(os.environ.get("LOCAL_ATTN_WINDOW", 5))
+    recency_bias_slope = float(os.environ.get("RECENCY_BIAS_SLOPE", 0.03))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -556,14 +556,14 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
-def make_local_causal_mask(seqlen: int, window: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+def make_recency_bias(seqlen: int, slope: float, device: torch.device, dtype: torch.dtype) -> Tensor:
     idx = torch.arange(seqlen, device=device)
     q_idx = idx[:, None]
     k_idx = idx[None, :]
-    allowed = (k_idx <= q_idx) & (k_idx >= (q_idx - window + 1))
-    mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=dtype)
-    mask.masked_fill_(allowed, 0.0)
-    return mask
+    dist = (q_idx - k_idx).clamp_min(0).to(dtype)
+    bias = -slope * dist
+    bias.masked_fill_(k_idx > q_idx, float("-inf"))
+    return bias
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -573,7 +573,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        local_attn_window: int,
+        recency_bias_slope: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -594,12 +594,12 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-        if local_attn_window <= 0:
-            raise ValueError(f"local_attn_window must be positive, got {local_attn_window}")
-        self.local_attn_window = local_attn_window
-        self._local_mask_cache: Tensor | None = None
-        self._local_mask_seq_len = 0
-        self._local_mask_dtype: torch.dtype | None = None
+        if recency_bias_slope < 0:
+            raise ValueError(f"recency_bias_slope must be non-negative, got {recency_bias_slope}")
+        self.recency_bias_slope = recency_bias_slope
+        self._attn_bias_cache: Tensor | None = None
+        self._attn_bias_seq_len = 0
+        self._attn_bias_dtype: torch.dtype | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -613,20 +613,20 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         if (
-            self._local_mask_cache is None
-            or self._local_mask_seq_len != seqlen
-            or self._local_mask_cache.device != x.device
-            or self._local_mask_dtype != q.dtype
+            self._attn_bias_cache is None
+            or self._attn_bias_seq_len != seqlen
+            or self._attn_bias_cache.device != x.device
+            or self._attn_bias_dtype != q.dtype
         ):
-            self._local_mask_cache = make_local_causal_mask(seqlen, self.local_attn_window, x.device, q.dtype)
-            self._local_mask_dtype = q.dtype
-            self._local_mask_seq_len = seqlen
+            self._attn_bias_cache = make_recency_bias(seqlen, self.recency_bias_slope, x.device, q.dtype)
+            self._attn_bias_dtype = q.dtype
+            self._attn_bias_seq_len = seqlen
 
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=self._local_mask_cache,
+            attn_mask=self._attn_bias_cache,
             is_causal=False,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
@@ -657,12 +657,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        local_attn_window: int,
+        recency_bias_slope: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, local_attn_window)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, recency_bias_slope)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -687,7 +687,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        local_attn_window: int,
+        recency_bias_slope: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -707,7 +707,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    local_attn_window,
+                    recency_bias_slope,
                 )
                 for i in range(num_layers)
             ]
@@ -854,7 +854,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        local_attn_window=args.local_attn_window,
+        recency_bias_slope=args.recency_bias_slope,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -933,9 +933,9 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:local_gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(f"local_attn_window:{args.local_attn_window}")
+    log0("sdp_backends:cudnn=False flash=False mem_efficient=True math=True")
+    log0(f"attention_mode:recency_bias_gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"recency_bias_slope:{args.recency_bias_slope}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
