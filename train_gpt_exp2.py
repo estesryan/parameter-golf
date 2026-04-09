@@ -862,23 +862,23 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    named_params = list(base_model.named_parameters())
 
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
     qgain_params = [
         p
-        for name, p in block_named_params
+        for name, p in named_params
         if "q_gain" in name
     ]
 
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         and "q_gain" not in name
     ]
@@ -1110,6 +1110,10 @@ def main() -> None:
                 )
             else:
                 log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
+        log0(
+            f"trailing_mlp_scale_mean:{base_model.trailing_mlp_scale.mean().item():.6f} "
+            f"trailing_mlp_scale_std:{base_model.trailing_mlp_scale.std().item():.6f}"
+        )
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
