@@ -596,6 +596,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q = q * 0.7
         y = F.scaled_dot_product_attention(
             q,
             k,
