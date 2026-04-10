@@ -651,13 +651,14 @@ class Block(nn.Module):
             total_layers,
         ) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            x = 0.9 * x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            gate = torch.sigmoid(self.attn_scale).to(dtype=x.dtype)[None, None, :]
+            x = 0.9 * x + gate * attn_out
 
         x = 0.9 * x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -1097,9 +1098,14 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
+            attn_gate = torch.sigmoid(block.attn_scale)
             log0(
-                f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
-                f"attn_scale_std:{block.attn_scale.std().item():.6f}"
+                f"layer:{i} attn_scale_logit_mean:{block.attn_scale.mean().item():.6f} "
+                f"attn_scale_logit_std:{block.attn_scale.std().item():.6f}"
+            )
+            log0(
+                f"layer:{i} attn_gate_mean:{attn_gate.mean().item():.6f} "
+                f"attn_gate_std:{attn_gate.std().item():.6f}"
             )
             log0(
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
