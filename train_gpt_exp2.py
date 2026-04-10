@@ -643,14 +643,14 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
         attn_init = 1.0 - 0.5 * (layer_idx / max(num_layers - 1, 1))
-        self.attn_scale = nn.Parameter(torch.full((dim,), attn_init, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.tensor(attn_init, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
             attn_scale = 4.0 * torch.tanh(self.attn_scale / 4.0)
-            x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + attn_scale.to(dtype=x.dtype) * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -681,7 +681,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = 0
         self.trailing_mlp = MLP(model_dim, mlp_mult)
         self.trailing_mlp_norm = RMSNorm()
-        self.trailing_mlp_scale = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+        self.trailing_mlp_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -718,7 +718,7 @@ class GPT(nn.Module):
             x = block(x)
 
         x_norm = self.trailing_mlp_norm(x)
-        x = x + self.trailing_mlp_scale.to(x.dtype)[None, None, :] * self.trailing_mlp(x_norm)
+        x = x + self.trailing_mlp_scale.to(x.dtype) * self.trailing_mlp(x_norm)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
