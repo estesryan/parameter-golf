@@ -635,7 +635,8 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
-        self.attn_contrib_accum = torch.tensor(0.0)
+        self.register_buffer("attn_contrib_accum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("attn_contrib_count", torch.zeros((), dtype=torch.float32), persistent=False)
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
@@ -646,8 +647,8 @@ class Block(nn.Module):
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
             # NEW: measure contribution magnitude
-            if hasattr(self, "attn_contrib_accum"):
-                self.attn_contrib_accum += attn_out.abs().mean().detach()
+            self.attn_contrib_accum.add_(attn_out.abs().mean().detach().to(torch.float32))
+            self.attn_contrib_count.add_(1.0)
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -1089,7 +1090,10 @@ def main() -> None:
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
                 f"attn_scale_std:{block.attn_scale.std().item():.6f}"
             )
-            log0(f"layer:{i} attn_contrib:{block.attn_contrib_accum.item():.6f}")
+            attn_contrib_mean = (
+                block.attn_contrib_accum / block.attn_contrib_count.clamp_min(1.0)
+            ).item()
+            log0(f"layer:{i} attn_contrib_mean:{attn_contrib_mean:.6f}")
             log0(
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
