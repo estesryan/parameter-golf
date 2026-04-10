@@ -601,7 +601,6 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q_gain = 4.0 * torch.sigmoid(self.q_gain / 4.0)
         q = q * q_gain.to(dtype=q.dtype)[None, :, None, None]
-        q = q * 0.7
         y = F.scaled_dot_product_attention(
             q,
             k,
