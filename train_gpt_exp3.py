@@ -584,7 +584,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.q_gain = nn.Parameter(torch.ones(num_heads) * 2.5)
         self.rotary = Rotary(self.head_dim, base=rope_base)
         self.layer_idx = layer_idx
         self.total_layers = total_layers
@@ -599,8 +599,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q_gain = 4.0 * torch.sigmoid(self.q_gain / 4.0)
-        q = q * q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
             k,
