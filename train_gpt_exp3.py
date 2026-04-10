@@ -632,7 +632,6 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
-        attn_budget: float = 1.0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -641,12 +640,11 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.attn_budget = float(attn_budget)
 
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            x = x + (self.attn_budget * self.attn_scale.to(dtype=x.dtype))[None, None, :] * attn_out
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -675,7 +673,6 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers
         self.num_decoder_layers = 0
-        attn_budgets = [1.15, 1.05, 0.95, 0.0, 0.85, 0.70, 0.55, 0.0, 0.40]
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -686,7 +683,6 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
-                    attn_budget=attn_budgets[i],
                 )
                 for i in range(num_layers)
             ]
