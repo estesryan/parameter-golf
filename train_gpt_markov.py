@@ -2,13 +2,19 @@
 Baseline GPT with optional Markov front-end.
 
 Adds N depthwise causal Conv1d layers (default: 1) before the transformer
-to provide a local bigram inductive bias. Otherwise identical to the baseline.
+to provide a local n-gram inductive bias. Otherwise identical to the baseline.
+
+Motivated by train_gpt_analyze_fineweb_mixing.py, which revealed strong
+short-range mutual information in the FineWeb corpus and raised the hypothesis
+that a lightweight convolutional front-end could make local structure more
+immediately accessible to the model.
 
 Results:
 A 1-layer causal Conv1d front-end produced no meaningful improvement over
 the baseline under the standard parameter-golf constraints (val_bpb ~1.346–1.348).
-The baseline already captures local n-gram structure efficiently, and the
-additional conv layer did not provide measurable gains.
+The baseline transformer already captures local n-gram structure efficiently
+without explicit inductive bias, suggesting the competition signal is not
+bottlenecked by short-range pattern learning.
 """
 
 from __future__ import annotations

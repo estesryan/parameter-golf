@@ -1,8 +1,9 @@
 """
 Naive baseline optimization.
 
-This configuration reflects empirical improvements to the standard GPT baseline
-under a strict time budget, without adding architectural complexity.
+This serves as the primary baseline for the submission approach - a clean,
+minimal configuration that strips away architectural complexity in favor of
+well-tuned learning dynamics.
 
 Key ideas:
 - Keep the model simple; avoid unnecessary structures (e.g. skip blending with x0).
@@ -11,6 +12,11 @@ Key ideas:
 - Use warmdown to improve late-stage convergence and overall compression.
 
 Overall: prioritize clean dynamics and efficient learning over added mechanisms.
+
+Results:
+Stripping the model back to a clean, minimal configuration produced meaningful
+gains over the naive baseline - suggesting that accumulated architectural
+complexity was hurting more than helping within the constraints of the time budget.
 """
 
 from __future__ import annotations

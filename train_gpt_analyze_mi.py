@@ -1,3 +1,20 @@
+"""
+Analyze token-level mutual information (MI) across lags in FineWeb training shards.
+
+Loads the first 5M tokens from up to 3 training shards and computes pairwise MI
+at lags 1-32. 
+
+The motivation: early experiments showed suspiciously strong local
+structure in the loss curves, raising the question of whether the competition
+reward is dominated by short-range pattern matching rather than genuine language
+understanding. Rather than guessing at an architecture, this script lets the data
+answer directly - if MI decays sharply after a few lags, a small local kernel
+captures most of the signal and long-range attention is wasted capacity. The MI
+scores are used to score and recommend sparse attention window patterns
+(contiguous k=3/5/7 vs. dilated 1-2-4 / 1-2-4-8) that match the actual
+statistical structure of the corpus.
+"""
+
 import glob
 import numpy as np
 import os

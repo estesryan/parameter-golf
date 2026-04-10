@@ -1,17 +1,22 @@
 """
 Multilag bigram + shared-basis trigram residual transformer.
 
-Novelty:
-- multilag bigram modeling over lags 1/2/4, with SVD initialization on lag-1
-- shared-basis trigram modeling using three pairwise views (12, 13, 23)
-- separate output projections for each trigram view
-- token-dependent sigmoid gating over trigram head contributions
+Motivated by the null result in train_gpt_markov.py — where a convolutional
+front-end failed to improve over the baseline despite strong short-range MI
+in the corpus. The hypothesis here was that the model might benefit from
+explicit n-gram factorization rather than a generic conv inductive bias.
+
+Architecture additions:
+- Multilag bigram modeling over lags 1/2/4, with SVD initialization on lag-1.
+- Shared-basis trigram modeling using three pairwise views (12, 13, 23).
+- Separate output projections for each trigram view.
+- Token-dependent sigmoid gating over trigram head contributions.
 
 Results:
 Explicit n-gram factorization (multilag bigram + gated trigram heads) did not
-outperform the baseline (val_bpb ~baseline). This suggests the baseline
-transformer already models local n-gram structure efficiently, and the added
-structure did not translate into measurable gains.
+outperform the baseline. This reinforces the conclusion from train_gpt_markov.py:
+the baseline transformer already captures local n-gram structure efficiently,
+and surfacing that structure explicitly does not translate into measurable gains.
 """
 
 from __future__ import annotations
