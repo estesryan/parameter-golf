@@ -613,13 +613,13 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.fc = CastedLinear(dim, 2 * hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        a, b = self.fc(x).chunk(2, dim=-1)
+        return self.proj(F.silu(a) * torch.relu(b).square())
 
 
 class Block(nn.Module):
@@ -632,7 +632,6 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
-        layer_idx: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -684,6 +683,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
+                    layer_idx=i,
                 )
                 for i in range(num_layers)
             ]
