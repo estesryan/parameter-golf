@@ -565,8 +565,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        layer_idx: int,
-        total_layers: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -584,10 +582,8 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.ones(num_heads) * 2.5)
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
-        self.layer_idx = layer_idx
-        self.total_layers = total_layers
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -622,7 +618,8 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.proj(F.silu(self.fc(x)))
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
 
 
 class Block(nn.Module):
@@ -635,32 +632,20 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
-        layer_idx: int,
-        total_layers: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(
-            dim,
-            num_heads,
-            num_kv_heads,
-            rope_base,
-            qk_gain_init,
-            layer_idx,
-            total_layers,
-        ) if use_attention else None
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            gate = torch.sigmoid(self.attn_scale).to(dtype=x.dtype)[None, None, :]
-            x = 0.9 * x + gate * attn_out
-
-        x = 0.9 * x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 class GPT(nn.Module):
@@ -698,8 +683,6 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
-                    layer_idx=i,
-                    total_layers=num_layers,
                 )
                 for i in range(num_layers)
             ]
@@ -1098,14 +1081,9 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
-            attn_gate = torch.sigmoid(block.attn_scale)
             log0(
-                f"layer:{i} attn_scale_logit_mean:{block.attn_scale.mean().item():.6f} "
-                f"attn_scale_logit_std:{block.attn_scale.std().item():.6f}"
-            )
-            log0(
-                f"layer:{i} attn_gate_mean:{attn_gate.mean().item():.6f} "
-                f"attn_gate_std:{attn_gate.std().item():.6f}"
+                f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
+                f"attn_scale_std:{block.attn_scale.std().item():.6f}"
             )
             log0(
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
