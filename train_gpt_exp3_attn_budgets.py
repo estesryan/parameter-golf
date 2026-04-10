@@ -76,7 +76,7 @@ class Hyperparameters:
     if os.environ.get("ATTN_LAYER_BUDGETS", ""):
         attn_layer_budgets = [float(x) for x in os.environ["ATTN_LAYER_BUDGETS"].split(",")]
     else:
-        attn_layer_budgets = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.35, 0.30]
+        attn_layer_budgets = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.35, 0.50, 0.50]
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -727,7 +727,7 @@ class GPT(nn.Module):
                     attn_init_scale=(
                         attn_layer_budgets[i]
                         if i < len(attn_layer_budgets)
-                        else (0.85 if i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1" else 0.0)
+                        else (1.0 if i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1" else 0.0)
                     ),
                     layer_idx=i,
                 )
