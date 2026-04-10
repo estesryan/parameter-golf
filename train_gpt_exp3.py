@@ -632,6 +632,7 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
+        layer_idx: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -640,6 +641,7 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.layer_idx = layer_idx
 
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
@@ -687,6 +689,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
+                    layer_idx=i,
                 )
                 for i in range(num_layers)
             ]
