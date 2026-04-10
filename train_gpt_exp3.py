@@ -652,22 +652,24 @@ class LocalCausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        # Local causal mask: each token attends only to the last `window_size` tokens incl. itself.
+        # Expand KV heads manually for GQA.
+        if self.num_kv_heads != self.num_heads:
+            repeat_factor = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeat_factor, dim=1)
+            v = v.repeat_interleave(repeat_factor, dim=1)
+
+        # Explicit local causal attention.
+        scale = 1.0 / math.sqrt(self.head_dim)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+
         idx = torch.arange(seqlen, device=x.device)
         local_mask = idx[:, None] - idx[None, :]
         local_mask = (local_mask >= 0) & (local_mask < self.window_size)
-        attn_mask = torch.zeros((seqlen, seqlen), device=x.device, dtype=q.dtype)
-        attn_mask = attn_mask.masked_fill(~local_mask, float("-inf"))
-        attn_mask = attn_mask[None, None, :, :]
+        scores = scores.masked_fill(~local_mask[None, None, :, :], float("-inf"))
 
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            is_causal=False,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        attn = torch.softmax(scores, dim=-1)
+        y = torch.matmul(attn, v)
+
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
     
