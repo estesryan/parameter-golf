@@ -73,7 +73,6 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111011101")
-    local_attn_window = int(os.environ.get("LOCAL_ATTN_WINDOW", 3))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -608,72 +607,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
-class LocalCausalSelfAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_base: float,
-        qk_gain_init: float,
-        window_size: int,
-    ):
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError("model_dim must be divisible by num_heads")
-        if num_heads % num_kv_heads != 0:
-            raise ValueError("num_heads must be divisible by num_kv_heads")
-        if window_size <= 0:
-            raise ValueError("window_size must be positive")
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for RoPE")
-        self.window_size = window_size
-        kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
-        bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-
-        # Expand KV heads manually for GQA.
-        if self.num_kv_heads != self.num_heads:
-            repeat_factor = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat_factor, dim=1)
-            v = v.repeat_interleave(repeat_factor, dim=1)
-
-        # Explicit local causal attention.
-        scale = 1.0 / math.sqrt(self.head_dim)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        idx = torch.arange(seqlen, device=x.device)
-        local_mask = idx[:, None] - idx[None, :]
-        local_mask = (local_mask >= 0) & (local_mask < self.window_size)
-        scores = scores.masked_fill(~local_mask[None, None, :, :], float("-inf"))
-
-        attn = torch.softmax(scores, dim=-1)
-        y = torch.matmul(attn, v)
-
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
-    
-    
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
@@ -699,20 +633,11 @@ class Block(nn.Module):
         qk_gain_init: float,
         use_attention: bool,
         layer_idx: int,
-        local_attn_window: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        if use_attention:
-            if layer_idx in (3, 7):
-                self.attn = LocalCausalSelfAttention(
-                    dim, num_heads, num_kv_heads, rope_base, qk_gain_init, local_attn_window
-                )
-            else:
-                self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        else:
-            self.attn = None
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -739,7 +664,6 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         attn_layer_pattern: str,
-        local_attn_window: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -760,8 +684,6 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
-                    layer_idx=i,
-                    local_attn_window=local_attn_window,
                 )
                 for i in range(num_layers)
             ]
@@ -909,7 +831,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         attn_layer_pattern=args.attn_layer_pattern,
-        local_attn_window=args.local_attn_window,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
