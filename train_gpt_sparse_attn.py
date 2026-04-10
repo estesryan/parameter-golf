@@ -1,16 +1,44 @@
 """
-Naive baseline optimization.
+Sparse attention baseline, built on top of train_gpt_lean.py.
 
-This configuration reflects empirical improvements to the standard GPT baseline
-under a strict time budget, without adding architectural complexity.
+Mutual information analysis (train_gpt_analyze_mi.py) confirmed that the
+parameter-golf challenge is fundamentally local pattern matching in disguise.
+Token-level MI drops sharply with lag distance and saturates quickly, meaning
+most predictive signal lives in a small neighbourhood of nearby tokens. This
+motivates skipping full attention entirely in low-value layers.
 
-Key ideas:
-- Keep the model simple; avoid unnecessary structures (e.g. skip blending with x0).
-- Let scalar control tensors (resid_mix, q_gain, attn_scale, mlp_scale) learn routing naturally.
-- Separate fast control parameters (resid_mix, q_gain) from other scalars via higher LR.
-- Use warmdown to improve late-stage convergence and overall compression.
+MI results:
+- Lag MI:     lag1=2.6255  lag2=1.0439  lag3=0.4993  lag4=0.2946
+              lag5=0.2134  lag6=0.1809  lag7=0.1642  lag8=0.1548  → plateau ~0.12
+- Window scores (cumulative MI over local windows):
+              k=3: 4.1687   k=5: 4.6768   k=7: 5.0218
+              dilated_1_2_4: 3.964   dilated_1_2_4_8: 4.1188
+              mid_2_4_8: 1.4933   long_4_8_16: 0.5805
+- Incremental gains per additional neighbour:
+              k=3: [2.6255, 1.5816, 0.5446]
+              k=5: [2.6255, 1.5816, 0.5446, 0.2047, 0.0812]
+              k=7: [2.6255, 1.5816, 0.5446, 0.2047, 0.0812, 0.0325, 0.0167]
 
-Overall: prioritize clean dynamics and efficient learning over added mechanisms.
+Architecture:
+- Sparse attention layers: `attn_layer_pattern` (e.g. "111011101") is a binary
+  string where "0" positions become MLP-only blocks, skipping attention entirely.
+- Grouped Query Attention (GQA): separate `num_heads` / `num_kv_heads` to reduce
+  KV parameter cost while retaining query expressivity.
+- Per-head Q gain scalar (`q_gain`), RMSNorm on Q and K before attention, and
+  RoPE positional embeddings for each attention layer.
+- relu² MLP (relu then square) in every block.
+- Per-dimension residual gates (`attn_scale`, `mlp_scale`) replace fixed mixing;
+  learned scalars control how strongly each sublayer writes to the residual stream.
+- Logit softcap via tanh (cap=30) to stabilise large logit magnitudes.
+- Tied input/output embeddings to cut parameter budget.
+- Muon optimizer for matrix-shaped weights; Adam for scalars and embeddings;
+  separate LR groups with warmdown for late-stage convergence.
+- Int8 + zlib quantization for export; control tensors kept in fp32.
+
+Overall: sparse attention produced meaningful gains over the lean baseline,
+confirming that selectively skipping attention in low-MI layers is a net win
+within the parameter and time budgets. This now serves as the improved
+submission baseline.
 """
 
 from __future__ import annotations
