@@ -73,6 +73,7 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111011101")
+    local_attn_window = int(os.environ.get("LOCAL_ATTN_WINDOW", 3))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -232,8 +233,6 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-    ablate_attn_layer: int = -1,
-    ablate_mlp_layer: int = -1,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -263,12 +262,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(
-                    x,
-                    y,
-                    ablate_attn_layer=ablate_attn_layer,
-                    ablate_mlp_layer=ablate_mlp_layer,
-                ).detach()
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -301,7 +295,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,trailing_mlp_scale,q_gain",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,q_gain",
     ).split(",")
     if pattern
 )
@@ -614,7 +608,70 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
+class LocalCausalSelfAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_base: float,
+        qk_gain_init: float,
+        window_size: int,
+    ):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        self.window_size = window_size
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = Rotary(self.head_dim, base=rope_base)
 
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+
+        # Local causal mask: each token attends only to the last `window_size` tokens incl. itself.
+        idx = torch.arange(seqlen, device=x.device)
+        local_mask = idx[:, None] - idx[None, :]
+        local_mask = (local_mask >= 0) & (local_mask < self.window_size)
+        attn_mask = torch.zeros((seqlen, seqlen), device=x.device, dtype=q.dtype)
+        attn_mask = attn_mask.masked_fill(~local_mask, float("-inf"))
+        attn_mask = attn_mask[None, None, :, :]
+
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=False,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y)
+    
+    
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
@@ -640,31 +697,29 @@ class Block(nn.Module):
         qk_gain_init: float,
         use_attention: bool,
         layer_idx: int,
-        num_layers: int,
+        local_attn_window: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.layer_idx = layer_idx
-        self.num_layers = num_layers
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
+        if use_attention:
+            if layer_idx == 0:
+                self.attn = LocalCausalSelfAttention(
+                    dim, num_heads, num_kv_heads, rope_base, qk_gain_init, local_attn_window
+                )
+            else:
+                self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        else:
+            self.attn = None
         self.mlp = MLP(dim, mlp_mult)
-        attn_init = 1.0 - 0.5 * (layer_idx / max(num_layers - 1, 1))
-        self.attn_scale = nn.Parameter(torch.tensor(attn_init, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
-    def forward(
-        self,
-        x: Tensor,
-        disable_attn: bool = False,
-        disable_mlp: bool = False,
-    ) -> Tensor:
-        if self.attn is not None and not disable_attn:
+    def forward(self, x: Tensor) -> Tensor:
+        if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            attn_scale = 4.0 * torch.tanh(self.attn_scale / 4.0)
-            x = x + attn_scale.to(dtype=x.dtype) * attn_out
-        if not disable_mlp:
-            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 class GPT(nn.Module):
@@ -682,6 +737,7 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         attn_layer_pattern: str,
+        local_attn_window: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -692,9 +748,6 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers
         self.num_decoder_layers = 0
-        self.trailing_mlp = MLP(model_dim, mlp_mult)
-        self.trailing_mlp_norm = RMSNorm()
-        self.trailing_mlp_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -706,7 +759,7 @@ class GPT(nn.Module):
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
                     layer_idx=i,
-                    num_layers=num_layers,
+                    local_attn_window=local_attn_window,
                 )
                 for i in range(num_layers)
             ]
@@ -724,24 +777,11 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(
-        self,
-        input_ids: Tensor,
-        target_ids: Tensor,
-        ablate_attn_layer: int = -1,
-        ablate_mlp_layer: int = -1,
-    ) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        for i, block in enumerate(self.blocks):
-            x = block(
-                x,
-                disable_attn=(i == ablate_attn_layer),
-                disable_mlp=(i == ablate_mlp_layer),
-            )
-
-        x_norm = self.trailing_mlp_norm(x)
-        x = x + self.trailing_mlp_scale.to(x.dtype) * self.trailing_mlp(x_norm)
+        for block in self.blocks:
+            x = block(x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -867,6 +907,7 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         attn_layer_pattern=args.attn_layer_pattern,
+        local_attn_window=args.local_attn_window,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -885,23 +926,23 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    named_params = list(base_model.named_parameters())
+    block_named_params = list(base_model.blocks.named_parameters())
 
     matrix_params = [
         p
-        for name, p in named_params
+        for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
     qgain_params = [
         p
-        for name, p in named_params
+        for name, p in block_named_params
         if "q_gain" in name
     ]
 
     scalar_params = [
         p
-        for name, p in named_params
+        for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         and "q_gain" not in name
     ]
@@ -1050,46 +1091,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-
-            if last_step:
-                base_val_bpb = val_bpb
-                log0("=== FINAL LAYER ABLATION DIAGNOSTIC ===")
-                for i, block in enumerate(base_model.blocks):
-                    if block.attn is not None:
-                        _, ablated_bpb = eval_val(
-                            args,
-                            model,
-                            rank,
-                            world_size,
-                            device,
-                            grad_accum_steps,
-                            val_tokens,
-                            base_bytes_lut,
-                            has_leading_space_lut,
-                            is_boundary_token_lut,
-                            ablate_attn_layer=i,
-                        )
-                        log0(
-                            f"ablate_attn layer:{i} val_bpb:{ablated_bpb:.4f} delta:{ablated_bpb - base_val_bpb:+.4f}"
-                        )
-
-                    _, ablated_bpb = eval_val(
-                        args,
-                        model,
-                        rank,
-                        world_size,
-                        device,
-                        grad_accum_steps,
-                        val_tokens,
-                        base_bytes_lut,
-                        has_leading_space_lut,
-                        is_boundary_token_lut,
-                        ablate_mlp_layer=i,
-                    )
-                    log0(
-                        f"ablate_mlp layer:{i} val_bpb:{ablated_bpb:.4f} delta:{ablated_bpb - base_val_bpb:+.4f}"
-                    )
-
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1173,10 +1174,6 @@ def main() -> None:
                 )
             else:
                 log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
-        log0(
-            f"trailing_mlp_scale_mean:{base_model.trailing_mlp_scale.mean().item():.6f} "
-            f"trailing_mlp_scale_std:{base_model.trailing_mlp_scale.std().item():.6f}"
-        )
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
