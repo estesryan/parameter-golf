@@ -632,7 +632,6 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
-        layer_idx: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
