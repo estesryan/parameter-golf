@@ -632,8 +632,10 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
+        layer_idx: int,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.attn_norm = RMSNorm()
         self.register_buffer("attn_contrib_accum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("attn_contrib_count", torch.zeros((), dtype=torch.float32), persistent=False)
@@ -646,10 +648,10 @@ class Block(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            # NEW: measure contribution magnitude
             self.attn_contrib_accum.add_(attn_out.abs().mean().detach().to(torch.float32))
             self.attn_contrib_count.add_(1.0)
-            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            depth_scale = 1.0 / math.sqrt(self.layer_idx + 1)
+            x = x + depth_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -688,6 +690,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
+                    layer_idx=i,
                 )
                 for i in range(num_layers)
             ]
