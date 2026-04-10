@@ -645,7 +645,11 @@ class Block(nn.Module):
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(self.mlp_norm(x))
+        mlp_scale = self.mlp_scale
+        if self.layer_idx == 0:
+            mlp_scale = 0.25 * mlp_scale
+        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 class GPT(nn.Module):
