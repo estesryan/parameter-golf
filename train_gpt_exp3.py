@@ -705,7 +705,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         if use_attention:
-            if layer_idx == 0:
+            if layer_idx in (3, 7):
                 self.attn = LocalCausalSelfAttention(
                     dim, num_heads, num_kv_heads, rope_base, qk_gain_init, local_attn_window
                 )
