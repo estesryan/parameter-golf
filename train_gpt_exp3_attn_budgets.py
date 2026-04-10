@@ -72,11 +72,11 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111011101")
+    attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111111111")
     if os.environ.get("ATTN_LAYER_BUDGETS", ""):
         attn_layer_budgets = [float(x) for x in os.environ["ATTN_LAYER_BUDGETS"].split(",")]
     else:
-        attn_layer_budgets = [0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.30, 0.50, 0.85]
+        attn_layer_budgets = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.35, 0.30]
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -653,6 +653,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.tensor(attn_init_scale, dtype=torch.float32))
+        self.attn_init_scale = attn_init_scale
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
@@ -661,7 +662,14 @@ class Block(nn.Module):
 
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x_in))
-            attn_resid = self.attn_scale.to(dtype=x_in.dtype) * attn_out
+            attn_scale = self.attn_scale
+
+            # Only constrain layers that started with low budget
+            if self.attn_init_scale < 0.8:
+                max_scale = 0.5 + 1.5 * self.attn_init_scale
+                attn_scale = torch.clamp(attn_scale, max=max_scale)
+
+            attn_resid = attn_scale.to(dtype=x_in.dtype) * attn_out
 
             self.attn_contrib_accum.add_(attn_out.abs().mean().detach().to(torch.float32))
             self.attn_contrib_count.add_(1.0)
