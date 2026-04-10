@@ -683,7 +683,6 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
-                    layer_idx=i,
                 )
                 for i in range(num_layers)
             ]
