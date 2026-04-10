@@ -639,6 +639,11 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.register_buffer("attn_contrib_accum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("attn_contrib_count", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("attn_effective_accum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("attn_ratio_accum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("mlp_ratio_accum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("block_delta_accum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("diag_count", torch.zeros((), dtype=torch.float32), persistent=False)
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
@@ -646,14 +651,29 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
+        x_in = x
+        x_norm = x_in.norm().detach().to(torch.float32).clamp_min(1e-12)
+
         if self.attn is not None:
-            attn_out = self.attn(self.attn_norm(x))
+            attn_out = self.attn(self.attn_norm(x_in))
+            attn_resid = self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+
             self.attn_contrib_accum.add_(attn_out.abs().mean().detach().to(torch.float32))
             self.attn_contrib_count.add_(1.0)
-            depth_scale = 1.0 / math.sqrt(self.layer_idx + 1)
-            x = x + depth_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+            self.attn_effective_accum.add_(attn_resid.abs().mean().detach().to(torch.float32))
+            self.attn_ratio_accum.add_((attn_resid.norm().detach().to(torch.float32) / x_norm))
+            x = x_in + attn_resid
+        else:
+            x = x_in
+
+        mlp_out = self.mlp(self.mlp_norm(x))
+        mlp_resid = self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        self.mlp_ratio_accum.add_((mlp_resid.norm().detach().to(torch.float32) / x_norm))
+
+        x_out = x + mlp_resid
+        self.block_delta_accum.add_(((x_out - x_in).norm().detach().to(torch.float32) / x_norm))
+        self.diag_count.add_(1.0)
+        return x_out
 
 class GPT(nn.Module):
     def __init__(
@@ -1089,14 +1109,34 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
+            attn_contrib_mean = (
+                block.attn_contrib_accum / block.attn_contrib_count.clamp_min(1.0)
+            ).item()
+            attn_effective_mean = (
+                block.attn_effective_accum / block.diag_count.clamp_min(1.0)
+            ).item()
+            attn_ratio_mean = (
+                block.attn_ratio_accum / block.diag_count.clamp_min(1.0)
+            ).item()
+            mlp_ratio_mean = (
+                block.mlp_ratio_accum / block.diag_count.clamp_min(1.0)
+            ).item()
+            block_delta_mean = (
+                block.block_delta_accum / block.diag_count.clamp_min(1.0)
+            ).item()
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
                 f"attn_scale_std:{block.attn_scale.std().item():.6f}"
             )
-            attn_contrib_mean = (
-                block.attn_contrib_accum / block.attn_contrib_count.clamp_min(1.0)
-            ).item()
-            log0(f"layer:{i} attn_contrib_mean:{attn_contrib_mean:.6f}")
+            log0(
+                f"layer:{i} attn_contrib_mean:{attn_contrib_mean:.6f} "
+                f"attn_effective_mean:{attn_effective_mean:.6f}"
+            )
+            log0(
+                f"layer:{i} attn_ratio_mean:{attn_ratio_mean:.6f} "
+                f"mlp_ratio_mean:{mlp_ratio_mean:.6f} "
+                f"block_delta_mean:{block_delta_mean:.6f}"
+            )
             log0(
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
@@ -1108,6 +1148,7 @@ def main() -> None:
                 )
             else:
                 log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
+
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
