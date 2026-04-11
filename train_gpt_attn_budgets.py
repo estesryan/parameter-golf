@@ -65,7 +65,7 @@ class Hyperparameters:
     if os.environ.get("ATTN_LAYER_BUDGETS", ""):
         attn_layer_budgets = [float(x) for x in os.environ["ATTN_LAYER_BUDGETS"].split(",")]
     else:
-        attn_layer_budgets = [2.0, 1.0, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4]
+        attn_layer_budgets = [1.0, 1.0, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4]
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -738,7 +738,7 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
+        #x = F.rms_norm(x, (x.size(-1),))
         for block in self.blocks:
             x = block(x)
 
