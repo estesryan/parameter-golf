@@ -666,16 +666,25 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
-        self.res_scale = nn.Parameter(torch.tensor(0.8, dtype=torch.float32))
+        self.keep_scale = nn.Parameter(torch.tensor(0.98, dtype=torch.float32))
+        self.write_scale = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        res_scale = self.res_scale.to(dtype=x.dtype)
+        residual = x
+        write = torch.zeros_like(x)
+
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            x = x + res_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + res_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            write = write + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+
+        mlp_out = self.mlp(self.mlp_norm(x))
+        write = write + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+
+        keep_scale = self.keep_scale.to(dtype=x.dtype)
+        write_scale = self.write_scale.to(dtype=x.dtype)
+        x = keep_scale * residual + write_scale * write
         return x
 
 class GPT(nn.Module):
@@ -1111,7 +1120,10 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
-            log0(f"layer:{i} res_scale:{block.res_scale.item():.6f}")
+            log0(
+                f"layer:{i} keep_scale:{block.keep_scale.item():.6f} "
+                f"write_scale:{block.write_scale.item():.6f}"
+            )
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
                 f"attn_scale_std:{block.attn_scale.std().item():.6f}"
