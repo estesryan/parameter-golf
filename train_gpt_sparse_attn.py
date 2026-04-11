@@ -752,6 +752,16 @@ class GPT(nn.Module):
 # TRAINING
 # -----------------------------
 
+def depth_lr_mult(layer_idx: int, num_layers: int) -> float:
+    # Stronger learning early, gentler learning late.
+    # For 9 layers this gives ~[1.20, 1.15, ..., 0.80].
+    if num_layers <= 1:
+        return 1.0
+    start = 1.20
+    end = 0.80
+    t = layer_idx / (num_layers - 1)
+    return start + t * (end - start)
+
 def main() -> None:
     global zeropower_via_newtonschulz5
 
@@ -878,26 +888,51 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    matrix_param_groups = []
+    qgain_param_groups = []
+    scalar_param_groups = []
 
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    for layer_idx, block in enumerate(base_model.blocks):
+        mult = depth_lr_mult(layer_idx, args.num_layers)
 
-    qgain_params = [
-        p
-        for name, p in block_named_params
-        if "q_gain" in name
-    ]
+        block_matrix_params = []
+        block_qgain_params = []
+        block_scalar_params = []
 
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and "q_gain" not in name
-    ]
+        for name, p in block.named_parameters():
+            if "q_gain" in name:
+                block_qgain_params.append(p)
+            elif p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                block_matrix_params.append(p)
+            else:
+                block_scalar_params.append(p)
+
+        if block_matrix_params:
+            matrix_param_groups.append(
+                {
+                    "params": block_matrix_params,
+                    "lr": args.matrix_lr * mult,
+                    "base_lr": args.matrix_lr * mult,
+                }
+            )
+
+        if block_qgain_params:
+            qgain_param_groups.append(
+                {
+                    "params": block_qgain_params,
+                    "lr": args.qgain_lr * mult,
+                    "base_lr": args.qgain_lr * mult,
+                }
+            )
+
+        if block_scalar_params:
+            scalar_param_groups.append(
+                {
+                    "params": block_scalar_params,
+                    "lr": args.scalar_lr * mult,
+                    "base_lr": args.scalar_lr * mult,
+                }
+            )
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -908,23 +943,21 @@ def main() -> None:
     )
 
     optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
+        matrix_param_groups,
+        lr=args.matrix_lr,  # overridden per group
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
 
     optimizer_qgain = torch.optim.Adam(
-        [{"params": qgain_params, "lr": args.qgain_lr, "base_lr": args.qgain_lr}],
+        qgain_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
 
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_param_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -958,7 +991,9 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-
+    for layer_idx in range(args.num_layers):
+        log0(f"layer:{layer_idx} lr_mult:{depth_lr_mult(layer_idx, args.num_layers):.4f}")
+        
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
