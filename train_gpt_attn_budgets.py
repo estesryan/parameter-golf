@@ -61,11 +61,11 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111111111")
+    attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111111010")
     if os.environ.get("ATTN_LAYER_BUDGETS", ""):
         attn_layer_budgets = [float(x) for x in os.environ["ATTN_LAYER_BUDGETS"].split(",")]
     else:
-        attn_layer_budgets = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.35, 0.50, 0.50]
+        attn_layer_budgets = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.70, 0.0]
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
