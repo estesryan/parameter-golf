@@ -602,28 +602,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int, use_swiglu: bool = False):
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        self.use_swiglu = use_swiglu
         hidden = mlp_mult * dim
-
-        if use_swiglu:
-            self.fc = CastedLinear(dim, 2 * hidden, bias=False)
-            self.proj = CastedLinear(hidden, dim, bias=False)
-        else:
-            self.fc = CastedLinear(dim, hidden, bias=False)
-            self.proj = CastedLinear(hidden, dim, bias=False)
-
+        self.fc = CastedLinear(dim, 2 * hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.use_swiglu:
-            x = self.fc(x)
-            x1, x2 = x.chunk(2, dim=-1)
-            return self.proj(F.silu(x1) * x2)
-        else:
-            x = torch.relu(self.fc(x))
-            return self.proj(x.square())
+        x = self.fc(x)
+        x1, x2 = x.chunk(2, dim=-1)
+        return self.proj(F.silu(x1) * x2)
 
 
 class Block(nn.Module):
@@ -651,7 +640,7 @@ class Block(nn.Module):
         self.register_buffer("diag_count", torch.zeros((), dtype=torch.float32), persistent=False)
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
-        self.mlp = MLP(dim, mlp_mult, use_swiglu=(layer_idx >= 6))
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.tensor(attn_init_scale, dtype=torch.float32))
         self.attn_init_scale = attn_init_scale
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
