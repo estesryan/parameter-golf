@@ -100,7 +100,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111011101")
+    attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111111010")
     max_attn_scale = float(os.environ.get("MAX_ATTN_SCALE", 1.5))
 
     # Optimizer hyperparameters.
