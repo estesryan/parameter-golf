@@ -635,6 +635,30 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
+class CausalDepthwiseConv(nn.Module):
+    def __init__(self, dim: int, kernel_size: int = 3):
+        super().__init__()
+        if kernel_size < 1:
+            raise ValueError("kernel_size must be >= 1")
+        self.kernel_size = kernel_size
+        self.pad_left = kernel_size - 1
+        self.conv = nn.Conv1d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=kernel_size,
+            groups=dim,
+            bias=False,
+        )
+        self.scale = nn.Parameter(torch.full((dim,), 0.1, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, T, C)
+        x_conv = x.transpose(1, 2)                     # (B, C, T)
+        x_conv = F.pad(x_conv, (self.pad_left, 0))    # causal left pad
+        y = self.conv(x_conv)                         # (B, C, T)
+        y = y.transpose(1, 2)                         # (B, T, C)
+        return self.scale.to(dtype=x.dtype)[None, None, :] * y
+    
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
@@ -663,8 +687,10 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
+        self.local_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
+        self.local_mixer = None if use_attention else CausalDepthwiseConv(dim, kernel_size=3)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -673,6 +699,9 @@ class Block(nn.Module):
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        else:
+            x = x + self.local_mixer(self.local_norm(x))
+
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -897,6 +926,14 @@ def main() -> None:
         and "q_gain" not in name
     ]
 
+    covered = {id(p) for p in matrix_params + qgain_params + scalar_params}
+
+    other_params = [
+        p
+        for _, p in block_named_params
+        if id(p) not in covered
+    ]
+
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -928,7 +965,20 @@ def main() -> None:
         fused=True,
     )
 
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_qgain, optimizer_scalar]
+    optimizer_other = torch.optim.Adam(
+        [{"params": other_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+
+    optimizers: list[torch.optim.Optimizer] = [
+        optimizer_tok,
+        optimizer_muon,
+        optimizer_qgain,
+        optimizer_scalar,
+        optimizer_other,
+    ]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1117,6 +1167,11 @@ def main() -> None:
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
+            if block.local_mixer is not None:
+                log0(
+                    f"layer:{i} local_scale_mean:{block.local_mixer.scale.mean().item():.6f} "
+                    f"local_scale_std:{block.local_mixer.scale.std().item():.6f}"
+                )
             if block.attn is not None:
                 log0(
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
