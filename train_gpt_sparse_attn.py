@@ -666,23 +666,16 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_res_scale = nn.Parameter(torch.tensor(0.9, dtype=torch.float32))
-        self.mlp_res_scale = nn.Parameter(torch.tensor(0.7, dtype=torch.float32))
+        self.res_scale = nn.Parameter(torch.tensor(0.80, dtype=torch.float32))
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        attn_res_scale = self.attn_res_scale.to(dtype=x.dtype)
-        mlp_res_scale = self.mlp_res_scale.to(dtype=x.dtype)
-
+        res_scale = self.res_scale.to(dtype=x.dtype)
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            attn_out = F.rms_norm(attn_out, (attn_out.size(-1),))
-            x = x + attn_res_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-
-        mlp_out = self.mlp(self.mlp_norm(x))
-        mlp_out = F.rms_norm(mlp_out, (mlp_out.size(-1),))
-        x = x + mlp_res_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+            x = x + res_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + res_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 class GPT(nn.Module):
@@ -1118,10 +1111,7 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
-            log0(
-                f"layer:{i} attn_res_scale:{block.attn_res_scale.item():.6f} "
-                f"mlp_res_scale:{block.mlp_res_scale.item():.6f}"
-            )
+            log0(f"layer:{i} res_scale:{block.res_scale.item():.6f}")
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
                 f"attn_scale_std:{block.attn_scale.std().item():.6f}"
