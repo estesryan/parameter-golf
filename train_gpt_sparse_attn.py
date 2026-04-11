@@ -666,7 +666,7 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
-        self.res_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        self.res_scale = nn.Parameter(torch.tensor(0.8, dtype=torch.float32))
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
