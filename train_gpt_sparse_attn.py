@@ -610,7 +610,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.log_q_gain = nn.Parameter(torch.full((num_heads,), math.log(qk_gain_init), dtype=torch.float32))
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -623,8 +623,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q_gain = self.log_q_gain.exp().to(dtype=q.dtype)
-        q = q * q_gain[None, :, None, None]
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -650,6 +649,34 @@ class MLP(nn.Module):
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
+
+class ShortContextHead(nn.Module):
+    def __init__(self, dim: int, vocab_size: int, kernel_size: int = 3):
+        super().__init__()
+        self.pad_left = kernel_size - 1
+
+        self.conv = nn.Conv1d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=kernel_size,
+            groups=dim,
+            bias=False,
+        )
+
+        self.proj = nn.Linear(dim, vocab_size, bias=False)
+
+        self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, T, C)
+        x_conv = x.transpose(1, 2)                    # (B, C, T)
+        x_conv = F.pad(x_conv, (self.pad_left, 0))    # causal
+        y = self.conv(x_conv)                         # (B, C, T)
+        y = y.transpose(1, 2)                         # (B, T, C)
+
+        logits = self.proj(y)                         # (B, T, V)
+        return self.scale.to(dtype=x.dtype) * logits
+    
 
 class Block(nn.Module):
     def __init__(
@@ -677,6 +704,7 @@ class Block(nn.Module):
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
+    
 class GPT(nn.Module):
     def __init__(
         self,
@@ -717,6 +745,7 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        self.short_head = ShortContextHead(model_dim, vocab_size, kernel_size=3)
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -735,15 +764,19 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)                                # (B, T, C)
         targets = target_ids.reshape(-1)
+
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_main = F.linear(x, self.tok_emb.weight)    # (B, T, V)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+            logits_main = self.lm_head(x)                     # (B, T, V)
+
+        logits = logits_main + self.short_head(x)             # (B, T, V)
+        logits = logits.reshape(-1, logits.size(-1))          # (B*T, V)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -877,25 +910,33 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    core_named_params = list(base_model.blocks.named_parameters()) + list(base_model.short_head.named_parameters())
 
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in core_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
     qgain_params = [
         p
-        for name, p in block_named_params
-        if "log_q_gain" in name
+        for name, p in core_named_params
+        if "q_gain" in name
     ]
 
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in core_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and "log_q_gain" not in name
+        and "q_gain" not in name
+    ]
+
+    covered = {id(p) for p in matrix_params + qgain_params + scalar_params}
+
+    other_params = [
+        p
+        for _, p in core_named_params
+        if id(p) not in covered
     ]
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -929,7 +970,20 @@ def main() -> None:
         fused=True,
     )
 
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_qgain, optimizer_scalar]
+    optimizer_other = torch.optim.Adam(
+        [{"params": other_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+
+    optimizers: list[torch.optim.Optimizer] = [
+        optimizer_tok,
+        optimizer_muon,
+        optimizer_qgain,
+        optimizer_scalar,
+        optimizer_other,
+    ]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1109,6 +1163,7 @@ def main() -> None:
     )
     if master_process:
         log0("=== CONTROL TENSORS ===")
+        log0(f"short_head_scale:{base_model.short_head.scale.item():.6f}")
         for i, block in enumerate(base_model.blocks):
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
@@ -1119,10 +1174,9 @@ def main() -> None:
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
             if block.attn is not None:
-                q_gain = block.attn.log_q_gain.exp()
                 log0(
-                    f"layer:{i} q_gain_mean:{q_gain.mean().item():.6f} "
-                    f"q_gain_std:{q_gain.std().item():.6f}"
+                    f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
+                    f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
                 )
             else:
                 log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
