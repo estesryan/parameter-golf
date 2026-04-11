@@ -650,34 +650,6 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class ShortContextHead(nn.Module):
-    def __init__(self, dim: int, vocab_size: int, kernel_size: int = 3):
-        super().__init__()
-        self.pad_left = kernel_size - 1
-
-        self.conv = nn.Conv1d(
-            in_channels=dim,
-            out_channels=dim,
-            kernel_size=kernel_size,
-            groups=dim,
-            bias=False,
-        )
-
-        self.proj = nn.Linear(dim, vocab_size, bias=False)
-
-        self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (B, T, C)
-        x_conv = x.transpose(1, 2)                    # (B, C, T)
-        x_conv = F.pad(x_conv, (self.pad_left, 0))    # causal
-        y = self.conv(x_conv)                         # (B, C, T)
-        y = y.transpose(1, 2)                         # (B, T, C)
-
-        logits = self.proj(y)                         # (B, T, V)
-        return self.scale.to(dtype=x.dtype) * logits
-    
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -694,17 +666,18 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
+        self.res_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
+        res_scale = self.res_scale.to(dtype=x.dtype)
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
-            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            x = x + res_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + res_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
-    
 class GPT(nn.Module):
     def __init__(
         self,
@@ -745,7 +718,6 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
-        self.short_head = ShortContextHead(model_dim, vocab_size, kernel_size=3)
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -764,19 +736,15 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        x = self.final_norm(x)                                # (B, T, C)
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-
         if self.tie_embeddings:
-            logits_main = F.linear(x, self.tok_emb.weight)    # (B, T, V)
+            logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_main = self.lm_head(x)                     # (B, T, V)
-
-        logits = logits_main + self.short_head(x)             # (B, T, V)
-        logits = logits.reshape(-1, logits.size(-1))          # (B*T, V)
-        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -910,33 +878,25 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    core_named_params = list(base_model.blocks.named_parameters()) + list(base_model.short_head.named_parameters())
+    block_named_params = list(base_model.blocks.named_parameters())
 
     matrix_params = [
         p
-        for name, p in core_named_params
+        for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
     qgain_params = [
         p
-        for name, p in core_named_params
+        for name, p in block_named_params
         if "q_gain" in name
     ]
 
     scalar_params = [
         p
-        for name, p in core_named_params
+        for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         and "q_gain" not in name
-    ]
-
-    covered = {id(p) for p in matrix_params + qgain_params + scalar_params}
-
-    other_params = [
-        p
-        for _, p in core_named_params
-        if id(p) not in covered
     ]
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -970,20 +930,7 @@ def main() -> None:
         fused=True,
     )
 
-    optimizer_other = torch.optim.Adam(
-        [{"params": other_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-
-    optimizers: list[torch.optim.Optimizer] = [
-        optimizer_tok,
-        optimizer_muon,
-        optimizer_qgain,
-        optimizer_scalar,
-        optimizer_other,
-    ]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_qgain, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1163,8 +1110,8 @@ def main() -> None:
     )
     if master_process:
         log0("=== CONTROL TENSORS ===")
-        log0(f"short_head_scale:{base_model.short_head.scale.item():.6f}")
         for i, block in enumerate(base_model.blocks):
+            log0(f"layer:{i} res_scale:{block.res_scale.item():.6f}")
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
                 f"attn_scale_std:{block.attn_scale.std().item():.6f}"
