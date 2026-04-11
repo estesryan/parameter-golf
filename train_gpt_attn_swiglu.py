@@ -709,7 +709,7 @@ class GPT(nn.Module):
                     model_dim,
                     num_heads,
                     num_kv_heads,
-                    (4 if i == 8 else mlp_mult),
+                    (3 if i >= 6 else mlp_mult),
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
