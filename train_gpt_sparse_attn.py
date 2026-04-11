@@ -610,7 +610,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.log_q_gain = nn.Parameter(torch.full((num_heads,), math.log(qk_gain_init), dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -623,7 +623,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q_gain = self.log_q_gain.exp().to(dtype=q.dtype)
+        q = q * q_gain[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -887,14 +888,14 @@ def main() -> None:
     qgain_params = [
         p
         for name, p in block_named_params
-        if "q_gain" in name
+        if "log_q_gain" in name
     ]
 
     scalar_params = [
         p
         for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and "q_gain" not in name
+        and "log_q_gain" not in name
     ]
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1118,9 +1119,10 @@ def main() -> None:
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
             if block.attn is not None:
+                q_gain = block.attn.log_q_gain.exp()
                 log0(
-                    f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
-                    f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
+                    f"layer:{i} q_gain_mean:{q_gain.mean().item():.6f} "
+                    f"q_gain_std:{q_gain.std().item():.6f}"
                 )
             else:
                 log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
