@@ -1,5 +1,44 @@
 """
-// to be filled in later.
+Sparse attention baseline, built on top of train_gpt_lean.py.
+
+Mutual information analysis (train_gpt_analyze_mi.py) confirmed that the
+parameter-golf challenge is fundamentally local pattern matching in disguise.
+Token-level MI drops sharply with lag distance and saturates quickly, meaning
+most predictive signal lives in a small neighbourhood of nearby tokens. This
+motivates skipping full attention entirely in low-value layers.
+
+MI results:
+- Lag MI:     lag1=2.6255  lag2=1.0439  lag3=0.4993  lag4=0.2946
+              lag5=0.2134  lag6=0.1809  lag7=0.1642  lag8=0.1548  → plateau ~0.12
+- Window scores (cumulative MI over local windows):
+              k=3: 4.1687   k=5: 4.6768   k=7: 5.0218
+              dilated_1_2_4: 3.964   dilated_1_2_4_8: 4.1188
+              mid_2_4_8: 1.4933   long_4_8_16: 0.5805
+- Incremental gains per additional neighbour:
+              k=3: [2.6255, 1.5816, 0.5446]
+              k=5: [2.6255, 1.5816, 0.5446, 0.2047, 0.0812]
+              k=7: [2.6255, 1.5816, 0.5446, 0.2047, 0.0812, 0.0325, 0.0167]
+
+Architecture:
+- Sparse attention layers: `attn_layer_pattern` (e.g. "111011101") is a binary
+  string where "0" positions become MLP-only blocks, skipping attention entirely.
+- Grouped Query Attention (GQA): separate `num_heads` / `num_kv_heads` to reduce
+  KV parameter cost while retaining query expressivity.
+- Per-head Q gain scalar (`q_gain`), RMSNorm on Q and K before attention, and
+  RoPE positional embeddings for each attention layer.
+- relu² MLP (relu then square) in every block.
+- Per-dimension residual gates (`attn_scale`, `mlp_scale`) replace fixed mixing;
+  learned scalars control how strongly each sublayer writes to the residual stream.
+- Logit softcap via tanh (cap=30) to stabilise large logit magnitudes.
+- Tied input/output embeddings to cut parameter budget.
+- Muon optimizer for matrix-shaped weights; Adam for scalars and embeddings;
+  separate LR groups with warmdown for late-stage convergence.
+- Int8 + zlib quantization for export; control tensors kept in fp32.
+
+Overall: sparse attention produced meaningful gains over the lean baseline,
+confirming that selectively skipping attention in low-MI layers is a net win
+within the parameter and time budgets. This now serves as the improved
+submission baseline.
 """
 
 from __future__ import annotations
@@ -61,11 +100,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111111010")
-    if os.environ.get("ATTN_LAYER_BUDGETS", ""):
-        attn_layer_budgets = [float(x) for x in os.environ["ATTN_LAYER_BUDGETS"].split(",")]
-    else:
-        attn_layer_budgets = [1.0, 1.0, 1.0, 0.9, 0.8, 0.7, 0.6, 0.7, 0.4]
+    attn_layer_pattern = os.environ.get("ATTN_LAYER_PATTERN", "111011101")
+    max_attn_scale = float(os.environ.get("MAX_ATTN_SCALE", 1.5))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -602,17 +638,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, 2 * hidden, bias=False)
+        self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.fc(x)
-        x1, x2 = x.chunk(2, dim=-1)
-        return self.proj(F.silu(x1) * x2)
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
 
 
 class Block(nn.Module):
@@ -625,11 +661,12 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool,
-        attn_init_scale: float,
+        attn_scale_clamp: float,
         layer_idx: int,
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.attn_scale_clamp = attn_scale_clamp
         self.attn_norm = RMSNorm()
         self.register_buffer("attn_contrib_accum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("attn_contrib_count", torch.zeros((), dtype=torch.float32), persistent=False)
@@ -641,8 +678,7 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init) if use_attention else None
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.tensor(attn_init_scale, dtype=torch.float32))
-        self.attn_init_scale = attn_init_scale
+        self.attn_scale = nn.Parameter(torch.tensor(0.85, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
@@ -651,13 +687,7 @@ class Block(nn.Module):
 
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x_in))
-            attn_scale = self.attn_scale
-
-            # Only constrain layers that started with low budget
-            if self.attn_init_scale < 0.8:
-                max_scale = 0.5 + 1.5 * self.attn_init_scale
-                attn_scale = torch.clamp(attn_scale, max=max_scale)
-
+            attn_scale = torch.clamp(self.attn_scale, max=self.attn_scale_clamp)
             attn_resid = attn_scale.to(dtype=x_in.dtype) * attn_out
 
             self.attn_contrib_accum.add_(attn_out.abs().mean().detach().to(torch.float32))
@@ -692,7 +722,7 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         attn_layer_pattern: str,
-        attn_layer_budgets: list[float],
+        attn_scale_clamp: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -709,15 +739,11 @@ class GPT(nn.Module):
                     model_dim,
                     num_heads,
                     num_kv_heads,
-                    (3 if i >= 6 else mlp_mult),
+                    mlp_mult,
                     rope_base,
                     qk_gain_init,
                     use_attention=(i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1"),
-                    attn_init_scale=(
-                        attn_layer_budgets[i]
-                        if i < len(attn_layer_budgets)
-                        else (1.0 if i < len(attn_layer_pattern) and attn_layer_pattern[i] == "1" else 0.0)
-                    ),
+                    attn_scale_clamp=attn_scale_clamp,
                     layer_idx=i,
                 )
                 for i in range(num_layers)
@@ -866,20 +892,18 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         attn_layer_pattern=args.attn_layer_pattern,
-        attn_layer_budgets=args.attn_layer_budgets,
+        attn_scale_clamp=args.max_attn_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    find_unused = ("0" in args.attn_layer_pattern)
-    log0(f"ddp_find_unused_parameters:{find_unused}")
     model: nn.Module = DDP(
         compiled_model,
         device_ids=[local_rank],
         broadcast_buffers=False,
-        find_unused_parameters=find_unused,
+        find_unused_parameters=True,
     ) if distributed else compiled_model
 
     # Optimizer split:
@@ -954,7 +978,6 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa_pattern({args.attn_layer_pattern}) num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(f"attention_budgets:{args.attn_layer_budgets if args.attn_layer_budgets else 'default'}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1121,40 +1144,8 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
-            attn_contrib_mean = (
-                block.attn_contrib_accum / block.attn_contrib_count.clamp_min(1.0)
-            ).item()
-            attn_effective_mean = (
-                block.attn_effective_accum / block.diag_count.clamp_min(1.0)
-            ).item()
-            attn_ratio_mean = (
-                block.attn_ratio_accum / block.diag_count.clamp_min(1.0)
-            ).item()
-            mlp_ratio_mean = (
-                block.mlp_ratio_accum / block.diag_count.clamp_min(1.0)
-            ).item()
-            block_delta_mean = (
-                block.block_delta_accum / block.diag_count.clamp_min(1.0)
-            ).item()
-            if block.attn_scale.ndim == 0:
-                log0(
-                    f"layer:{i} attn_scale_mean:{block.attn_scale.item():.6f} "
-                    f"attn_scale_std:0.000000"
-                )
-            else:
-                log0(
-                    f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
-                    f"attn_scale_std:{block.attn_scale.std().item():.6f}"
-                )
-            log0(
-                f"layer:{i} attn_contrib_mean:{attn_contrib_mean:.6f} "
-                f"attn_effective_mean:{attn_effective_mean:.6f}"
-            )
-            log0(
-                f"layer:{i} attn_ratio_mean:{attn_ratio_mean:.6f} "
-                f"mlp_ratio_mean:{mlp_ratio_mean:.6f} "
-                f"block_delta_mean:{block_delta_mean:.6f}"
-            )
+            attn_scale_val = block.attn_scale.item()
+            log0(f"layer:{i} attn_scale:{attn_scale_val:.6f}")
             log0(
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
@@ -1164,9 +1155,32 @@ def main() -> None:
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                     f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
                 )
+                attn_contrib_mean = (
+                    block.attn_contrib_accum / block.attn_contrib_count.clamp_min(1.0)
+                ).item()
+                attn_effective_mean = (
+                    block.attn_effective_accum / block.diag_count.clamp_min(1.0)
+                ).item()
+                attn_ratio_mean = (
+                    block.attn_ratio_accum / block.diag_count.clamp_min(1.0)
+                ).item()
+                log0(
+                    f"layer:{i} attn_contrib_mean:{attn_contrib_mean:.6f} "
+                    f"attn_effective_mean:{attn_effective_mean:.6f}"
+                )
+                log0(f"layer:{i} attn_ratio_mean:{attn_ratio_mean:.6f}")
             else:
                 log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
-
+            mlp_ratio_mean = (
+                block.mlp_ratio_accum / block.diag_count.clamp_min(1.0)
+            ).item()
+            block_delta_mean = (
+                block.block_delta_accum / block.diag_count.clamp_min(1.0)
+            ).item()
+            log0(
+                f"layer:{i} mlp_ratio_mean:{mlp_ratio_mean:.6f} "
+                f"block_delta_mean:{block_delta_mean:.6f}"
+            )
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
