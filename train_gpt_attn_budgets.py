@@ -643,7 +643,8 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.tensor(attn_init_scale, dtype=torch.float32))
         self.attn_init_scale = attn_init_scale
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        mlp_init = 0.5 if layer_idx == 0 else 1.0
+        self.mlp_scale = nn.Parameter(torch.full((dim,), mlp_init, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         x_in = x
@@ -738,7 +739,7 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-        #x = F.rms_norm(x, (x.size(-1),))
+        x = F.rms_norm(x, (x.size(-1),))
         for block in self.blocks:
             x = block(x)
 
