@@ -677,9 +677,12 @@ class Block(nn.Module):
 
         if self.attn is not None:
             attn_out = self.attn(self.attn_norm(x))
+            attn_out = F.rms_norm(attn_out, (attn_out.size(-1),))
             x = x + attn_res_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
-        x = x + mlp_res_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(self.mlp_norm(x))
+        mlp_out = F.rms_norm(mlp_out, (mlp_out.size(-1),))
+        x = x + mlp_res_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 class GPT(nn.Module):
