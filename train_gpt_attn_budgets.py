@@ -651,10 +651,10 @@ class Block(nn.Module):
             attn_out = self.attn(self.attn_norm(x_in))
             attn_scale = self.attn_scale
 
-            # Apply the same budget rule to every attention layer.
-            # High-budget layers still get more headroom.
-            max_scale = 0.5 + 1.5 * self.attn_init_scale
-            attn_scale = torch.clamp(attn_scale, min=0.0, max=max_scale)
+            # Only constrain layers that started with low budget
+            if self.attn_init_scale < 0.8:
+                max_scale = 0.5 + 1.5 * self.attn_init_scale
+                attn_scale = torch.clamp(attn_scale, max=max_scale)
 
             attn_resid = attn_scale.to(dtype=x_in.dtype) * attn_out
 
