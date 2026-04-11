@@ -611,6 +611,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.dist_decay = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -624,11 +625,18 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+
+        pos = torch.arange(seqlen, device=x.device)
+        dist = (pos[:, None] - pos[None, :]).clamp_min(0).to(q.dtype)   # (T, T), causal distance
+
+        decay = F.softplus(self.dist_decay).to(q.dtype)                  # (H,)
+        bias = -decay[None, :, None, None] * dist[None, None, :, :]     # (1, H, T, T)
+
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=None,
+            attn_mask=bias,
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
@@ -786,9 +794,9 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_flash_sdp(False)
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
@@ -941,7 +949,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0("sdp_backends:cudnn=False flash=False mem_efficient=True math=True")
     log0(f"attention_mode:gqa_pattern({args.attn_layer_pattern}) num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -1122,8 +1130,13 @@ def main() -> None:
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                     f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
                 )
+                log0(
+                    f"layer:{i} dist_decay_mean:{F.softplus(block.attn.dist_decay).mean().item():.6f} "
+                    f"dist_decay_std:{F.softplus(block.attn.dist_decay).std().item():.6f}"
+                )
             else:
                 log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
+                
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
