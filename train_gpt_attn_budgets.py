@@ -643,8 +643,7 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.tensor(attn_init_scale, dtype=torch.float32))
         self.attn_init_scale = attn_init_scale
-        mlp_init = 0.5 if layer_idx == 0 else 1.0
-        self.mlp_scale = nn.Parameter(torch.full((dim,), mlp_init, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         x_in = x
