@@ -1,5 +1,51 @@
 """
-// to be filled in later.
+Attention budget baseline, built on top of train_gpt_sparse_attn.py.
+
+Mutual information analysis (train_gpt_analyze_mi.py) confirmed that the
+parameter-golf challenge is fundamentally local pattern matching in disguise.
+Token-level MI drops sharply with lag distance and saturates quickly, meaning
+most predictive signal lives in a small neighbourhood of nearby tokens. This
+motivates skipping full attention entirely in low-value layers.
+
+MI results:
+- Lag MI:     lag1=2.6255  lag2=1.0439  lag3=0.4993  lag4=0.2946
+              lag5=0.2134  lag6=0.1809  lag7=0.1642  lag8=0.1548  → plateau ~0.12
+- Window scores (cumulative MI over local windows):
+              k=3: 4.1687   k=5: 4.6768   k=7: 5.0218
+              dilated_1_2_4: 3.964   dilated_1_2_4_8: 4.1188
+              mid_2_4_8: 1.4933   long_4_8_16: 0.5805
+- Incremental gains per additional neighbour:
+              k=3: [2.6255, 1.5816, 0.5446]
+              k=5: [2.6255, 1.5816, 0.5446, 0.2047, 0.0812]
+              k=7: [2.6255, 1.5816, 0.5446, 0.2047, 0.0812, 0.0325, 0.0167]
+
+Architecture:
+- Sparse attention layers: `attn_layer_pattern` (e.g. "111111010") is a binary
+  string where "0" positions become MLP-only blocks, skipping attention entirely.
+- Attention budgets: `attn_layer_budgets` is a per-layer list of floats (0–1)
+  that initialise `attn_scale` for each attention layer. Deeper layers with
+  lower MI receive smaller budgets (e.g. [1.0, 1.0, 1.0, 0.9, 0.8, 0.7, 0.6,
+  0.7, 0.4]), biasing those layers toward relying more heavily on MLP. Layers
+  initialised below 0.8 also have their scale clamped at `0.5 + 1.5 * init`,
+  preventing low-budget layers from expanding their attention contribution
+  during training and wasting capacity.
+- Grouped Query Attention (GQA): separate `num_heads` / `num_kv_heads` to reduce
+  KV parameter cost while retaining query expressivity.
+- Per-head Q gain scalar (`q_gain`), RMSNorm on Q and K before attention, and
+  RoPE positional embeddings for each attention layer.
+- relu² MLP (relu then square) in every block.
+- Per-dimension residual gates (`attn_scale`, `mlp_scale`) replace fixed mixing;
+  learned scalars control how strongly each sublayer writes to the residual stream.
+- Logit softcap via tanh (cap=30) to stabilise large logit magnitudes.
+- Tied input/output embeddings to cut parameter budget.
+- Muon optimizer for matrix-shaped weights; Adam for scalars and embeddings;
+  separate LR groups with warmdown for late-stage convergence.
+- Int8 + zlib quantization for export; control tensors kept in fp32.
+
+Overall: attention budgets produced meaningful quality gains on top of the
+sparse attention baseline, confirming that per-layer residual scale initialisation
+guided by MI is an effective use of the parameter and time budgets. This now
+serves as the new improved submission baseline.
 """
 
 from __future__ import annotations
