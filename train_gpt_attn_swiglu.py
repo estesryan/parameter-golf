@@ -602,17 +602,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.fc = CastedLinear(dim, 2 * hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        x = self.fc(x)
+        x1, x2 = x.chunk(2, dim=-1)
+        return self.proj(F.silu(x1) * x2)
 
 
 class Block(nn.Module):
