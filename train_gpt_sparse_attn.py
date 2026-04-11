@@ -649,7 +649,7 @@ class CausalDepthwiseConv(nn.Module):
             groups=dim,
             bias=False,
         )
-        self.scale = nn.Parameter(torch.full((dim,), 0.1, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.full((dim,), 0.03, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         # x: (B, T, C)
