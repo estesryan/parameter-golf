@@ -816,7 +816,7 @@ class GPT(nn.Module):
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         p = target_logp.exp()
-        weights = ((1.0 - p) ** 1.5).detach()
+        weights = ((1.0 - p) ** 1.0).detach()
         loss = -(weights * target_logp).mean()
         return loss
 
