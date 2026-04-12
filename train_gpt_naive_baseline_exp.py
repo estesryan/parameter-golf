@@ -637,18 +637,28 @@ class Block(nn.Module):
 
         self.use_local_conv = use_local_conv
         if self.use_local_conv:
+            local_dim = 128  # << key knob (cheap)
+
+            self.local_in = CastedLinear(dim, local_dim, bias=False)
+
             self.dwconv = nn.Conv1d(
-                dim,
-                dim,
+                local_dim,
+                local_dim,
                 kernel_size=5,
                 padding=0,
-                groups=dim,
+                groups=local_dim,
                 bias=False,
             )
+
+            self.local_out = CastedLinear(local_dim, dim, bias=False)
+            self.local_out._zero_init = True
+
             self.dwconv_kernel_size = 5
             self.conv_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         else:
+            self.local_in = None
             self.dwconv = None
+            self.local_out = None
             self.dwconv_kernel_size = 0
             self.conv_scale = None
 
@@ -660,8 +670,13 @@ class Block(nn.Module):
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
         if self.use_local_conv:
-            x_conv = F.pad(x.transpose(1, 2), (self.dwconv_kernel_size - 1, 0))
-            conv_out = self.dwconv(x_conv).transpose(1, 2)
+            local = self.local_in(x)
+
+            local_conv = F.pad(local.transpose(1, 2), (self.dwconv_kernel_size - 1, 0))
+            local_conv = self.dwconv(local_conv).transpose(1, 2)
+
+            conv_out = self.local_out(local_conv)
+
             x = x + self.conv_scale.to(dtype=x.dtype) * conv_out
 
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
