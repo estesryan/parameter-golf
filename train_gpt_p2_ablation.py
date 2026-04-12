@@ -1,7 +1,32 @@
 """
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+Loss-function ablation on the naive baseline GPT training script.
 
-Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
+This file extends the standard `train_gpt.py` naive baseline with an optional
+training-time loss modification while preserving the canonical evaluation path.
+
+Specifically, we introduce a P2-style reweighting of token-level cross-entropy:
+
+    L = -(1 - p)^γ * log(p)
+
+where p is the model probability of the correct token and γ controls the degree
+of emphasis on harder tokens (lower p). This allows controlled experiments on
+whether difficulty-based gradient reweighting improves compression (BPB) under
+the parameter-golf constraints.
+
+Key properties of this modification:
+- **Eval remains unchanged**: validation always uses standard cross-entropy
+  (F.cross_entropy on logits), ensuring BPB is directly comparable to other
+  submissions.
+- **Training-only change**: the loss reweighting is applied only during training.
+- **Configurable via environment variables**:
+    - LOSS_TYPE: "ce" (default) or "p2"
+    - P2_GAMMA: exponent γ for P2 weighting (default 0.5)
+
+This file is intended as a controlled ablation study:
+- baseline (LOSS_TYPE=ce) reproduces the naive baseline behavior
+- P2 variants isolate the effect of loss reweighting under identical settings
+
+No other architectural, optimizer, tokenizer, or evaluation changes are made.
 """
 
 from __future__ import annotations
@@ -69,6 +94,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    loss_type = os.environ.get("LOSS_TYPE", "ce")  # "ce" or "p2"
+    p2_gamma = float(os.environ.get("P2_GAMMA", 0.5))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -256,7 +283,12 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                logits = model(x, y, return_logits=True)
+                batch_loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    y.view(-1),
+                    reduction="mean"
+                )
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -659,6 +691,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        loss_type: str,
+        p2_gamma: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +700,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.loss_type = loss_type
+        self.p2_gamma = p2_gamma
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -697,7 +733,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, return_logits: bool = False) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -720,8 +756,23 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        if return_logits:
+            return logits
+
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+        if self.loss_type == "ce":
+            return -target_logp.mean()
+        elif self.loss_type == "p2":
+            p = target_logp.exp()
+            weights = ((1.0 - p) ** self.p2_gamma).detach()
+            return -(weights * target_logp).mean()
+        else:
+            raise ValueError(f"Unknown LOSS_TYPE={self.loss_type}")
 
 
 # -----------------------------
@@ -835,6 +886,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        loss_type=args.loss_type,
+        p2_gamma=args.p2_gamma,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -908,6 +961,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"loss_type:{args.loss_type} p2_gamma:{args.p2_gamma}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
