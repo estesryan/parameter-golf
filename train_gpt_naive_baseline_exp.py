@@ -942,6 +942,15 @@ def main() -> None:
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    def current_seq_len(step: int) -> int:
+        if step < 300:
+            return 128
+        if step < 900:
+            return 256
+        if step < 1800:
+            return 512
+        return args.train_seq_len
+
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -970,7 +979,8 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                seq_len = current_seq_len(0)
+                x, y = train_loader.next_batch(args.train_batch_tokens, seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1038,7 +1048,8 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            seq_len = current_seq_len(step)
+            x, y = train_loader.next_batch(args.train_batch_tokens, seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
