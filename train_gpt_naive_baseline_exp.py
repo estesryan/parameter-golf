@@ -657,14 +657,19 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_out = self.mlp(self.mlp_norm(x))
+
+        out = (
+            self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out +
+            self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        )
 
         if self.use_local_conv:
             x_conv = F.pad(x.transpose(1, 2), (self.dwconv_kernel_size - 1, 0))
             conv_out = self.dwconv(x_conv).transpose(1, 2)
-            x = x + self.conv_scale.to(dtype=x.dtype) * conv_out
+            out = out + self.conv_scale.to(dtype=x.dtype) * conv_out
 
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + out
         return x
 
 
