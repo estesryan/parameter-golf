@@ -62,6 +62,7 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
+    embed_dim = int(os.environ.get("EMBED_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
@@ -674,6 +675,7 @@ class GPT(nn.Module):
         vocab_size: int,
         num_layers: int,
         model_dim: int,
+        embed_dim: int,
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
@@ -689,11 +691,15 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.embed_dim = embed_dim
+        self.tok_emb = nn.Embedding(vocab_size, embed_dim)
+        self.in_proj = CastedLinear(embed_dim, model_dim, bias=False)
+
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -708,8 +714,13 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+
         self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        self.out_proj = CastedLinear(model_dim, embed_dim, bias=False)
+        self.lm_head = None if tie_embeddings else CastedLinear(embed_dim, vocab_size, bias=False)
+
+        self.in_proj._zero_init = False
+        self.out_proj._zero_init = False
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
@@ -724,6 +735,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        x = self.in_proj(x)
+        x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
@@ -736,7 +749,10 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)
+        x = self.out_proj(x)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -851,6 +867,7 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
+        embed_dim=args.embed_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
@@ -876,6 +893,7 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+
     matrix_params = [
         p
         for name, p in block_named_params
@@ -886,6 +904,13 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or "dwconv" in name or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+
+    # factorized token-interface projections
+    matrix_params.extend([
+        base_model.in_proj.weight,
+        base_model.out_proj.weight,
+    ])
+
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
