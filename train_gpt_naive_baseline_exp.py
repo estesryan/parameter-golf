@@ -642,7 +642,7 @@ class Block(nn.Module):
                 dim,
                 kernel_size=5,
                 padding=0,
-                groups=dim,
+                groups = dim // 4,
                 bias=False,
             )
             self.dwconv_kernel_size = 5
@@ -703,7 +703,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    use_local_conv=(i < 2),
+                    use_local_conv=(i < 3),
                 )
                 for i in range(num_layers)
             ]
