@@ -640,12 +640,12 @@ class Block(nn.Module):
             self.dwconv = nn.Conv1d(
                 dim,
                 dim,
-                kernel_size=5,
+                kernel_size=3,
                 padding=0,
                 groups=dim,
                 bias=False,
             )
-            self.dwconv_kernel_size = 5
+            self.dwconv_kernel_size = 3
             self.conv_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         else:
             self.dwconv = None
