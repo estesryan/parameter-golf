@@ -640,12 +640,12 @@ class Block(nn.Module):
             self.dwconv = nn.Conv1d(
                 dim,
                 dim,
-                kernel_size=3,
+                kernel_size=5,
                 padding=0,
                 groups=dim,
                 bias=False,
             )
-            self.dwconv_kernel_size = 3
+            self.dwconv_kernel_size = 5
             self.conv_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         else:
             self.dwconv = None
@@ -703,7 +703,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    use_local_conv=(i < 3),
+                    use_local_conv=(i < 2),
                 )
                 for i in range(num_layers)
             ]
