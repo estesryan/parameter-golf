@@ -26,6 +26,9 @@ This file is intended as a controlled ablation study:
 - baseline (LOSS_TYPE=ce) reproduces the naive baseline behavior
 - P2 variants isolate the effect of loss reweighting under identical settings
 
+Single-seed setup: Results are from a single run (SEED=1337) and are intended
+for relative comparison only.
+
 No other architectural, optimizer, tokenizer, or evaluation changes are made.
 """
 
