@@ -82,7 +82,7 @@ class Hyperparameters:
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 15.0))
-    logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.10))
+    logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.20))
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.01))
@@ -787,6 +787,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, return_logits: bool = False):
         x = self.tok_emb(input_ids)
+        if self.training:
+            x = x + 0.005 * torch.randn_like(x)
         x = x.transpose(1, 2)
         x = self.token_mixer(x)
         x = x[:, :, :input_ids.size(1)]
