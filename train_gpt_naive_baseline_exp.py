@@ -624,6 +624,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_local_conv: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -634,16 +635,22 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-        self.dwconv = nn.Conv1d(
-            dim,
-            dim,
-            kernel_size=5,
-            padding=0,
-            groups=dim,
-            bias=False,
-        )
-        self.dwconv_kernel_size = 5
-        self.conv_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.use_local_conv = use_local_conv
+        if self.use_local_conv:
+            self.dwconv = nn.Conv1d(
+                dim,
+                dim,
+                kernel_size=5,
+                padding=0,
+                groups=dim,
+                bias=False,
+            )
+            self.dwconv_kernel_size = 5
+            self.conv_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        else:
+            self.dwconv = None
+            self.dwconv_kernel_size = 0
+            self.conv_scale = None
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -652,9 +659,10 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
-        x_conv = F.pad(x.transpose(1, 2), (self.dwconv_kernel_size - 1, 0))
-        conv_out = self.dwconv(x_conv).transpose(1, 2)
-        x = x + self.conv_scale.to(dtype=x.dtype) * conv_out
+        if self.use_local_conv:
+            x_conv = F.pad(x.transpose(1, 2), (self.dwconv_kernel_size - 1, 0))
+            conv_out = self.dwconv(x_conv).transpose(1, 2)
+            x = x + self.conv_scale.to(dtype=x.dtype) * conv_out
 
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -695,6 +703,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_local_conv=(i < 3),
                 )
                 for i in range(num_layers)
             ]
