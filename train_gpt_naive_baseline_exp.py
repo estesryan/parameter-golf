@@ -642,7 +642,7 @@ class Block(nn.Module):
                 dim,
                 kernel_size=5,
                 padding=0,
-                groups = dim // 4,
+                groups=dim,
                 bias=False,
             )
             self.dwconv_kernel_size = 5
