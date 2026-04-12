@@ -646,7 +646,7 @@ class Block(nn.Module):
                 bias=False,
             )
             self.dwconv_kernel_size = 5
-            self.conv_scale = nn.Parameter(torch.full((dim,), 0.1, dtype=torch.float32))
+            self.conv_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         else:
             self.dwconv = None
             self.dwconv_kernel_size = 0
