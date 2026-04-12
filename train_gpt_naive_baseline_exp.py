@@ -81,8 +81,6 @@ class Hyperparameters:
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
-    head_beta1 = float(os.environ.get("HEAD_BETA1", 0.9))
-    head_beta2 = float(os.environ.get("HEAD_BETA2", 0.98))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -886,7 +884,7 @@ def main() -> None:
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.head_beta1, args.head_beta2),
+            betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
         )
