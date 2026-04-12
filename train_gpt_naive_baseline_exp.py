@@ -624,7 +624,6 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        use_local_conv: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -635,50 +634,11 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-        self.use_local_conv = use_local_conv
-        if self.use_local_conv:
-            local_dim = 192  # << key knob (cheap)
-
-            self.local_in = CastedLinear(dim, local_dim, bias=False)
-
-            self.dwconv = nn.Conv1d(
-                local_dim,
-                local_dim,
-                kernel_size=5,
-                padding=0,
-                groups=local_dim,
-                bias=False,
-            )
-
-            self.local_out = CastedLinear(local_dim, dim, bias=False)
-            self.local_out._zero_init = True
-
-            self.dwconv_kernel_size = 5
-            self.conv_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        else:
-            self.local_in = None
-            self.dwconv = None
-            self.local_out = None
-            self.dwconv_kernel_size = 0
-            self.conv_scale = None
-
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-
-        if self.use_local_conv:
-            local = self.local_in(x)
-
-            local_conv = F.pad(local.transpose(1, 2), (self.dwconv_kernel_size - 1, 0))
-            local_conv = self.dwconv(local_conv).transpose(1, 2)
-
-            conv_out = self.local_out(local_conv)
-
-            x = x + self.conv_scale.to(dtype=x.dtype) * conv_out
-
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -718,7 +678,6 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    use_local_conv=(i < 3),
                 )
                 for i in range(num_layers)
             ]
@@ -878,9 +837,6 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
-    for module in base_model.modules():
-        if isinstance(module, nn.Conv1d):
-            module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -894,12 +850,12 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim >= 2 and "dwconv" not in name and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or "dwconv" in name or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
