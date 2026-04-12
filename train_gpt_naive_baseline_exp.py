@@ -638,10 +638,11 @@ class Block(nn.Module):
             dim,
             dim,
             kernel_size=5,
-            padding=2,
+            padding=0,
             groups=dim,
             bias=False,
         )
+        self.dwconv_kernel_size = 5
         self.conv_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -651,7 +652,8 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
-        conv_out = self.dwconv(x.transpose(1, 2)).transpose(1, 2)
+        x_conv = F.pad(x.transpose(1, 2), (self.dwconv_kernel_size - 1, 0))
+        conv_out = self.dwconv(x_conv).transpose(1, 2)
         x = x + self.conv_scale.to(dtype=x.dtype) * conv_out
 
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
