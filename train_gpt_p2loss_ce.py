@@ -82,7 +82,7 @@ class Hyperparameters:
 
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 15.0))
-    logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.20))
+    logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", 1.10))
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.01))
@@ -816,7 +816,7 @@ class GPT(nn.Module):
         log_probs = F.log_softmax(logits.float() * self.logit_sharpen, dim=-1)
         target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         p = target_logp.exp()
-        weights = ((1.0 - p) ** 2).detach()
+        weights = ((1.0 - p) ** 1.5).detach()
         loss = -(weights * target_logp).mean()
         return loss
 
