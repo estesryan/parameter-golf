@@ -625,6 +625,7 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_local_conv: bool,
+        num_layers: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -634,6 +635,7 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.res_scale = (2.0 * num_layers) ** -0.5
 
         self.use_local_conv = use_local_conv
         if self.use_local_conv:
@@ -657,19 +659,15 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
         attn_out = self.attn(self.attn_norm(x))
-        mlp_out = self.mlp(self.mlp_norm(x))
-
-        out = (
-            self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out +
-            self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
-        )
+        x = x + self.res_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
         if self.use_local_conv:
             x_conv = F.pad(x.transpose(1, 2), (self.dwconv_kernel_size - 1, 0))
             conv_out = self.dwconv(x_conv).transpose(1, 2)
-            out = out + self.conv_scale.to(dtype=x.dtype) * conv_out
+            x = x + self.res_scale * self.conv_scale.to(dtype=x.dtype) * conv_out
 
-        x = x + out
+        mlp_out = self.mlp(self.mlp_norm(x))
+        x = x + self.res_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 
@@ -709,6 +707,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_local_conv=(i < 3),
+                    num_layers=num_layers,
                 )
                 for i in range(num_layers)
             ]
