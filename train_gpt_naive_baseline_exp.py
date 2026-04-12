@@ -637,7 +637,7 @@ class Block(nn.Module):
 
         self.use_local_conv = use_local_conv
         if self.use_local_conv:
-            local_dim = 128  # << key knob (cheap)
+            local_dim = 192  # << key knob (cheap)
 
             self.local_in = CastedLinear(dim, local_dim, bias=False)
 
