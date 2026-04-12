@@ -684,8 +684,6 @@ class GPT(nn.Module):
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        if self.lm_head is not None:
-            self.lm_head._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
