@@ -638,9 +638,14 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
+        # parallel paths
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(self.mlp_norm(x))
+
+        x = x + (
+            self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        )
         return x
 
 
