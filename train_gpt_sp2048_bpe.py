@@ -639,9 +639,8 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
-        if self.attn_mult != 0.0:
-            attn_out = self.attn(self.attn_norm(x))
-            x = x + self.attn_mult * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        attn_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_mult * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -686,7 +685,7 @@ class GPT(nn.Module):
             ]
         )
         for i in (3, 7):
-            self.blocks[i].attn_mult = 0.0
+            self.blocks[i].attn_mult = 1e-6
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
