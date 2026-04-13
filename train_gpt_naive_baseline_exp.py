@@ -624,6 +624,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_token_mixer: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -633,12 +634,27 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.use_token_mixer = use_token_mixer
+        if self.use_token_mixer:
+            self.mix_scale_1 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+            self.mix_scale_2 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        else:
+            self.mix_scale_1 = None
+            self.mix_scale_2 = None
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+
+        if self.use_token_mixer:
+            x_prev1 = F.pad(x[:, :-1, :], (0, 0, 1, 0))
+            x_prev2 = F.pad(x[:, :-2, :], (0, 0, 2, 0))
+            x = x + self.mix_scale_1.to(dtype=x.dtype)[None, None, :] * (x_prev1 - x)
+            x = x + self.mix_scale_2.to(dtype=x.dtype)[None, None, :] * (x_prev2 - x)
+
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -678,6 +694,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_token_mixer=(i < 3),
                 )
                 for i in range(num_layers)
             ]
