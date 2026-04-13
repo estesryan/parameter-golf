@@ -638,9 +638,13 @@ class Block(nn.Module):
         if self.use_token_mixer:
             self.mix_scale_1 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
             self.mix_scale_2 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+            self.mix_scale_3 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+            self.mix_scale_4 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
         else:
             self.mix_scale_1 = None
             self.mix_scale_2 = None
+            self.mix_scale_3 = None
+            self.mix_scale_4 = None
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -652,8 +656,13 @@ class Block(nn.Module):
         if self.use_token_mixer:
             x_prev1 = F.pad(x[:, :-1, :], (0, 0, 1, 0))
             x_prev2 = F.pad(x[:, :-2, :], (0, 0, 2, 0))
+            x_prev3 = F.pad(x[:, :-3, :], (0, 0, 3, 0))
+            x_prev4 = F.pad(x[:, :-4, :], (0, 0, 4, 0))
+
             x = x + self.mix_scale_1.to(dtype=x.dtype)[None, None, :] * (x_prev1 - x)
             x = x + self.mix_scale_2.to(dtype=x.dtype)[None, None, :] * (x_prev2 - x)
+            x = x + self.mix_scale_3.to(dtype=x.dtype)[None, None, :] * (x_prev3 - x)
+            x = x + self.mix_scale_4.to(dtype=x.dtype)[None, None, :] * (x_prev4 - x)
 
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
