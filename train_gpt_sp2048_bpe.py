@@ -700,6 +700,12 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
 
+        # lag-1 embedding mixing
+        x_shift = torch.roll(x, shifts=1, dims=1)
+        x_shift[:, 0, :] = 0  # no leakage at first position
+
+        x = x + 0.1 * x_shift
+
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
