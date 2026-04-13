@@ -615,27 +615,6 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class LocalConv(nn.Module):
-    def __init__(self, dim: int, kernel_size: int = 5):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.conv = nn.Conv1d(
-            dim,
-            dim,
-            kernel_size=kernel_size,
-            padding=0,
-            groups=dim,
-            bias=True,
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (B, T, C)
-        x = x.transpose(1, 2)  # (B, C, T)
-        x = F.pad(x, (self.kernel_size - 1, 0))  # left pad only -> causal
-        x = self.conv(x)
-        return x.transpose(1, 2)
-    
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -654,7 +633,6 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.local_conv = None
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -662,9 +640,6 @@ class Block(nn.Module):
 
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-
-        if self.local_conv is not None:
-            x = x + self.local_conv(x)
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -695,19 +670,19 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList()
-        for i in range(num_layers):
-            block = Block(
-                model_dim,
-                num_heads,
-                num_kv_heads,
-                mlp_mult,
-                rope_base,
-                qk_gain_init,
-            )
-            if i < 2:  # only first 2 layers
-                block.local_conv = LocalConv(model_dim, kernel_size=5)
-            self.blocks.append(block)
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for i in range(num_layers)
+            ]
+        )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
