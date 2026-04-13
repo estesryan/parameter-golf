@@ -618,16 +618,22 @@ class MLP(nn.Module):
 class LocalConv(nn.Module):
     def __init__(self, dim: int, kernel_size: int = 5):
         super().__init__()
+        self.kernel_size = kernel_size
         self.conv = nn.Conv1d(
-            dim, dim,
+            dim,
+            dim,
             kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            groups=dim  # depthwise (cheap)
+            padding=0,
+            groups=dim,
+            bias=True,
         )
 
     def forward(self, x: Tensor) -> Tensor:
         # x: (B, T, C)
-        return self.conv(x.transpose(1, 2)).transpose(1, 2)
+        x = x.transpose(1, 2)  # (B, C, T)
+        x = F.pad(x, (self.kernel_size - 1, 0))  # left pad only -> causal
+        x = self.conv(x)
+        return x.transpose(1, 2)
     
 
 class Block(nn.Module):
