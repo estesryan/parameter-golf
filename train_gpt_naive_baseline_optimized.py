@@ -1,5 +1,5 @@
 """
-Naive baseline GPT training script.
+Optimized Naive baseline GPT training script.
 """
 
 from __future__ import annotations
