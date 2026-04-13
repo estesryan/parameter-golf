@@ -52,9 +52,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_batch_tokens_late = int(os.environ.get("TRAIN_BATCH_TOKENS_LATE", 393_216))
-    batch_switch_fraction = float(os.environ.get("BATCH_SWITCH_FRACTION", 0.35))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -907,10 +905,7 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        f"train_batch_tokens:{args.train_batch_tokens} "
-        f"train_batch_tokens_late:{args.train_batch_tokens_late} "
-        f"batch_switch_fraction:{args.batch_switch_fraction:.2f} "
-        f"train_seq_len:{args.train_seq_len} "
+        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
@@ -927,13 +922,6 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-
-    def current_train_batch_tokens(elapsed_ms: float) -> int:
-        if max_wallclock_ms is None:
-            return args.train_batch_tokens
-        if elapsed_ms < args.batch_switch_fraction * max_wallclock_ms:
-            return args.train_batch_tokens
-        return args.train_batch_tokens_late
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -957,8 +945,7 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                batch_tokens = current_train_batch_tokens(0.0)
-                x, y = train_loader.next_batch(batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1026,8 +1013,7 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            batch_tokens = current_train_batch_tokens(elapsed_ms)
-            x, y = train_loader.next_batch(batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
