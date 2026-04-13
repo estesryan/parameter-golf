@@ -634,14 +634,10 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.resid_corr = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-
-        corr = torch.tanh(self.resid_corr).to(dtype=x.dtype)
-        x = x + corr[None, None, :] * (x - x0)
 
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
@@ -1103,11 +1099,6 @@ def main() -> None:
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                     f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
                 )
-
-            log0(
-                f"layer:{i} resid_corr_mean:{block.resid_corr.mean().item():.6f} "
-                f"resid_corr_std:{block.resid_corr.std().item():.6f}"
-            )
                 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
