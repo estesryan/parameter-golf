@@ -671,7 +671,6 @@ class GPT(nn.Module):
         self.bigram_prev = nn.Embedding(vocab_size, bigram_rank)
         self.bigram_curr = nn.Embedding(vocab_size, bigram_rank)
         self.bigram_proj = CastedLinear(bigram_rank, model_dim, bias=False)
-        self.bigram_proj._zero_init = True
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -701,6 +700,7 @@ class GPT(nn.Module):
 
         nn.init.normal_(self.bigram_prev.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.bigram_curr.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.bigram_proj.weight, mean=0.0, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
