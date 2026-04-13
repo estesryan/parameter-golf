@@ -624,7 +624,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        use_token_mixer: bool,
+        use_local_conv: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -634,17 +634,22 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.use_token_mixer = use_token_mixer
-        if self.use_token_mixer:
-            self.mix_scale_1 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-            self.mix_scale_2 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-            self.mix_scale_3 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-            self.mix_scale_4 = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self.use_local_conv = use_local_conv
+        if self.use_local_conv:
+            self.dwconv = nn.Conv1d(
+                dim,
+                dim,
+                kernel_size=5,
+                padding=0,
+                groups=dim,
+                bias=False,
+            )
+            self.dwconv_kernel_size = 5
+            self.conv_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         else:
-            self.mix_scale_1 = None
-            self.mix_scale_2 = None
-            self.mix_scale_3 = None
-            self.mix_scale_4 = None
+            self.dwconv = None
+            self.dwconv_kernel_size = 0
+            self.conv_scale = None
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -653,16 +658,10 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
-        if self.use_token_mixer:
-            x_prev1 = F.pad(x[:, :-1, :], (0, 0, 1, 0))
-            x_prev2 = F.pad(x[:, :-2, :], (0, 0, 2, 0))
-            x_prev3 = F.pad(x[:, :-3, :], (0, 0, 3, 0))
-            x_prev4 = F.pad(x[:, :-4, :], (0, 0, 4, 0))
-
-            x = x + self.mix_scale_1.to(dtype=x.dtype)[None, None, :] * (x_prev1 - x)
-            x = x + self.mix_scale_2.to(dtype=x.dtype)[None, None, :] * (x_prev2 - x)
-            x = x + self.mix_scale_3.to(dtype=x.dtype)[None, None, :] * (x_prev3 - x)
-            x = x + self.mix_scale_4.to(dtype=x.dtype)[None, None, :] * (x_prev4 - x)
+        if self.use_local_conv:
+            x_conv = F.pad(x.transpose(1, 2), (self.dwconv_kernel_size - 1, 0))
+            conv_out = self.dwconv(x_conv).transpose(1, 2)
+            x = x + self.conv_scale.to(dtype=x.dtype) * conv_out
 
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -703,7 +702,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    use_token_mixer=(i < 3),
+                    use_local_conv=(i < 3),
                 )
                 for i in range(num_layers)
             ]
@@ -863,6 +862,9 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
+    for module in base_model.modules():
+        if isinstance(module, nn.Conv1d):
+            module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -876,12 +878,12 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim >= 2 and "dwconv" not in name and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 or "dwconv" in name or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
