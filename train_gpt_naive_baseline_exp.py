@@ -287,7 +287,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,ctx_gate",
     ).split(",")
     if pattern
 )
@@ -666,6 +666,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.ctx_gate = CastedLinear(model_dim, model_dim, bias=False)
+        self.ctx_gate._zero_init = True
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -699,8 +701,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-
         x = F.rms_norm(x, (x.size(-1),))
+        x = x * (1.0 + 0.05 * torch.tanh(self.ctx_gate(x)))
         x0 = x
         skips: list[Tensor] = []
 
@@ -853,12 +855,16 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2
+        and "ctx_gate.weight" not in name
+        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2
+        or "ctx_gate.weight" in name
+        or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
     if base_model.skip_weights.numel() > 0:
@@ -1077,7 +1083,11 @@ def main() -> None:
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                     f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
                 )
-                
+        log0(
+            f"ctx_gate_mean:{base_model.ctx_gate.weight.mean().item():.6f} "
+            f"ctx_gate_std:{base_model.ctx_gate.weight.std().item():.6f} "
+            f"ctx_gate_absmax:{base_model.ctx_gate.weight.abs().max().item():.6f}"
+        )
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
