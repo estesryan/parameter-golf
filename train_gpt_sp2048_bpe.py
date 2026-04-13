@@ -666,6 +666,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.lag1_alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -704,7 +705,7 @@ class GPT(nn.Module):
         x_shift = torch.roll(x, shifts=1, dims=1)
         x_shift[:, 0, :] = 0  # no leakage at first position
 
-        x = x + 0.1 * x_shift
+        x = x + self.lag1_alpha.to(dtype=x.dtype) * x_shift
 
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
