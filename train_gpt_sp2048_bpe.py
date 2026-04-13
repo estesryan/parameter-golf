@@ -638,14 +638,9 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
-        # parallel paths
         attn_out = self.attn(self.attn_norm(x))
-        mlp_out = self.mlp(self.mlp_norm(x))
-
-        x = x + (
-            self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-            + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
-        )
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -671,6 +666,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram_alpha = nn.Parameter(torch.tensor(0.10, dtype=torch.float32))
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -703,9 +699,8 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-
-        x = F.rms_norm(x, (x.size(-1),))
+        tok = self.tok_emb(input_ids)
+        x = F.rms_norm(tok, (tok.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
@@ -721,11 +716,23 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            proj_weight = self.tok_emb.weight
+            logits_proj = F.linear(x, proj_weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
+            proj_weight = self.lm_head.weight
             logits_proj = self.lm_head(x)
+
+        # lag-1 bigram logit residual
+        tok_shift = torch.roll(tok, shifts=1, dims=1)
+        tok_shift[:, 0, :] = 0
+        bigram_logits = F.linear(
+            tok_shift.reshape(-1, tok_shift.size(-1)).to(dtype=proj_weight.dtype),
+            proj_weight
+        )
+
+        logits_proj = logits_proj + self.bigram_alpha.to(dtype=logits_proj.dtype) * bigram_logits
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
