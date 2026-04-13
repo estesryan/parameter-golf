@@ -702,7 +702,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    use_local_conv=(i < 3),
+                    use_local_conv=(1 <= i < 4),
                 )
                 for i in range(num_layers)
             ]
