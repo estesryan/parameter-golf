@@ -633,20 +633,16 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.resid_corr = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
-        x_attn = self.attn_norm(x)
+        corr = torch.tanh(self.resid_corr).to(dtype=x.dtype)
+        x = x + corr[None, None, :] * (x - x0)
 
-        # causal shift-mix: token t sees only itself and t-1
-        x_shift = torch.roll(x_attn, shifts=1, dims=1)
-        x_shift[:, 0, :] = 0
-
-        x_attn = 0.5 * x_attn + 0.5 * x_shift
-        attn_out = self.attn(x_attn)
-
+        attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
