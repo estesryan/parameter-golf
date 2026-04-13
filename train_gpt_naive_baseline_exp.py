@@ -666,6 +666,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.tok_gate = nn.Embedding(vocab_size, 1)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -692,6 +693,7 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        nn.init.zeros_(self.tok_gate.weight)
 
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
@@ -699,6 +701,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        gate = 1.0 + 0.05 * torch.tanh(self.tok_gate(input_ids))
+        x = x * gate
 
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -870,6 +874,7 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
+    scalar_params.append(base_model.tok_gate.weight)
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
@@ -1077,7 +1082,11 @@ def main() -> None:
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                     f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
                 )
-                
+        log0(
+            f"tok_gate_mean:{base_model.tok_gate.weight.mean().item():.6f} "
+            f"tok_gate_std:{base_model.tok_gate.weight.std().item():.6f} "
+            f"tok_gate_absmax:{base_model.tok_gate.weight.abs().max().item():.6f}"
+        )
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
