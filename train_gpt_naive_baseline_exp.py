@@ -67,6 +67,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    bigram_rank = int(os.environ.get("BIGRAM_RANK", 16))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -662,6 +663,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        bigram_rank: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -670,6 +672,10 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram_prev = nn.Embedding(vocab_size, bigram_rank)
+        self.bigram_curr = nn.Embedding(vocab_size, bigram_rank)
+        self.bigram_proj = CastedLinear(bigram_rank, model_dim, bias=False)
+        self.bigram_proj._zero_init = True
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -696,12 +702,22 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+
+        nn.init.normal_(self.bigram_prev.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.bigram_curr.weight, mean=0.0, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+
+        prev_ids = torch.roll(input_ids, shifts=1, dims=1)
+        prev_ids[:, 0] = 0  # causal boundary token id
+
+        bigram_h = self.bigram_prev(prev_ids) * self.bigram_curr(input_ids)
+        x = x + self.bigram_proj(bigram_h)
+
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -838,6 +854,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        bigram_rank=args.bigram_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -862,6 +879,14 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+
+    # train bigram remap parameters too
+    matrix_params.extend([
+        base_model.bigram_prev.weight,
+        base_model.bigram_curr.weight,
+        base_model.bigram_proj.weight,
+    ])
+
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1078,8 +1103,11 @@ def main() -> None:
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                     f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
                 )
-            else:
-                log0(f"layer:{i} q_gain_mean:NA q_gain_std:NA")
+
+            log0(
+                f"layer:{i} resid_corr_mean:{block.resid_corr.mean().item():.6f} "
+                f"resid_corr_std:{block.resid_corr.std().item():.6f}"
+            )
                 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
