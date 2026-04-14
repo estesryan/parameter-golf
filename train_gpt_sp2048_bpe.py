@@ -50,7 +50,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4500))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4800))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -633,16 +633,22 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.mlp_global_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.block_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
-        attn_out = self.attn(self.attn_norm(x))
+        x_in = x
+        attn_out = self.attn(self.attn_norm(x_in))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
-        x = x + self.mlp_global_scale.to(dtype=x.dtype) * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(self.mlp_norm(x))
+        update = (
+            x - x_in
+            + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        )
+        x = x_in + self.block_scale.to(dtype=x.dtype) * update
         return x
 
 
@@ -1066,6 +1072,9 @@ def main() -> None:
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
+            log0(
+                f"layer:{i} block_scale:{block.block_scale.item():.6f}"
+            )
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
                 f"attn_scale_std:{block.attn_scale.std().item():.6f}"
