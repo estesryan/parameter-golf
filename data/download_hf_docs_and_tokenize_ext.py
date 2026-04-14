@@ -12,6 +12,12 @@ PYTHONUNBUFFERED=1 python3 data/download_hf_docs_and_tokenize_ext.py \
   --tokenizer-train-docs 10000000 \
   --train-shards 80
 
+  PYTHONUNBUFFERED=1 python3 data/download_hf_docs_and_tokenize_ext.py \
+  --output-root ./data \
+  --tokenizer-config ./data/tokenizer_specs_2048_uni.json \
+  --tokenizer-train-docs 10000000 \
+  --train-shards 80
+
 """
 
 from __future__ import annotations
