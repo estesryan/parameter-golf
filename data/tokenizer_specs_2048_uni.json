@@ -6,11 +6,10 @@
       "vocab_size": 2048,
       "trainer_overrides": {
         "model_type": "unigram",
-        "input_sentence_size": 10000000,
+        "input_sentence_size": 2000000,
         "shuffle_input_sentence": true,
         "remove_extra_whitespaces": true,
         "split_by_unicode_script": false,
-        "split_by_number": true,
         "character_coverage": 0.9995,
         "train_extremely_large_corpus": true
       }
