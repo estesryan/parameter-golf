@@ -9,7 +9,8 @@
         "input_sentence_size": 5000000,
         "shuffle_input_sentence": true,
         "remove_extra_whitespaces": true,
-        "character_coverage": 0.9995
+        "character_coverage": 0.9995,
+        "split_by_number": true
       }
     }
   ]
