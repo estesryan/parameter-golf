@@ -50,7 +50,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 480))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4500))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -642,9 +642,10 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x_in))
         mlp_out = self.mlp(self.mlp_norm(x_in))
 
-        x = x_in
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        x = x_in + (
+            self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        ) / math.sqrt(2.0)
         return x
 
 
