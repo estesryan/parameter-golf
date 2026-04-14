@@ -4,7 +4,6 @@
       "name": "sp_bpe_2048",
       "dataset_suffix": "sp2048",
       "vocab_size": 2048,
-      "split_digits": false,
       "trainer_overrides": {
         "model_type": "bpe",
         "input_sentence_size": 5000000,
