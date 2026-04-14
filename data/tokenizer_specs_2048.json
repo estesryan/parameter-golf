@@ -1,8 +1,8 @@
 {
   "tokenizers": [
     {
-      "name": "sp_bpe_2048_opt",
-      "dataset_suffix": "sp2048_opt",
+      "name": "sp_bpe_2048",
+      "dataset_suffix": "sp2048",
       "vocab_size": 2048,
       "trainer_overrides": {
         "model_type": "bpe",
