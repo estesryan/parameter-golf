@@ -295,7 +295,7 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
             "vocab_size": vocab_size,
             "character_coverage": 0.999,
             "byte_fallback": True,
-            "split_digits": True,
+            "split_digits": bool(spec.get("split_digits", True)),
             "normalization_rule_name": "nmt_nfkc",
             "add_dummy_prefix": False,
             "pad_id": 0,
