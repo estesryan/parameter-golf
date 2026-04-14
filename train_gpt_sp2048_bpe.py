@@ -50,7 +50,8 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4800))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.35))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -63,7 +64,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 3))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -605,7 +606,7 @@ class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = int(round(mlp_mult * dim))
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -925,15 +926,26 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
+        # --- Wallclock-based warmdown (use when warmdown_iters < 0) ---
+        if max_wallclock_ms is not None and args.warmdown_iters < 0:
+            warmdown_start_ms = (1.0 - args.warmdown_frac) * max_wallclock_ms
+            if elapsed_ms < warmdown_start_ms:
+                return 1.0
+
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            warmdown_ms = max_wallclock_ms - warmdown_start_ms
+            return max(remaining_ms / max(warmdown_ms, 1e-9), 0.0)
+
+        # --- No warmdown ---
+        if args.warmdown_iters == 0:
             return 1.0
-        if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+        # --- Step-based warmdown ---
+        warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+        if step < warmdown_start:
+            return 1.0
+
+        return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.

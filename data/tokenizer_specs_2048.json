@@ -6,7 +6,7 @@
       "vocab_size": 2048,
       "trainer_overrides": {
         "model_type": "bpe",
-        "input_sentence_size": 5000000,
+        "input_sentence_size": 10000000,
         "shuffle_input_sentence": true,
         "remove_extra_whitespaces": true,
         "character_coverage": 0.9995
