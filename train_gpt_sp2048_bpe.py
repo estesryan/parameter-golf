@@ -642,10 +642,10 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x_in))
         mlp_out = self.mlp(self.mlp_norm(x_in))
 
-        x = x_in + (
+        x = x_in + 0.85 * (
             self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
             + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
-        ) / math.sqrt(2.0)
+        )
         return x
 
 
