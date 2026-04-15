@@ -57,6 +57,8 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 2.0))
+    late_qat_frac = float(os.environ.get("LATE_QAT_FRAC", 0.15))
+    late_qat_start_scale = float(os.environ.get("LATE_QAT_START_SCALE", -1.0))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 2048))
@@ -84,7 +86,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -315,11 +317,9 @@ MIXED_PRECISION_INT8_NAME_PATTERNS = (
 
 INT6_QMAX = 31
 INT8_QMAX = 127
-
-# GPTQ-lite style clip search: try a few clip percentiles and keep the lowest-MSE one.
-ROW_CLIP_QS = (0.98, 0.99, 0.995, 0.999, 0.9995, 0.9999, 1.0)
-VECTOR_CLIP_Q = 0.999
-ROW_SHRINKS = (1.0, 0.995, 0.99, 0.98, 0.96, 0.94, 0.92)
+# Simple fixed clipping for PTQ.
+INT_CLIP_PERCENTILE = 99.99984
+INT_CLIP_Q = INT_CLIP_PERCENTILE / 100.0
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -340,63 +340,23 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor, dict[st
     bits = 8 if use_int8 else 6
 
     if t32.ndim == 2:
-        if t32.numel() == 0:
-            q = torch.empty_like(t32, dtype=torch.int8)
-            s = torch.empty((t32.shape[0],), dtype=INT8_PER_ROW_SCALE_DTYPE)
-            meta = {
-                "scheme": "per_row",
-                "axis": 0,
-                "bits": bits,
-                "qmax": qmax,
-                "clip_q": None,
-                "shrink": None,
-            }
-            return q, s, meta
+        clip_abs = (
+            torch.quantile(t32.abs(), INT_CLIP_Q, dim=1)
+            if t32.numel()
+            else torch.empty((t32.shape[0],), dtype=torch.float32)
+        )
+        clip_abs = clip_abs.clamp_min(1.0 / qmax)
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8).contiguous()
+        meta = {"scheme": "per_row", "axis": 0, "bits": bits, "qmax": qmax, "clip_q": INT_CLIP_Q}
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), meta
 
-        best_q = None
-        best_scale = None
-        best_err = None
-        best_clip_q = None
-        best_shrink = None
-
-        abs_rows = t32.abs()
-
-        for clip_q in ROW_CLIP_QS:
-            base_clip_abs = torch.quantile(abs_rows, clip_q, dim=1)
-            base_clip_abs = base_clip_abs.clamp_min(1.0 / qmax)
-
-            for shrink in ROW_SHRINKS:
-                clip_abs = (base_clip_abs * shrink).clamp_min(1.0 / qmax)
-                clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-                scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
-                q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8)
-
-                recon = q.float() * scale[:, None]
-                err = (t32 - recon).pow(2).mean()
-
-                if best_err is None or err.item() < best_err:
-                    best_q = q.contiguous()
-                    best_scale = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-                    best_err = err.item()
-                    best_clip_q = clip_q
-                    best_shrink = shrink
-
-        meta = {
-            "scheme": "per_row",
-            "axis": 0,
-            "bits": bits,
-            "qmax": qmax,
-            "clip_q": best_clip_q,
-            "shrink": best_shrink,
-        }
-        return best_q, best_scale, meta
-
-    # Vectors / scalars: keep simple per-tensor quantization.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), VECTOR_CLIP_Q).item()) if t32.numel() else 0.0
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT_CLIP_Q).item()) if t32.numel() else 0.0
     clip_abs = max(clip_abs, 1.0 / qmax)
     scale = torch.tensor(clip_abs / float(qmax), dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
-    meta = {"scheme": "per_tensor", "bits": bits, "qmax": qmax, "clip_q": VECTOR_CLIP_Q}
+    meta = {"scheme": "per_tensor", "bits": bits, "qmax": qmax, "clip_q": INT_CLIP_Q}
     return q, scale, meta
 
 def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
@@ -569,11 +529,41 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def fake_quantize_weight_for_qat(name: str, w: Tensor) -> Tensor:
+    w32 = w.float()
+
+    use_int8 = any(pattern in name for pattern in MIXED_PRECISION_INT8_NAME_PATTERNS)
+    qmax = INT8_QMAX if use_int8 else INT6_QMAX
+
+    if w32.ndim == 2:
+        clip_abs = torch.quantile(w32.abs(), INT_CLIP_Q, dim=1)
+        clip_abs = clip_abs.clamp_min(1.0 / qmax)
+        clipped = torch.maximum(torch.minimum(w32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax)
+        return (q - clipped.detach() / scale[:, None] + clipped / scale[:, None]) * scale[:, None]
+
+    clip_abs = torch.quantile(w32.abs().flatten(), INT_CLIP_Q) if w32.numel() else torch.tensor(0.0, device=w32.device)
+    clip_abs = clip_abs.clamp_min(1.0 / qmax)
+    clipped = torch.clamp(w32, -clip_abs, clip_abs)
+    scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
+    q = torch.clamp(torch.round(clipped / scale), -qmax, qmax)
+    return (q - clipped.detach() / scale + clipped / scale) * scale
+
+
 class CastedLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__(in_features, out_features, bias=bias)
+        self.qat_param_name = ""
+        self.register_buffer("qat_enabled", torch.tensor(False, dtype=torch.bool), persistent=False)
+
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        if bool(self.qat_enabled.item()) and self.qat_param_name:
+            w = fake_quantize_weight_for_qat(self.qat_param_name, w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -584,6 +574,12 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def set_late_qat_enabled(module: nn.Module, enabled: bool) -> None:
+    for submodule in module.modules():
+        if isinstance(submodule, CastedLinear):
+            submodule.qat_enabled.fill_(enabled)
+
+    
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -916,6 +912,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    for module_name, module in base_model.named_modules():
+        if isinstance(module, CastedLinear):
+            module.qat_param_name = f"{module_name}.weight"
+    set_late_qat_enabled(base_model, False)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1056,6 +1056,7 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    late_qat_prev = False
 
     step = 0
     while True:
@@ -1094,6 +1095,22 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        late_qat_on = False
+        if max_wallclock_ms is not None and args.late_qat_frac > 0:
+            late_qat_start_ms = (1.0 - args.late_qat_frac) * max_wallclock_ms
+            late_qat_on = elapsed_ms >= late_qat_start_ms
+        if args.late_qat_start_scale >= 0.0:
+            late_qat_on = late_qat_on or (scale <= args.late_qat_start_scale)
+
+        set_late_qat_enabled(base_model, late_qat_on)
+        if late_qat_on and not late_qat_prev:
+            log0(
+                f"late_qat:on step:{step}/{args.iterations} "
+                f"train_time:{elapsed_ms:.0f}ms scale:{scale:.4f}"
+            )
+        late_qat_prev = late_qat_on
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
