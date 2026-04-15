@@ -282,7 +282,7 @@ def eval_val(
 # -----------------------------
 #
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
+# Instead, we get approximately the same model (with a small hit) by quantizing the model to mixed int6/int8 and compressing it.
 # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -316,9 +316,9 @@ MIXED_PRECISION_INT8_NAME_PATTERNS = (
 INT6_QMAX = 31
 INT8_QMAX = 127
 
-# Keep this simple for now. You can add clip-search later if needed.
-INT_CLIP_PERCENTILE = 99.99984
-INT_CLIP_Q = INT_CLIP_PERCENTILE / 100.0
+# GPTQ-lite style clip search: try a few clip percentiles and keep the lowest-MSE one.
+ROW_CLIP_QS = (0.999, 0.9995, 0.9999, 0.99999, 1.0)
+VECTOR_CLIP_Q = 0.9999
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -339,25 +339,43 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor, dict[st
     bits = 8 if use_int8 else 6
 
     if t32.ndim == 2:
-        # Per-row quantization for matrices.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clip_abs = clip_abs.clamp_min(1.0 / qmax)
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8).contiguous()
-        meta = {"scheme": "per_row", "axis": 0, "bits": bits, "qmax": qmax}
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), meta
+        # GPTQ-lite style clip search: try a few clip percentiles and keep the lowest-MSE result.
+        if t32.numel() == 0:
+            q = torch.empty_like(t32, dtype=torch.int8)
+            s = torch.empty((t32.shape[0],), dtype=INT8_PER_ROW_SCALE_DTYPE)
+            meta = {"scheme": "per_row", "axis": 0, "bits": bits, "qmax": qmax, "clip_q": None}
+            return q, s, meta
 
-    # Vectors / scalars: per-tensor quantization.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT_CLIP_Q).item()) if t32.numel() else 0.0
+        best_q = None
+        best_scale = None
+        best_err = None
+        best_clip_q = None
+
+        for clip_q in ROW_CLIP_QS:
+            clip_abs = torch.quantile(t32.abs(), clip_q, dim=1)
+            clip_abs = clip_abs.clamp_min(1.0 / qmax)
+            clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+            scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
+            q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8)
+
+            recon = q.float() * scale[:, None]
+            err = (t32 - recon).pow(2).mean()
+
+            if best_err is None or err.item() < best_err:
+                best_q = q.contiguous()
+                best_scale = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+                best_err = err.item()
+                best_clip_q = clip_q
+
+        meta = {"scheme": "per_row", "axis": 0, "bits": bits, "qmax": qmax, "clip_q": best_clip_q}
+        return best_q, best_scale, meta
+
+    # Vectors / scalars: keep simple per-tensor quantization.
+    clip_abs = float(torch.quantile(t32.abs().flatten(), VECTOR_CLIP_Q).item()) if t32.numel() else 0.0
     clip_abs = max(clip_abs, 1.0 / qmax)
     scale = torch.tensor(clip_abs / float(qmax), dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
-    meta = {"scheme": "per_tensor", "bits": bits, "qmax": qmax}
+    meta = {"scheme": "per_tensor", "bits": bits, "qmax": qmax, "clip_q": VECTOR_CLIP_Q}
     return q, scale, meta
 
 def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
