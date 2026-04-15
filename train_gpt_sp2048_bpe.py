@@ -714,7 +714,7 @@ class GPT(nn.Module):
                         model_dim,
                         num_heads,
                         num_kv_heads,
-                        mlp_mult,
+                        2 if i < 2 else mlp_mult,
                         rope_base,
                         qk_gain_init,
                     )
