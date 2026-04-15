@@ -61,7 +61,7 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 2048))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 5))
+    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 7))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
