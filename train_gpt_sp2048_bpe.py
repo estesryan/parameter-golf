@@ -74,7 +74,7 @@ class Hyperparameters:
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
-    head_lr = float(os.environ.get("HEAD_LR", 0.012))
+    head_lr = float(os.environ.get("HEAD_LR", 0.010))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
@@ -560,7 +560,7 @@ class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if bool(self.qat_enabled.item()) and self.qat_param_name:
+        if self.training and self.qat_param_name and self.qat_enabled:
             w = fake_quantize_weight_for_qat(self.qat_param_name, w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
