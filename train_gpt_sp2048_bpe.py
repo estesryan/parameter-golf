@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
-import zstandard as zstd
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -62,7 +62,6 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 2048))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 0))
-    hybrid_recurrence = bool(int(os.environ.get("HYBRID_RECURRENCE", "0")))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -654,7 +653,6 @@ class GPT(nn.Module):
         vocab_size: int,
         num_layers: int,
         num_unique_layers: int,
-        hybrid_recurrence: bool,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -673,7 +671,6 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_layers = num_layers
-        self.hybrid_recurrence = hybrid_recurrence
         self.num_unique_layers = num_unique_layers if num_unique_layers > 0 else num_layers
         if not (1 <= self.num_unique_layers <= self.num_layers):
             raise ValueError(
@@ -684,43 +681,19 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-
-        if self.hybrid_recurrence:
-            self.shared_block = Block(
-                model_dim,
-                num_heads,
-                num_kv_heads,
-                mlp_mult,
-                rope_base,
-                qk_gain_init,
-            )
-            self.blocks = nn.ModuleList(
-                [
-                    Block(
-                        model_dim,
-                        num_heads,
-                        num_kv_heads,
-                        mlp_mult,
-                        rope_base,
-                        qk_gain_init,
-                    )
-                    for _ in range(num_layers - 2)
-                ]
-            )
-        else:
-            self.blocks = nn.ModuleList(
-                [
-                    Block(
-                        model_dim,
-                        num_heads,
-                        num_kv_heads,
-                        2 if i < 2 else mlp_mult,
-                        rope_base,
-                        qk_gain_init,
-                    )
-                    for i in range(self.num_unique_layers)
-                ]
-            )
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for _ in range(self.num_unique_layers)
+            ]
+        )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -743,25 +716,13 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
-            if self.hybrid_recurrence:
-                if i < 2:
-                    x = self.shared_block(x, x0)
-                else:
-                    x = self.blocks[i - 2](x, x0)
-            else:
-                x = self.blocks[i % self.num_unique_layers](x, x0)
+            x = self.blocks[i % self.num_unique_layers](x, x0)
             skips.append(x)
-
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-
-            logical_idx = self.num_encoder_layers + i
-            if self.hybrid_recurrence:
-                x = self.blocks[logical_idx - 2](x, x0)
-            else:
-                block_idx = logical_idx % self.num_unique_layers
-                x = self.blocks[block_idx](x, x0)
+            block_idx = (self.num_encoder_layers + i) % self.num_unique_layers
+            x = self.blocks[block_idx](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -878,7 +839,6 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         num_unique_layers=args.num_unique_layers,
-        hybrid_recurrence=args.hybrid_recurrence,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -902,10 +862,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    if getattr(base_model, "shared_block", None) is not None:
-        block_named_params += [
-            (f"shared_block.{name}", p) for name, p in base_model.shared_block.named_parameters()
-        ]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1144,21 +1100,6 @@ def main() -> None:
                     f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
                     f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
                 )
-
-        if getattr(base_model, "shared_block", None) is not None:
-            block = base_model.shared_block
-            log0(
-                f"layer:shared attn_scale_mean:{block.attn_scale.mean().item():.6f} "
-                f"attn_scale_std:{block.attn_scale.std().item():.6f}"
-            )
-            log0(
-                f"layer:shared mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
-                f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
-            )
-            log0(
-                f"layer:shared q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
-                f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
-            )
                 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1178,8 +1119,7 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    cctx = zstd.ZstdCompressor(level=22)
-    quant_blob = cctx.compress(quant_raw)
+    quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1188,17 +1128,16 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zstd: {quant_file_bytes} bytes "
+            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zstd: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    dctx = zstd.ZstdDecompressor()
-    quant_state = torch.load(io.BytesIO(dctx.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
