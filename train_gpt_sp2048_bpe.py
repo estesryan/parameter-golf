@@ -704,7 +704,7 @@ class GPT(nn.Module):
                         rope_base,
                         qk_gain_init,
                     )
-                    for _ in range((num_layers + 1) // 2)
+                    for _ in range(num_layers - 2)
                 ]
             )
         else:
@@ -744,10 +744,10 @@ class GPT(nn.Module):
 
         for i in range(self.num_encoder_layers):
             if self.hybrid_recurrence:
-                if i % 2 == 0:
-                    x = self.blocks[i // 2](x, x0)
-                else:
+                if i < 2:
                     x = self.shared_block(x, x0)
+                else:
+                    x = self.blocks[i - 2](x, x0)
             else:
                 x = self.blocks[i % self.num_unique_layers](x, x0)
             skips.append(x)
@@ -758,12 +758,7 @@ class GPT(nn.Module):
 
             logical_idx = self.num_encoder_layers + i
             if self.hybrid_recurrence:
-                if logical_idx == self.num_layers - 1:
-                    x = self.blocks[logical_idx // 2](x, x0)   # force last layer unique
-                elif logical_idx % 2 == 0:
-                    x = self.blocks[logical_idx // 2](x, x0)
-                else:
-                    x = self.shared_block(x, x0)
+                x = self.blocks[logical_idx - 2](x, x0)
             else:
                 block_idx = logical_idx % self.num_unique_layers
                 x = self.blocks[block_idx](x, x0)
