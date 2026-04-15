@@ -560,8 +560,10 @@ class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if self.training and self.qat_param_name and self.qat_enabled:
-            w = fake_quantize_weight_for_qat(self.qat_param_name, w)
+        if self.training and self.qat_param_name:
+            w_q = fake_quantize_weight_for_qat(self.qat_param_name, w)
+            qat_mask = self.qat_enabled.to(dtype=w.dtype)
+            w = w * (1.0 - qat_mask) + w_q * qat_mask
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
