@@ -68,7 +68,7 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
-    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.35))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.30))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 327_680))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -77,12 +77,12 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 2048))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 7))
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 0))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -328,8 +328,6 @@ INT8_PER_ROW_ZERO_DTYPE = torch.uint8
 # - large transformer matrices go int6
 MIXED_PRECISION_INT8_NAME_PATTERNS = (
     "tok_emb",
-    "attn.c_q",
-    "attn.proj",
 )
 
 INT6_QMAX = 31
@@ -570,11 +568,34 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def fake_quantize_weight_symmetric_per_row(w: Tensor, qmax: int) -> Tensor:
+    w32 = w.float()
+    if w32.ndim != 2:
+        clip_abs = w32.abs().amax().clamp_min(1.0 / qmax)
+        scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
+        q = torch.clamp(torch.round(w32 / scale), -qmax, qmax)
+        dq = q * scale
+        return w + (dq.to(dtype=w.dtype) - w).detach()
+
+    clip_abs = w32.abs().amax(dim=1).clamp_min(1.0 / qmax)
+    scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
+    q = torch.clamp(torch.round(w32 / scale[:, None]), -qmax, qmax)
+    dq = q * scale[:, None]
+    return w + (dq.to(dtype=w.dtype) - w).detach()
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__(in_features, out_features, bias=bias)
+        self.register_buffer("qat_enabled", torch.tensor(0.0))
+        self.qat_qmax = 31
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        w_q = fake_quantize_weight_symmetric_per_row(w, self.qat_qmax)
+        w = w + (w_q - w) * self.qat_enabled
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -917,6 +938,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    for name, module in base_model.named_modules():
+        if isinstance(module, CastedLinear):
+            if "attn.c_q" in name or "attn.proj" in name:
+                module.qat_qmax = 31
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1094,6 +1119,19 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if max_wallclock_ms is not None:
+            progress = (elapsed_ms / max_wallclock_ms - 0.88) / 0.12
+            alpha = max(0.0, min(progress, 1.0))
+        else:
+            alpha = 0.0
+
+        for name, module in base_model.named_modules():
+            if isinstance(module, CastedLinear):
+                if "attn.c_q" in name or "attn.proj" in name:
+                    module.qat_enabled.fill_(alpha)
+                else:
+                    module.qat_enabled.fill_(0.0)
+        
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
