@@ -4,7 +4,7 @@ Optimized GPT training script with 2048-vocab BPE tokenizer.
 Motivated by the P2-loss ablation study, which showed that uniform CE outperforms 
 hard-token reweighting — late layers do important global refinement and focal weighting 
 suppresses that signal. This pointed to data representation, as the bottleneck. 
-After testing unigram, BPE-1536, and BPE-2048, the 2048 BPE vocab was selected as 
+After testing unigram, and various BPE sizes, the 2048 BPE vocab was selected as 
 the best trade-off between compression and embedding table size under the parameter budget.
 
 Architecture additions over the naive baseline:
