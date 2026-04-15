@@ -61,6 +61,7 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 2048))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 0))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -651,6 +652,7 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
+        num_unique_layers: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -668,6 +670,13 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.num_layers = num_layers
+        self.num_unique_layers = num_unique_layers if num_unique_layers > 0 else num_layers
+        if not (1 <= self.num_unique_layers <= self.num_layers):
+            raise ValueError(
+                f"num_unique_layers must be in [1, {self.num_layers}], got {self.num_unique_layers}"
+            )
+
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -682,7 +691,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for _ in range(self.num_unique_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -706,14 +715,14 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i % self.num_unique_layers](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block_idx = (self.num_encoder_layers + i) % self.num_unique_layers
+            x = self.blocks[block_idx](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -829,6 +838,7 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_unique_layers=args.num_unique_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
