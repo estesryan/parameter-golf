@@ -718,7 +718,7 @@ class GPT(nn.Module):
                         rope_base,
                         qk_gain_init,
                     )
-                    for _ in range(self.num_unique_layers)
+                    for i in range(self.num_unique_layers)
                 ]
             )
         self.final_norm = RMSNorm()
