@@ -317,8 +317,9 @@ INT6_QMAX = 31
 INT8_QMAX = 127
 
 # GPTQ-lite style clip search: try a few clip percentiles and keep the lowest-MSE one.
-ROW_CLIP_QS = (0.999, 0.9995, 0.9999, 0.99999, 1.0)
-VECTOR_CLIP_Q = 0.9999
+ROW_CLIP_QS = (0.98, 0.99, 0.995, 0.999, 0.9995, 0.9999, 1.0)
+VECTOR_CLIP_Q = 0.999
+ROW_SHRINKS = (1.0, 0.995, 0.99, 0.98, 0.96, 0.94, 0.92)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -339,35 +340,55 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor, dict[st
     bits = 8 if use_int8 else 6
 
     if t32.ndim == 2:
-        # GPTQ-lite style clip search: try a few clip percentiles and keep the lowest-MSE result.
         if t32.numel() == 0:
             q = torch.empty_like(t32, dtype=torch.int8)
             s = torch.empty((t32.shape[0],), dtype=INT8_PER_ROW_SCALE_DTYPE)
-            meta = {"scheme": "per_row", "axis": 0, "bits": bits, "qmax": qmax, "clip_q": None}
+            meta = {
+                "scheme": "per_row",
+                "axis": 0,
+                "bits": bits,
+                "qmax": qmax,
+                "clip_q": None,
+                "shrink": None,
+            }
             return q, s, meta
 
         best_q = None
         best_scale = None
         best_err = None
         best_clip_q = None
+        best_shrink = None
+
+        abs_rows = t32.abs()
 
         for clip_q in ROW_CLIP_QS:
-            clip_abs = torch.quantile(t32.abs(), clip_q, dim=1)
-            clip_abs = clip_abs.clamp_min(1.0 / qmax)
-            clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-            scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
-            q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8)
+            base_clip_abs = torch.quantile(abs_rows, clip_q, dim=1)
+            base_clip_abs = base_clip_abs.clamp_min(1.0 / qmax)
 
-            recon = q.float() * scale[:, None]
-            err = (t32 - recon).pow(2).mean()
+            for shrink in ROW_SHRINKS:
+                clip_abs = (base_clip_abs * shrink).clamp_min(1.0 / qmax)
+                clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+                scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
+                q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8)
 
-            if best_err is None or err.item() < best_err:
-                best_q = q.contiguous()
-                best_scale = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-                best_err = err.item()
-                best_clip_q = clip_q
+                recon = q.float() * scale[:, None]
+                err = (t32 - recon).pow(2).mean()
 
-        meta = {"scheme": "per_row", "axis": 0, "bits": bits, "qmax": qmax, "clip_q": best_clip_q}
+                if best_err is None or err.item() < best_err:
+                    best_q = q.contiguous()
+                    best_scale = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+                    best_err = err.item()
+                    best_clip_q = clip_q
+                    best_shrink = shrink
+
+        meta = {
+            "scheme": "per_row",
+            "axis": 0,
+            "bits": bits,
+            "qmax": qmax,
+            "clip_q": best_clip_q,
+            "shrink": best_shrink,
+        }
         return best_q, best_scale, meta
 
     # Vectors / scalars: keep simple per-tensor quantization.
