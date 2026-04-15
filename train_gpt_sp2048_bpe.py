@@ -1,5 +1,23 @@
 """
-Optimized Naive baseline GPT training script.
+Optimized GPT training script with 2048-vocab BPE tokenizer.
+
+Motivated by the P2-loss ablation (train_gpt_p2_ablation.py), which showed
+that uniform CE outperforms hard-token reweighting — late layers do important
+global refinement and focal weighting suppresses that signal. This pointed to
+data representation, as the bottleneck. After testing unigram, BPE-1536, and BPE-2048, 
+the 2048 BPE vocab was selected as the best trade-off between compression and embedding 
+table size under the parameter budget.
+
+Architecture additions over the naive baseline:
+- U-Net skip connections: encoder outputs injected into decoder layers via
+  learned per-channel skip weights.
+- Learned per-channel residual mixing (resid_mix) blending x with x0 per block.
+- Per-head learned q_gain scalars and QK RMSNorm for attention stability.
+- Logit softcap (tanh, cap=30) before cross-entropy.
+- Mixed int6/int8 PTQ with per-row quantization and zstd (level 22) export.
+- Wall-clock-aware warmdown: LR decay is driven by elapsed time rather than
+  step count, eliminating the need to manually re-tune warmdown_iters between
+  experiments.
 """
 
 from __future__ import annotations
