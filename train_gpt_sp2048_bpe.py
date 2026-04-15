@@ -57,8 +57,6 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 2.0))
-    late_qat_frac = float(os.environ.get("LATE_QAT_FRAC", 0.15))
-    late_qat_start_scale = float(os.environ.get("LATE_QAT_START_SCALE", -1.0))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 2048))
@@ -74,7 +72,7 @@ class Hyperparameters:
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
-    head_lr = float(os.environ.get("HEAD_LR", 0.010))
+    head_lr = float(os.environ.get("HEAD_LR", 0.012))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
@@ -529,43 +527,11 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
-def fake_quantize_weight_for_qat(name: str, w: Tensor) -> Tensor:
-    w32 = w.float()
-
-    use_int8 = any(pattern in name for pattern in MIXED_PRECISION_INT8_NAME_PATTERNS)
-    qmax = INT8_QMAX if use_int8 else INT6_QMAX
-
-    if w32.ndim == 2:
-        clip_abs = torch.quantile(w32.abs(), INT_CLIP_Q, dim=1)
-        clip_abs = clip_abs.clamp_min(1.0 / qmax)
-        clipped = torch.maximum(torch.minimum(w32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax)
-        return (q - clipped.detach() / scale[:, None] + clipped / scale[:, None]) * scale[:, None]
-
-    clip_abs = torch.quantile(w32.abs().flatten(), INT_CLIP_Q) if w32.numel() else torch.tensor(0.0, device=w32.device)
-    clip_abs = clip_abs.clamp_min(1.0 / qmax)
-    clipped = torch.clamp(w32, -clip_abs, clip_abs)
-    scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
-    q = torch.clamp(torch.round(clipped / scale), -qmax, qmax)
-    return (q - clipped.detach() / scale + clipped / scale) * scale
-
-
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
-        super().__init__(in_features, out_features, bias=bias)
-        self.qat_param_name = ""
-        self.register_buffer("qat_enabled", torch.tensor(False, dtype=torch.bool), persistent=False)
-
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight
-        if self.training and self.qat_param_name:
-            w_q = fake_quantize_weight_for_qat(self.qat_param_name, w)
-            qat_mask = self.qat_enabled.to(dtype=w.dtype)
-            w = w * (1.0 - qat_mask) + w_q * qat_mask
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w.to(x.dtype), bias)
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -576,12 +542,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
-def set_late_qat_enabled(module: nn.Module, enabled: bool) -> None:
-    for submodule in module.modules():
-        if isinstance(submodule, CastedLinear):
-            submodule.qat_enabled.fill_(enabled)
-
-    
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -914,10 +874,6 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    for module_name, module in base_model.named_modules():
-        if isinstance(module, CastedLinear):
-            module.qat_param_name = f"{module_name}.weight"
-    set_late_qat_enabled(base_model, False)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1058,7 +1014,6 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    late_qat_prev = False
 
     step = 0
     while True:
@@ -1097,22 +1052,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-
-        late_qat_on = False
-        if max_wallclock_ms is not None and args.late_qat_frac > 0:
-            late_qat_start_ms = (1.0 - args.late_qat_frac) * max_wallclock_ms
-            late_qat_on = elapsed_ms >= late_qat_start_ms
-        if args.late_qat_start_scale >= 0.0:
-            late_qat_on = late_qat_on or (scale <= args.late_qat_start_scale)
-
-        set_late_qat_enabled(base_model, late_qat_on)
-        if late_qat_on and not late_qat_prev:
-            log0(
-                f"late_qat:on step:{step}/{args.iterations} "
-                f"train_time:{elapsed_ms:.0f}ms scale:{scale:.4f}"
-            )
-        late_qat_prev = late_qat_on
-
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
