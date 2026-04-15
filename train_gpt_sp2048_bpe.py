@@ -282,7 +282,7 @@ def eval_val(
 # -----------------------------
 #
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to mixed int6/int8 and compressing it.
+# Instead, we get approximately the same model (with a small hit) by quantizing the model to mixed int6/int8 and compressing it with zstd (level 22).
 # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
