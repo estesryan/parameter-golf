@@ -744,7 +744,7 @@ class GPT(nn.Module):
 
         for i in range(self.num_encoder_layers):
             if self.hybrid_recurrence:
-                if i < 1:
+                if i < 2:
                     x = self.shared_block(x, x0)
                 else:
                     x = self.blocks[i - 2](x, x0)
