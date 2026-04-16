@@ -55,19 +55,18 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 1000))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 20000))
+    iterations = int(os.environ.get("ITERATIONS", 100000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
-    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.30))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.32))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 327_680))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 294_912))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 2.0))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 2048))
-    num_layers = int(os.environ.get("NUM_LAYERS", 7))
-    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 0))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 5120))
+    num_layers = int(os.environ.get("NUM_LAYERS", 5))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -78,11 +77,11 @@ class Hyperparameters:
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
-    head_lr = float(os.environ.get("HEAD_LR", 0.012))
+    head_lr = float(os.environ.get("HEAD_LR", 0.010))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.35))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.35))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -701,7 +700,6 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
-        num_unique_layers: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -720,12 +718,6 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_layers = num_layers
-        self.num_unique_layers = num_unique_layers if num_unique_layers > 0 else num_layers
-        if not (1 <= self.num_unique_layers <= self.num_layers):
-            raise ValueError(
-                f"num_unique_layers must be in [1, {self.num_layers}], got {self.num_unique_layers}"
-            )
-
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -740,7 +732,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for _ in range(self.num_unique_layers)
+                for _ in range(self.num_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -765,13 +757,12 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i % self.num_unique_layers](x, x0)
+            x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            block_idx = (self.num_encoder_layers + i) % self.num_unique_layers
-            x = self.blocks[block_idx](x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -887,7 +878,6 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
-        num_unique_layers=args.num_unique_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -1165,6 +1155,16 @@ def main() -> None:
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
     quant_obj, quant_stats = quantize_state_dict_mixed(base_model.state_dict())
+    # Per-tensor quantization error diagnostic
+    if master_process:
+        orig_sd = base_model.state_dict()
+        dequant_sd = dequantize_state_dict_mixed(quant_obj)
+        for name in orig_sd:
+            if orig_sd[name].is_floating_point():
+                orig = orig_sd[name].float()
+                dequant = dequant_sd[name].float()
+                err = (orig - dequant).abs().mean()
+                log0(f"quant_err {name}: {err:.6f}")
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
