@@ -1,22 +1,24 @@
 """
-Optimized GPT training script with 2048-vocab BPE tokenizer.
+GPT training script using a 5120-vocab BPE tokenizer.
 
-Motivated by the P2-loss ablation study, which showed that uniform CE outperforms 
-hard-token reweighting — late layers do important global refinement and focal weighting 
-suppresses that signal. This pointed to data representation, as the bottleneck. 
-After testing unigram, and various BPE sizes, the 2048 BPE vocab was selected as 
-the best trade-off between compression and embedding table size under the parameter budget.
+Tokenizer choice is driven by empirical evaluation across 1024–8096 vocab sizes.
 
-Architecture additions over the naive baseline:
-- U-Net skip connections: encoder outputs injected into decoder layers via
-  learned per-channel skip weights.
-- Learned per-channel residual mixing (resid_mix) blending x with x0 per block.
-- Per-head learned q_gain scalars and QK RMSNorm for attention stability.
-- Logit softcap (tanh, cap=30) before cross-entropy.
-- Mixed int6/int8 PTQ with per-row quantization and zstd (level 22) export.
-- Wall-clock-aware warmdown: LR decay is driven by elapsed time rather than
-  step count, eliminating the need to manually re-tune warmdown_iters between
-  experiments.
+SentencePiece logs indicated a significant fraction of long sequences being
+excluded at lower max_sentence_length settings. Increasing this threshold
+improves corpus coverage and, when paired with appropriate sequence length
+during training, yields modest additional gains.
+
+Architecture additions over the baseline:
+- Untied input/output embeddings (separate tok_emb and lm_head weights) by default;
+  tied mode available via TIE_EMBEDDINGS=1
+- U-Net-style skip connections between early and late layers
+- Learned residual mixing (resid_mix) per block
+- Per-head q_gain scaling with QK RMSNorm
+- Logit soft-capping prior to cross-entropy
+- Muon optimizer for matrix-shaped parameters; Adam for embeddings and scalars
+- Mixed int6/int8 post-training quantization with zstd compression
+- Wall-clock-based learning rate warmdown
+
 """
 
 from __future__ import annotations
@@ -45,11 +47,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -333,7 +330,7 @@ MIXED_PRECISION_INT8_NAME_PATTERNS = (
 INT6_QMAX = 31
 INT8_QMAX = 127
 # Base clipping for PTQ.
-INT_CLIP_PERCENTILE = 99.99984
+INT_CLIP_PERCENTILE = 99.9990
 INT_CLIP_Q = INT_CLIP_PERCENTILE / 100.0
 
 def tensor_nbytes(t: Tensor) -> int:
@@ -917,7 +914,7 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
+    # - token embedding (Adam) uses EMBED_LR (untied) or TIED_EMBED_LR (tied)
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
@@ -970,7 +967,8 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    attn_mode = "gqa" if args.num_kv_heads != args.num_heads else "mha"
+    log0(f"attention_mode:{attn_mode} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1155,11 +1153,10 @@ def main() -> None:
                 f"layer:{i} mlp_scale_mean:{block.mlp_scale.mean().item():.6f} "
                 f"mlp_scale_std:{block.mlp_scale.std().item():.6f}"
             )
-            if block.attn is not None:
-                log0(
-                    f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
-                    f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
-                )
+            log0(
+                f"layer:{i} q_gain_mean:{block.attn.q_gain.mean().item():.6f} "
+                f"q_gain_std:{block.attn.q_gain.std().item():.6f}"
+            )
                 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
