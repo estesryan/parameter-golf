@@ -3,7 +3,7 @@
     {
       "name": "sp_bpe_6144",
       "dataset_suffix": "sp6144",
-      "vocab_size": 5120,
+      "vocab_size": 6144,
       "trainer_overrides": {
         "model_type": "bpe",
         "input_sentence_size": 1000000,
