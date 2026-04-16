@@ -1161,7 +1161,7 @@ def main() -> None:
         dequant_sd = dequantize_state_dict_mixed(quant_obj)
         for name in orig_sd:
             if orig_sd[name].is_floating_point():
-                orig = orig_sd[name].float()
+                orig = orig_sd[name].float().cpu()
                 dequant = dequant_sd[name].float()
                 err = (orig - dequant).abs().mean()
                 log0(f"quant_err {name}: {err:.6f}")
