@@ -55,7 +55,7 @@ class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp2048")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
-    max_train_shards = int(os.environ.get("MAX_TRAIN_SHARDS", 0))
+    max_train_shards = int(os.environ.get("MAX_TRAIN_SHARDS", 0)) # 0 = use all available shards (no limit/no wraps)
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_2048_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
@@ -356,7 +356,7 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
     bits = 8 if use_int8 else 6
 
     if t32.ndim == 2:
-        if name == "lm_head.weight":
+        if name in ("lm_head.weight", "tok_emb.weight"):
             row_min = t32.amin(dim=1)
             row_max = t32.amax(dim=1)
             scale = ((row_max - row_min) / 255.0).clamp_min(1e-8)
