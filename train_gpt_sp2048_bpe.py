@@ -1,14 +1,6 @@
 """
 GPT training script using a 5120-vocab BPE tokenizer.
 
-Tokenizer choice is driven by empirical evaluation across 1024–8096 vocab sizes.
-
-SentencePiece logs indicated a significant fraction of long sequences being
-excluded at lower max_sentence_length settings. Increasing this threshold
-improves corpus coverage and, when paired with appropriate sequence length
-during training, yields modest additional gains.
-
-Architecture additions over the baseline:
 - Untied input/output embeddings (separate tok_emb and lm_head weights) by default;
   tied mode available via TIE_EMBEDDINGS=1
 - U-Net-style skip connections between early and late layers
