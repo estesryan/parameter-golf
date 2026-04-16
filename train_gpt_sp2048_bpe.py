@@ -315,7 +315,7 @@ INT8_PER_ROW_ZERO_DTYPE = torch.uint8
 # - embeddings / output head stay int8
 # - large transformer matrices go int6
 MIXED_PRECISION_INT8_NAME_PATTERNS = (
-    "tok_emb",
+    # "tok_emb",
 )
 
 INT6_QMAX = 31
