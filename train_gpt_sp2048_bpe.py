@@ -55,7 +55,6 @@ class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp2048")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
-    max_train_shards = int(os.environ.get("MAX_TRAIN_SHARDS", 0)) # 0 = use all available shards (no limit/no wraps)
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_2048_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
@@ -507,34 +506,22 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class TokenStream:
-    def __init__(self, pattern: str, max_shards: int = 0):
-        files = [Path(p) for p in sorted(glob.glob(pattern))]
-        if max_shards > 0:
-            files = files[:max_shards]
-        self.files = files
+    # Reads shards sequentially and wraps around forever. The training loop therefore
+    # has deterministic, simple streaming behavior with no sampling or workers.
+    def __init__(self, pattern: str):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
-            raise FileNotFoundError(
-                f"No files found for pattern: {pattern} with max_shards={max_shards}"
-            )
+            raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
-        self.wrap_count = 0
-        self.total_tokens_taken = 0
-        self.shard_advances = 0
 
     def _advance_file(self) -> None:
-        next_idx = self.file_idx + 1
-        self.shard_advances += 1
-        if next_idx >= len(self.files):
-            self.wrap_count += 1
-            next_idx = 0
-        self.file_idx = next_idx
+        self.file_idx = (self.file_idx + 1) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
     def take(self, n: int) -> Tensor:
-        self.total_tokens_taken += n
         chunks: list[Tensor] = []
         remaining = n
         while remaining > 0:
@@ -550,18 +537,11 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    def __init__(
-        self,
-        pattern: str,
-        rank: int,
-        world_size: int,
-        device: torch.device,
-        max_shards: int = 0,
-    ):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern, max_shards=max_shards)
+        self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -908,15 +888,7 @@ def main() -> None:
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    effective_train_files = (
-        actual_train_files if args.max_train_shards <= 0
-        else min(actual_train_files, args.max_train_shards)
-    )
-    log0(
-        f"train_loader:dataset:{dataset_dir.name} "
-        f"train_shards_available:{actual_train_files} "
-        f"train_shards_used:{effective_train_files}"
-    )
+    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
@@ -1015,13 +987,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(
-        args.train_files,
-        rank,
-        world_size,
-        device,
-        max_shards=args.max_train_shards,
-    )
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1077,13 +1043,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(
-            args.train_files,
-            rank,
-            world_size,
-            device,
-            max_shards=args.max_train_shards,
-        )
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1184,12 +1144,6 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    log0(
-        f"train_stream: wraps:{train_loader.stream.wrap_count} "
-        f"shard_advances:{train_loader.stream.shard_advances} "
-        f"total_tokens_taken:{train_loader.stream.total_tokens_taken} "
-        f"current_shard_idx:{train_loader.stream.file_idx + 1}/{len(train_loader.stream.files)}"
-    )
     if master_process:
         log0("=== CONTROL TENSORS ===")
         for i, block in enumerate(base_model.blocks):
