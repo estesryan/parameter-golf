@@ -306,26 +306,11 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_MAX_NUMEL = 200_000
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
-INT8_PER_ROW_SCALE_DTYPE = torch.float32
-
-# Mixed quantization:
-# - tok_emb uses asymmetric uint8 per-row
-# - selected large weights use symmetric int8 per-row
-# - other large 2D weights use symmetric int6 per-row
-# - non-2D tensors use symmetric per-tensor quant
-INT6_QMAX = 31
-INT8_QMAX = 127
-
-INT_CLIP_PERCENTILE = 99.9
-INT_CLIP_Q = INT_CLIP_PERCENTILE / 100.0
-
-CLIP_BY_NAME = {
-    "attn.proj.weight": 0.99999,
-    "mlp.fc.weight": 0.9995,
-    "mlp.proj.weight": 0.9995,
-}
+INT8_PER_ROW_SCALE_DTYPE = torch.float16
+INT8_CLIP_PERCENTILE = 99.99984
+INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -338,116 +323,27 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[str, Tensor], dict[str, object]]:
+
+def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
-
-    if name == "tok_emb.weight":
-        # asymmetric uint8 per-row for embeddings only
-        row_min = t32.amin(dim=1)
-        row_max = t32.amax(dim=1)
-        scale = ((row_max - row_min) / 255.0).clamp_min(1e-8)
-        zero = torch.clamp(torch.round(-row_min / scale), 0, 255).to(torch.uint8)
-
-        q = torch.clamp(
-            torch.round(t32 / scale[:, None]) + zero[:, None].to(torch.float32),
-            0, 255
-        ).to(torch.uint8).contiguous()
-
-        meta = {"scheme": "per_row_affine_uint8"}
-        return q, {"scale": scale.to(torch.float16), "zero": zero}, meta
-
-    use_int8 = any(k in name for k in (
-        "lm_head.weight",
-        "attn.c_q.weight",
-        "attn.c_k.weight",
-        "attn.c_v.weight",
-    ))
-    qmax = INT8_QMAX if use_int8 else INT6_QMAX
-    bits = 8 if use_int8 else 6
-
     if t32.ndim == 2:
-
-        # RMS-based scaling for problematic int6 tensors
-        use_rms_row_int6 = (
-            (not use_int8) and any(k in name for k in (
-                "attn.proj.weight",
-                "mlp.fc.weight",
-                "mlp.proj.weight",
-            ))
-        )
-
-        if use_rms_row_int6:
-            rms = torch.sqrt(torch.mean(t32 * t32, dim=1) + 1e-8)
-
-            K = 2.7  # critical constant
-
-            scale = (K * rms / float(qmax)).clamp_min(1e-8)
-
-            clipped = torch.clamp(
-                t32,
-                -qmax * scale[:, None],
-                qmax * scale[:, None],
-            )
-
-            xq = clipped / scale[:, None]
-
-            # reduce entropy
-            xq = torch.round(xq * 2.0) / 2.0   # 0.5 step grid
-
-            q = torch.clamp(
-                torch.round(xq),
-                -qmax, qmax
-            ).to(torch.int8).contiguous()
-
-            meta = {"scheme": "per_row"}
-            return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), meta
-        
-        # existing per-row path for everything else
-        clip_q = INT_CLIP_Q
-        best_match_len = -1
-        for k, v in CLIP_BY_NAME.items():
-            if k in name and len(k) > best_match_len:
-                clip_q = v
-                best_match_len = len(k)
-
         clip_abs = (
-            torch.quantile(t32.abs(), clip_q, dim=1)
+            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
             if t32.numel()
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-        clip_abs = clip_abs.clamp_min(1.0 / qmax)
-
-        clipped = torch.maximum(
-            torch.minimum(t32, clip_abs[:, None]),
-            -clip_abs[:, None]
-        )
-
-        scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
-
-        q = torch.clamp(
-            torch.round(clipped / scale[:, None]),
-            -qmax, qmax
-        ).to(torch.int8).contiguous()
-
-        meta = {"scheme": "per_row"}
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), meta
-
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT_CLIP_Q).item()) if t32.numel() else 0.0
-    clip_abs = max(clip_abs, 1.0 / qmax)
-    scale = torch.tensor(clip_abs / float(qmax), dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
-    meta = {"scheme": "per_tensor"}
-    return q, scale, meta
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    return q, scale
 
 
 def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - mixed int6/int8 for large float tensors
-    # - per-row quantization for 2D tensors
-    # - per-tensor quantization for other tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -471,8 +367,6 @@ def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
@@ -480,67 +374,16 @@ def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s, meta = quantize_float_tensor(name, t)
-
-        qmeta[name] = meta  # ← MOVE HERE FIRST
-
-        if isinstance(s, torch.Tensor) and meta.get("scheme") == "per_row":
-            s_min = s.min()
-            s_max = s.max()
-            s_scale = (s_max - s_min) / 255.0 + 1e-8
-
-            s_q = torch.clamp(
-                torch.round((s - s_min) / s_scale),
-                0, 255
-            ).to(torch.uint8)
-
-            # mild entropy reduction (NOT destructive)
-            s_q = (s_q >> 2) << 2
-
-            qmeta[name]["scale_min"] = float(s_min)
-            qmeta[name]["scale_scale"] = float(s_scale)
-
-            s = s_q
-        qmeta[name]["shape"] = list(q.shape)
-        is_int6 = (q.dtype == torch.int8) and (not any(k in name for k in (
-            "lm_head.weight",
-            "attn.c_q.weight",
-            "attn.c_k.weight",
-            "attn.c_v.weight",
-        )))
-        if is_int6:
-            # shift to unsigned [0, 63]
-            q6 = (q + 31).to(torch.uint8)
-
-            # pack 4 values → 3 bytes
-            pad = (-q6.numel()) % 4
-            if pad:
-                q6 = torch.cat([q6.view(-1), torch.zeros(pad, dtype=torch.uint8)]).view(-1, 4)
-            else:
-                q6 = q6.view(-1, 4)
-            packed = torch.zeros(q6.size(0), 3, dtype=torch.uint8)
-
-            packed[:, 0] = (q6[:, 0] << 2) | (q6[:, 1] >> 4)
-            packed[:, 1] = ((q6[:, 1] & 0xF) << 4) | (q6[:, 2] >> 2)
-            packed[:, 2] = ((q6[:, 2] & 0x3) << 6) | q6[:, 3]
-
-            quantized[name] = packed.view(-1)
-            qmeta[name]["packed"] = True
-        else:
-            quantized[name] = q
+        q, s = quantize_float_tensor(t)
+        if s.ndim > 0:
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
-
-        stored_q = quantized[name]
-        if isinstance(s, dict):
-            stats["int8_payload_bytes"] += tensor_nbytes(stored_q)
-            for v in s.values():
-                stats["int8_payload_bytes"] += tensor_nbytes(v)
-        else:
-            stats["int8_payload_bytes"] += tensor_nbytes(stored_q) + tensor_nbytes(s)
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "mixed_int6_int8_per_row_v1",
+        "__quant_format__": "int8_clean_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -552,6 +395,7 @@ def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
+
 def dequantize_state_dict_mixed(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
@@ -560,32 +404,9 @@ def dequantize_state_dict_mixed(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        meta = qmeta.get(name, {})
-        if meta.get("packed", False):
-            shape = meta["shape"]
-
-            q_flat = q.view(-1, 3)
-
-            unpack = torch.empty(q_flat.size(0), 4, dtype=torch.uint8)
-
-            unpack[:, 0] = q_flat[:, 0] >> 2
-            unpack[:, 1] = ((q_flat[:, 0] & 0x3) << 4) | (q_flat[:, 1] >> 4)
-            unpack[:, 2] = ((q_flat[:, 1] & 0xF) << 2) | (q_flat[:, 2] >> 6)
-            unpack[:, 3] = q_flat[:, 2] & 0x3F
-
-            q = (unpack.view(-1) - 31).to(torch.int8)
-            q = q.view(shape)
-        if meta.get("scheme") == "per_row_affine_uint8":
-            scale = s["scale"].to(dtype=torch.float32)
-            zero = s["zero"].to(dtype=torch.float32)
-            out[name] = ((q.to(torch.float32) - zero[:, None]) * scale[:, None]).to(dtype=dtype).contiguous()
-        elif meta.get("scheme") == "per_row":
-            if s.dtype == torch.uint8:
-                s_min = meta["scale_min"]
-                s_scale = meta["scale_scale"]
-                s = s.float() * s_scale + s_min
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            out[name] = (q.float() * s.view(q.shape[0], 1)).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
