@@ -355,9 +355,6 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
         "attn.c_q.weight",
         "attn.c_k.weight",
         "attn.c_v.weight",
-        "attn.proj.weight",
-        "mlp.fc.weight",
-        "mlp.proj.weight",
     ))
     qmax = INT8_QMAX if use_int8 else INT6_QMAX
     bits = 8 if use_int8 else 6
