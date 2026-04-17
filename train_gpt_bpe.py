@@ -309,10 +309,12 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_PER_ROW_ZERO_DTYPE = torch.uint8
 
 # Mixed quantization:
-# - all other large transformer matrices use symmetric int6 per-row
+# - tok_emb uses asymmetric uint8 per-row
+# - selected large weights use symmetric int8 per-row
+# - other large 2D weights use symmetric int6 per-row
+# - non-2D tensors use symmetric per-tensor quant
 INT6_QMAX = 31
 INT8_QMAX = 127
 
@@ -345,7 +347,7 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
             0, 255
         ).to(torch.uint8).contiguous()
 
-        meta = {"scheme": "per_row_affine_uint8", "axis": 0}
+        meta = {"scheme": "per_row_affine_uint8"}
         return q, {"scale": scale.to(torch.float16), "zero": zero}, meta
 
     use_int8 = any(k in name for k in (
@@ -361,8 +363,7 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
     bits = 8 if use_int8 else 6
 
     if t32.ndim == 2:
-
-        # --- per-row symmetric quant for ALL matrices (attn + mlp) ---
+        # --- per-row symmetric quant for generic 2D weights ---
         clip_abs = (
             torch.quantile(t32.abs(), INT_CLIP_Q, dim=1)
             if t32.numel()
@@ -383,14 +384,14 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
             -qmax, qmax
         ).to(torch.int8).contiguous()
 
-        meta = {"scheme": "per_row", "axis": 0, "bits": bits, "qmax": qmax, "clip_q": INT_CLIP_Q}
+        meta = {"scheme": "per_row"}
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), meta
 
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT_CLIP_Q).item()) if t32.numel() else 0.0
     clip_abs = max(clip_abs, 1.0 / qmax)
     scale = torch.tensor(clip_abs / float(qmax), dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
-    meta = {"scheme": "per_tensor", "bits": bits, "qmax": qmax, "clip_q": INT_CLIP_Q}
+    meta = {"scheme": "per_tensor"}
     return q, scale, meta
 
 
@@ -473,14 +474,7 @@ def dequantize_state_dict_mixed(obj: dict[str, object]) -> dict[str, Tensor]:
             scale = s["scale"].to(dtype=torch.float32)
             zero = s["zero"].to(dtype=torch.float32)
             out[name] = ((q.to(torch.float32) - zero[:, None]) * scale[:, None]).to(dtype=dtype).contiguous()
-        elif meta.get("scheme") == "per_col_affine_uint8":
-            scale = s["scale"].to(dtype=torch.float32)
-            zero = s["zero"].to(dtype=torch.float32)
-            out[name] = ((q.to(torch.float32) - zero[None, :]) * scale[None, :]).to(dtype=dtype).contiguous()
         elif meta.get("scheme") == "per_row":
-            s = s.to(dtype=torch.float32)
-            out[name] = (q.float() * s.view(q.shape[0], 1)).to(dtype=dtype).contiguous()
-        elif meta.get("scheme") == "per_row_symmetric_int8":
             s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], 1)).to(dtype=dtype).contiguous()
         else:
