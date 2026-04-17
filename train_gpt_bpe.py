@@ -323,10 +323,7 @@ INT8_EXACT_NAMES = {
     "lm_head.weight",
 }
 
-INT8_PREFIXES = (
-    "blocks.6.",
-    "blocks.7.",
-)
+INT8_PREFIXES = ()
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
