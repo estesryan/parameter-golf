@@ -4,6 +4,8 @@ This script is standalone. It does not import any local exporter or tokenizer
 helpers. Tokenizer configs are JSON only and currently support the built-in
 pure-byte and SentencePiece tokenizer definitions in `data/tokenizer_specs.json`.
 
+APPEND_EOS = True # explicit end-of-document tokens help the model handle boundaries in long sequences
+
 Command:
 
 PYTHONUNBUFFERED=1 python3 data/download_hf_docs_and_tokenize_ext.py \
@@ -34,7 +36,7 @@ SIDECAR_FILENAME = "docs_selected.source_manifest.json"
 VERSION = "10B"
 NUM_VAL_DOCS = 50_000
 SHARD_SIZE = 10**8
-APPEND_EOS = False
+APPEND_EOS = True # key innovation: explicit end-of-document tokens help the model handle boundaries in long sequences
 DATAFILE_MAGIC = 20240520
 DATAFILE_VERSION = 1
 DEFAULT_REPO_ID = os.environ.get("MATCHED_FINEWEB_REPO_ID", "willdepueoai/parameter-golf")
