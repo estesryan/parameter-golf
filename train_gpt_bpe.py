@@ -312,8 +312,8 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_PER_ROW_ZERO_DTYPE = torch.uint8
 
 # Mixed quantization:
-# - lm_head uses asymmetric int8 per-row
-# - all other large matrices including tok_emb use symmetric int6 per-row
+# - tok_emb and lm_head use asymmetric int8 per-row (embeddings have asymmetric distributions)
+# - all other large transformer matrices use symmetric int6 per-row
 INT6_QMAX = 31
 INT8_QMAX = 127
 # Base clipping for PTQ.
@@ -334,8 +334,9 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[str, Tensor], dict[str, object]]:
     t32 = t.float()
 
-    # lm_head uses asymmetric int8, everything else uses symmetric int6
-    use_int8 = name == "lm_head.weight"
+    # tok_emb and lm_head use asymmetric int8 -- embeddings have asymmetric distributions
+    # that symmetric int6 clips badly. All transformer weights use symmetric int6.
+    use_int8 = name in ("lm_head.weight", "tok_emb.weight")
     qmax = INT8_QMAX if use_int8 else INT6_QMAX
     bits = 8 if use_int8 else 6
 
