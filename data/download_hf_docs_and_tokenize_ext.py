@@ -4,8 +4,6 @@ This script is standalone. It does not import any local exporter or tokenizer
 helpers. Tokenizer configs are JSON only and currently support the built-in
 pure-byte and SentencePiece tokenizer definitions in `data/tokenizer_specs.json`.
 
-APPEND_EOS = True # explicit end-of-document tokens help the model handle boundaries in long sequences
-
 Command:
 
 PYTHONUNBUFFERED=1 python3 data/download_hf_docs_and_tokenize_ext.py \
