@@ -312,7 +312,6 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_PER_ROW_ZERO_DTYPE = torch.uint8
 
 # Mixed quantization:
-# - tok_emb and lm_head use asymmetric int8 per-row (embeddings have asymmetric distributions)
 # - all other large transformer matrices use symmetric int6 per-row
 INT6_QMAX = 31
 INT8_QMAX = 127
@@ -334,9 +333,23 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[str, Tensor], dict[str, object]]:
     t32 = t.float()
 
+    if name == "tok_emb.weight":
+        # asymmetric uint8 per-row for embeddings only
+        row_min = t32.amin(dim=1)
+        row_max = t32.amax(dim=1)
+        scale = ((row_max - row_min) / 255.0).clamp_min(1e-8)
+        zero = torch.clamp(torch.round(-row_min / scale), 0, 255).to(torch.uint8)
+
+        q = torch.clamp(
+            torch.round(t32 / scale[:, None]) + zero[:, None].to(torch.float32),
+            0, 255
+        ).to(torch.uint8).contiguous()
+
+        meta = {"scheme": "per_row_affine_uint8", "axis": 0}
+        return q, {"scale": scale.to(torch.float16), "zero": zero}, meta
+
     use_int8 = any(k in name for k in (
         "lm_head.weight",
-        "tok_emb.weight",
         "attn.c_q.weight",
         "attn.c_k.weight",
         "attn.c_v.weight",
