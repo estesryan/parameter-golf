@@ -308,7 +308,7 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 )
 INT8_KEEP_FLOAT_MAX_NUMEL = 200_000
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
-INT8_PER_ROW_SCALE_DTYPE = torch.float16
+INT8_PER_ROW_SCALE_DTYPE = torch.float32
 
 # Mixed quantization:
 # - tok_emb uses asymmetric uint8 per-row
@@ -481,14 +481,31 @@ def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
 
         stats["num_float_tensors"] += 1
         q, s, meta = quantize_float_tensor(name, t)
+
+        qmeta[name] = meta  # ← MOVE HERE FIRST
+
+        if isinstance(s, torch.Tensor) and meta.get("scheme") == "per_row":
+            s_min = s.min()
+            s_max = s.max()
+            s_scale = (s_max - s_min) / 255.0 + 1e-8
+
+            # reduce entropy HARD
+            s_q = torch.clamp(
+                torch.round((s - s_min) / s_scale / 4.0) * 4.0,
+                0, 255
+            ).to(torch.uint8)
+
+            qmeta[name]["scale_min"] = float(s_min)
+            qmeta[name]["scale_scale"] = float(s_scale)
+
+            s = s_q
+        qmeta[name]["shape"] = list(q.shape)
         is_int6 = (q.dtype == torch.int8) and (not any(k in name for k in (
             "lm_head.weight",
             "attn.c_q.weight",
             "attn.c_k.weight",
             "attn.c_v.weight",
         )))
-        qmeta[name] = meta
-        qmeta[name]["shape"] = list(q.shape)
         if is_int6:
             # shift to unsigned [0, 63]
             q6 = (q + 31).to(torch.uint8)
@@ -512,12 +529,13 @@ def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
 
+        stored_q = quantized[name]
         if isinstance(s, dict):
-            stats["int8_payload_bytes"] += tensor_nbytes(q)
+            stats["int8_payload_bytes"] += tensor_nbytes(stored_q)
             for v in s.values():
                 stats["int8_payload_bytes"] += tensor_nbytes(v)
         else:
-            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+            stats["int8_payload_bytes"] += tensor_nbytes(stored_q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
         "__quant_format__": "mixed_int6_int8_per_row_v1",
@@ -560,6 +578,10 @@ def dequantize_state_dict_mixed(obj: dict[str, object]) -> dict[str, Tensor]:
             zero = s["zero"].to(dtype=torch.float32)
             out[name] = ((q.to(torch.float32) - zero[:, None]) * scale[:, None]).to(dtype=dtype).contiguous()
         elif meta.get("scheme") == "per_row":
+            if s.dtype == torch.uint8:
+                s_min = meta["scale_min"]
+                s_scale = meta["scale_scale"]
+                s = s.float() * s_scale + s_min
             s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], 1)).to(dtype=dtype).contiguous()
         else:
