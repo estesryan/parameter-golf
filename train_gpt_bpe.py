@@ -318,9 +318,14 @@ INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 GPTQ_LITE_PERCENTILES = [0.99, 0.995, 0.999, 0.9995, 0.9999, 0.99999, 1.0]
 
-INT8_NAMES = (
+INT8_EXACT_NAMES = {
     "tok_emb.weight",
     "lm_head.weight",
+}
+
+INT8_PREFIXES = (
+    "blocks.6.",
+    "blocks.7.",
 )
 
 def tensor_nbytes(t: Tensor) -> int:
@@ -354,7 +359,7 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 
 def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
-    use_int8 = any(k in name for k in INT8_NAMES)
+    use_int8 = (name in INT8_EXACT_NAMES) or any(name.startswith(prefix) for prefix in INT8_PREFIXES)
     qmax = INT8_QMAX if use_int8 else INT6_QMAX
 
     if t32.ndim == 2:
