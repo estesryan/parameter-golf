@@ -389,8 +389,13 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
                 qmax * scale[:, None],
             )
 
+            xq = clipped / scale[:, None]
+
+            # reduce entropy
+            xq = torch.round(xq * 2.0) / 2.0   # 0.5 step grid
+
             q = torch.clamp(
-                torch.round(clipped / scale[:, None]),
+                torch.round(xq),
                 -qmax, qmax
             ).to(torch.int8).contiguous()
 
