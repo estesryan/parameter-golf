@@ -321,6 +321,12 @@ INT8_QMAX = 127
 INT_CLIP_PERCENTILE = 99.9
 INT_CLIP_Q = INT_CLIP_PERCENTILE / 100.0
 
+CLIP_BY_NAME = {
+    "attn.proj.weight": 0.99999,
+    "mlp.fc.weight": 0.9995,
+    "mlp.proj.weight": 0.9995,
+}
+
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
@@ -361,7 +367,13 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
 
     if t32.ndim == 2:
         # --- per-row symmetric quant for generic 2D weights ---
-        clip_q = 0.99999 if "attn.proj.weight" in name else INT_CLIP_Q
+        clip_q = INT_CLIP_Q
+        best_match_len = -1
+        for k, v in CLIP_BY_NAME.items():
+            if k in name and len(k) > best_match_len:
+                clip_q = v
+                best_match_len = len(k)
+
         clip_abs = (
             torch.quantile(t32.abs(), clip_q, dim=1)
             if t32.numel()
