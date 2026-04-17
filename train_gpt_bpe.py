@@ -324,7 +324,7 @@ INT8_EXACT_NAMES = {
 }
 
 INT8_PREFIXES = (
-    "blocks.6.",
+    # "blocks.6.",
     "blocks.7.",
 )
 
