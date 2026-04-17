@@ -481,8 +481,34 @@ def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
 
         stats["num_float_tensors"] += 1
         q, s, meta = quantize_float_tensor(name, t)
+        is_int6 = (q.dtype == torch.int8) and (not any(k in name for k in (
+            "lm_head.weight",
+            "attn.c_q.weight",
+            "attn.c_k.weight",
+            "attn.c_v.weight",
+        )))
         qmeta[name] = meta
-        quantized[name] = q
+        qmeta[name]["shape"] = list(q.shape)
+        if is_int6:
+            # shift to unsigned [0, 63]
+            q6 = (q + 31).to(torch.uint8)
+
+            # pack 4 values → 3 bytes
+            pad = (-q6.numel()) % 4
+            if pad:
+                q6 = torch.cat([q6.view(-1), torch.zeros(pad, dtype=torch.uint8)]).view(-1, 4)
+            else:
+                q6 = q6.view(-1, 4)
+            packed = torch.zeros(q6.size(0), 3, dtype=torch.uint8)
+
+            packed[:, 0] = (q6[:, 0] << 2) | (q6[:, 1] >> 4)
+            packed[:, 1] = ((q6[:, 1] & 0xF) << 4) | (q6[:, 2] >> 2)
+            packed[:, 2] = ((q6[:, 2] & 0x3) << 6) | q6[:, 3]
+
+            quantized[name] = packed.view(-1)
+            qmeta[name]["packed"] = True
+        else:
+            quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
 
@@ -515,7 +541,20 @@ def dequantize_state_dict_mixed(obj: dict[str, object]) -> dict[str, Tensor]:
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
         meta = qmeta.get(name, {})
+        if meta.get("packed", False):
+            shape = meta["shape"]
 
+            q_flat = q.view(-1, 3)
+
+            unpack = torch.empty(q_flat.size(0), 4, dtype=torch.uint8)
+
+            unpack[:, 0] = q_flat[:, 0] >> 2
+            unpack[:, 1] = ((q_flat[:, 0] & 0x3) << 4) | (q_flat[:, 1] >> 4)
+            unpack[:, 2] = ((q_flat[:, 1] & 0xF) << 2) | (q_flat[:, 2] >> 6)
+            unpack[:, 3] = q_flat[:, 2] & 0x3F
+
+            q = (unpack.view(-1) - 31).to(torch.int8)
+            q = q.view(shape)
         if meta.get("scheme") == "per_row_affine_uint8":
             scale = s["scale"].to(dtype=torch.float32)
             zero = s["zero"].to(dtype=torch.float32)
