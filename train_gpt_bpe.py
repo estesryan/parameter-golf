@@ -316,7 +316,10 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
 GPTQ_LITE_PERCENTILES = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
 
-INT8_NAMES = ()  # all weights use int6 with GPTQ-lite optimal clip search
+INT8_NAMES = (
+    "tok_emb.weight",
+    "lm_head.weight",
+)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
