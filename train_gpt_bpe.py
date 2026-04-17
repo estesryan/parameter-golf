@@ -489,11 +489,13 @@ def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
             s_max = s.max()
             s_scale = (s_max - s_min) / 255.0 + 1e-8
 
-            # reduce entropy HARD
             s_q = torch.clamp(
-                torch.round((s - s_min) / s_scale / 4.0) * 4.0,
+                torch.round((s - s_min) / s_scale),
                 0, 255
             ).to(torch.uint8)
+
+            # mild entropy reduction (NOT destructive)
+            s_q = (s_q >> 2) << 2
 
             qmeta[name]["scale_min"] = float(s_min)
             qmeta[name]["scale_scale"] = float(s_scale)
