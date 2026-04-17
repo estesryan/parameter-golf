@@ -320,7 +320,6 @@ INT8_NAMES = (
     "attn.c_q.weight",
     "attn.c_k.weight",
     "attn.c_v.weight",
-    "mlp.proj.weight",
 )
 
 def tensor_nbytes(t: Tensor) -> int:
