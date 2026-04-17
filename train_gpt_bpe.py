@@ -316,10 +316,8 @@ INT6_QMAX = 31
 INT8_QMAX = 127
 
 INT8_NAMES = (
+    "tok_emb.weight",
     "lm_head.weight",
-    "attn.c_q.weight",
-    "attn.c_k.weight",
-    "attn.c_v.weight",
 )
 
 def tensor_nbytes(t: Tensor) -> int:
