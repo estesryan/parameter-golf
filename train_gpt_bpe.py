@@ -310,14 +310,6 @@ INT8_KEEP_FLOAT_MAX_NUMEL = 200_000
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 
-GROUP_SIZE = 64
-
-GROUPED_INT6_NAMES = (
-    "attn.proj.weight",
-    "mlp.fc.weight",
-    "mlp.proj.weight",
-)
-
 # Mixed quantization:
 # - tok_emb uses asymmetric uint8 per-row
 # - selected large weights use symmetric int8 per-row
@@ -374,41 +366,37 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
     bits = 8 if use_int8 else 6
 
     if t32.ndim == 2:
-        use_grouped_int6 = (
-            (not use_int8) and any(k in name for k in GROUPED_INT6_NAMES)
+
+        # RMS-based scaling for problematic int6 tensors
+        use_rms_row_int6 = (
+            (not use_int8) and any(k in name for k in (
+                "attn.proj.weight",
+                "mlp.fc.weight",
+                "mlp.proj.weight",
+            ))
         )
 
-        if use_grouped_int6:
-            rows, cols = t32.shape
-            if cols % GROUP_SIZE != 0:
-                raise ValueError(
-                    f"{name}: expected cols divisible by GROUP_SIZE={GROUP_SIZE}, got shape={tuple(t32.shape)}"
-                )
+        if use_rms_row_int6:
+            rms = torch.sqrt(torch.mean(t32 * t32, dim=1) + 1e-8)
 
-            num_groups = cols // GROUP_SIZE
-            xg = t32.view(rows, num_groups, GROUP_SIZE)
+            K = 2.7  # critical constant
 
-            # per-(row,group) RMS-based symmetric int6 scale
-            rms = torch.sqrt(torch.mean(xg * xg, dim=2) + 1e-8)
-            scale = (2.7 * rms / float(qmax)).clamp_min(1e-8)
+            scale = (K * rms / float(qmax)).clamp_min(1e-8)
 
             clipped = torch.clamp(
-                xg,
-                -qmax * scale.unsqueeze(-1),
-                qmax * scale.unsqueeze(-1),
+                t32,
+                -qmax * scale[:, None],
+                qmax * scale[:, None],
             )
 
             q = torch.clamp(
-                torch.round(clipped / scale.unsqueeze(-1)),
+                torch.round(clipped / scale[:, None]),
                 -qmax, qmax
-            ).to(torch.int8).contiguous().view(rows, cols)
+            ).to(torch.int8).contiguous()
 
-            meta = {
-                "scheme": "per_row_grouped",
-                "group_size": GROUP_SIZE,
-            }
+            meta = {"scheme": "per_row"}
             return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), meta
-
+        
         # existing per-row path for everything else
         clip_q = INT_CLIP_Q
         best_match_len = -1
@@ -530,14 +518,6 @@ def dequantize_state_dict_mixed(obj: dict[str, object]) -> dict[str, Tensor]:
         elif meta.get("scheme") == "per_row":
             s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], 1)).to(dtype=dtype).contiguous()
-        elif meta.get("scheme") == "per_row_grouped":
-            group_size = int(meta["group_size"])
-            s = s.to(dtype=torch.float32)  # [rows, num_groups]
-            rows, cols = q.shape
-            num_groups = cols // group_size
-            out[name] = (
-                q.float().view(rows, num_groups, group_size) * s.unsqueeze(-1)
-            ).view(rows, cols).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
