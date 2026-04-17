@@ -54,11 +54,11 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 20000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 1000))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 2000))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 100000))
+    iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
     warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.30))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
