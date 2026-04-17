@@ -388,12 +388,18 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
             num_groups = cols // GROUP_SIZE
             xg = t32.view(rows, num_groups, GROUP_SIZE)
 
-            # per-(row,group) symmetric int6 scale
-            clip_abs = xg.abs().amax(dim=2).clamp_min(1.0 / qmax)
-            scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
+            # per-(row,group) RMS-based symmetric int6 scale
+            rms = torch.sqrt(torch.mean(xg * xg, dim=2) + 1e-8)
+            scale = (2.7 * rms / float(qmax)).clamp_min(1e-8)
+
+            clipped = torch.clamp(
+                xg,
+                -qmax * scale.unsqueeze(-1),
+                qmax * scale.unsqueeze(-1),
+            )
 
             q = torch.clamp(
-                torch.round(xg / scale.unsqueeze(-1)),
+                torch.round(clipped / scale.unsqueeze(-1)),
                 -qmax, qmax
             ).to(torch.int8).contiguous().view(rows, cols)
 
