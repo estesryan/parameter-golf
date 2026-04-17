@@ -361,8 +361,9 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
 
     if t32.ndim == 2:
         # --- per-row symmetric quant for generic 2D weights ---
+        clip_q = 0.99999 if "attn.proj.weight" in name else INT_CLIP_Q
         clip_abs = (
-            torch.quantile(t32.abs(), INT_CLIP_Q, dim=1)
+            torch.quantile(t32.abs(), clip_q, dim=1)
             if t32.numel()
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
