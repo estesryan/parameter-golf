@@ -312,6 +312,16 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
+INT6_QMAX = 31
+INT8_QMAX = 127
+
+INT8_NAMES = (
+    "lm_head.weight",
+    "attn.c_q.weight",
+    "attn.c_k.weight",
+    "attn.c_v.weight",
+)
+
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
@@ -324,8 +334,11 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
     return t
 
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
+    use_int8 = any(k in name for k in INT8_NAMES)
+    qmax = INT8_QMAX if use_int8 else INT6_QMAX
+
     if t32.ndim == 2:
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
@@ -333,13 +346,13 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / float(qmax)).clamp_min(1.0 / float(qmax))
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / float(qmax) if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
     return q, scale
 
 
@@ -374,7 +387,7 @@ def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
+        q, s = quantize_float_tensor(name, t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -383,7 +396,7 @@ def quantize_state_dict_mixed(state_dict: dict[str, Tensor]):
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "mixed_int6_int8_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
