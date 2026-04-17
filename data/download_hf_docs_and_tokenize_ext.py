@@ -8,9 +8,9 @@ Command:
 
 PYTHONUNBUFFERED=1 python3 data/download_hf_docs_and_tokenize_ext.py \
   --output-root ./data \
-  --tokenizer-config ./data/tokenizer_specs_5120.json \
+  --tokenizer-config ./data/tokenizer_specs_3072.json \
   --tokenizer-train-docs 1000000 \
-  --train-shards 80
+  --train-shards 25
 
 """
 
