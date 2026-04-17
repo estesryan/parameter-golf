@@ -311,6 +311,8 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT6_CLIP_PERCENTILE = 99.9
+INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
 
 INT6_QMAX = 31
 INT8_QMAX = 127
@@ -340,8 +342,9 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor]:
     qmax = INT8_QMAX if use_int8 else INT6_QMAX
 
     if t32.ndim == 2:
+        clip_q = INT8_CLIP_Q if use_int8 else INT6_CLIP_Q
         clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            torch.quantile(t32.abs(), clip_q, dim=1)
             if t32.numel()
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
@@ -350,7 +353,8 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor]:
         q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    clip_q = INT8_CLIP_Q if use_int8 else INT6_CLIP_Q
+    clip_abs = float(torch.quantile(t32.abs().flatten(), clip_q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / float(qmax) if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
     return q, scale
