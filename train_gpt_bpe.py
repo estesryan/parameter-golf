@@ -342,16 +342,16 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
 
     if t32.ndim == 2:
         if use_int8:
-            row_min = t32.amin(dim=1)
-            row_max = t32.amax(dim=1)
-            scale = ((row_max - row_min) / 255.0).clamp_min(1e-8)
-            zero = torch.clamp(torch.round(-row_min / scale), 0, 255).to(torch.uint8)
-            q = torch.clamp(torch.round(t32 / scale[:, None]) + zero[:, None].to(torch.float32), 0, 255).to(torch.uint8).contiguous()
+            col_min = t32.amin(dim=0)
+            col_max = t32.amax(dim=0)
+            scale = ((col_max - col_min) / 255.0).clamp_min(1e-8)
+            zero = torch.clamp(torch.round(-col_min / scale), 0, 255).to(torch.uint8)
+            q = torch.clamp(torch.round(t32 / scale[None, :]) + zero[None, :].to(torch.float32), 0, 255).to(torch.uint8).contiguous()
             aux = {
                 "scale": scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(),
                 "zero": zero.to(dtype=INT8_PER_ROW_ZERO_DTYPE).contiguous(),
             }
-            meta = {"scheme": "per_row_affine_uint8", "axis": 0, "bits": 8}
+            meta = {"scheme": "per_col_affine_uint8", "axis": 1, "bits": 8}
             return q, aux, meta
 
         clip_abs = (
@@ -453,6 +453,10 @@ def dequantize_state_dict_mixed(obj: dict[str, object]) -> dict[str, Tensor]:
             scale = s["scale"].to(dtype=torch.float32)
             zero = s["zero"].to(dtype=torch.float32)
             out[name] = ((q.to(torch.float32) - zero[:, None]) * scale[:, None]).to(dtype=dtype).contiguous()
+        elif meta.get("scheme") == "per_col_affine_uint8":
+            scale = s["scale"].to(dtype=torch.float32)
+            zero = s["zero"].to(dtype=torch.float32)
+            out[name] = ((q.to(torch.float32) - zero[None, :]) * scale[None, :]).to(dtype=dtype).contiguous()
         elif meta.get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
