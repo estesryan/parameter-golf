@@ -316,7 +316,8 @@ INT6_QMAX = 31
 INT8_QMAX = 127
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-GPTQ_LITE_PERCENTILES = [0.98, 0.99, 0.995, 0.999, 0.9995, 0.9999, 0.99999, 1.0]
+GPTQ_LITE_PERCENTILES_AGGRESSIVE = [0.98, 0.99, 0.995, 0.999, 0.9995, 0.9999, 0.99999, 1.0]
+GPTQ_LITE_PERCENTILES_CONSERVATIVE = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
 
 INT8_NAMES = (
     "tok_emb.weight",
@@ -327,9 +328,12 @@ def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
 def best_clip_per_row(t32: Tensor, qmax: int) -> Tensor:
+    row_std = t32.std(dim=1)
+    percentiles = GPTQ_LITE_PERCENTILES_AGGRESSIVE \
+        if row_std.mean() > 0.05 else GPTQ_LITE_PERCENTILES_CONSERVATIVE
     best_clip = None
     best_mse = None
-    for pct in GPTQ_LITE_PERCENTILES:
+    for pct in percentiles:
         clip = torch.quantile(t32.abs(), pct, dim=1).clamp_min(1.0 / qmax)
         scale = (clip / float(qmax)).clamp_min(1.0 / qmax)
         clipped = torch.clamp(t32, -clip[:, None], clip[:, None])
