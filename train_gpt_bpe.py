@@ -310,6 +310,14 @@ INT8_KEEP_FLOAT_MAX_NUMEL = 200_000
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 
+GROUP_SIZE = 64
+
+GROUPED_INT6_NAMES = (
+    "attn.proj.weight",
+    "mlp.fc.weight",
+    "mlp.proj.weight",
+)
+
 # Mixed quantization:
 # - tok_emb uses asymmetric uint8 per-row
 # - selected large weights use symmetric int8 per-row
@@ -366,7 +374,36 @@ def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor | dict[s
     bits = 8 if use_int8 else 6
 
     if t32.ndim == 2:
-        # --- per-row symmetric quant for generic 2D weights ---
+        use_grouped_int6 = (
+            (not use_int8) and any(k in name for k in GROUPED_INT6_NAMES)
+        )
+
+        if use_grouped_int6:
+            rows, cols = t32.shape
+            if cols % GROUP_SIZE != 0:
+                raise ValueError(
+                    f"{name}: expected cols divisible by GROUP_SIZE={GROUP_SIZE}, got shape={tuple(t32.shape)}"
+                )
+
+            num_groups = cols // GROUP_SIZE
+            xg = t32.view(rows, num_groups, GROUP_SIZE)
+
+            # per-(row,group) symmetric int6 scale
+            clip_abs = xg.abs().amax(dim=2).clamp_min(1.0 / qmax)
+            scale = (clip_abs / float(qmax)).clamp_min(1.0 / qmax)
+
+            q = torch.clamp(
+                torch.round(xg / scale.unsqueeze(-1)),
+                -qmax, qmax
+            ).to(torch.int8).contiguous().view(rows, cols)
+
+            meta = {
+                "scheme": "per_row_grouped",
+                "group_size": GROUP_SIZE,
+            }
+            return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), meta
+
+        # existing per-row path for everything else
         clip_q = INT_CLIP_Q
         best_match_len = -1
         for k, v in CLIP_BY_NAME.items():
@@ -487,6 +524,14 @@ def dequantize_state_dict_mixed(obj: dict[str, object]) -> dict[str, Tensor]:
         elif meta.get("scheme") == "per_row":
             s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], 1)).to(dtype=dtype).contiguous()
+        elif meta.get("scheme") == "per_row_grouped":
+            group_size = int(meta["group_size"])
+            s = s.to(dtype=torch.float32)  # [rows, num_groups]
+            rows, cols = q.shape
+            num_groups = cols // group_size
+            out[name] = (
+                q.float().view(rows, num_groups, group_size) * s.unsqueeze(-1)
+            ).view(rows, cols).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
