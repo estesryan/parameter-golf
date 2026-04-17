@@ -6,9 +6,12 @@ GPT training script using a 5120-vocab BPE tokenizer.
 - U-Net-style skip connections between early and late layers
 - Learned residual mixing (resid_mix) per block
 - Per-head q_gain scaling with QK RMSNorm
+- RoPE positional embeddings
+- relu² MLP activation
 - Logit soft-capping prior to cross-entropy
 - Muon optimizer for matrix-shaped parameters; Adam for embeddings and scalars
-- Mixed int6/int8 post-training quantization with zstd compression
+- Mixed int6/int8 post-training quantization with GPTQ-Lite per-row optimal clip search
+  and zstd compression (level 22)
 - Wall-clock-based learning rate warmdown
 
 """
@@ -81,7 +84,7 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -627,7 +630,7 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         hidden = int(round(mlp_mult * dim))
         self.fc = CastedLinear(dim, hidden, bias=False)
