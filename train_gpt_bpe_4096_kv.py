@@ -776,6 +776,8 @@ class GPT(nn.Module):
         memory: Tensor | None = None,
         return_memory: bool = False,
     ):
+        if memory is not None:
+            memory = memory.detach().clone()
         x = self.tok_emb(input_ids)
 
         x = F.rms_norm(x, (x.size(-1),))
