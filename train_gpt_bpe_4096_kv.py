@@ -792,7 +792,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[block_idx](x, x0, memory=block_memory)
 
-        next_memory = x[:, -MEMORY_LEN:, :].detach()
+        next_memory = x[:, -MEMORY_LEN:, :].detach().clone()
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
