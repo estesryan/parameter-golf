@@ -632,11 +632,9 @@ class CausalSelfAttention(nn.Module):
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
         # KV MEMORY INJECTION
-        if kv_cache is not None:
-            mem_k, mem_v = kv_cache
-            if mem_k is not None:
-                k = torch.cat([mem_k, k], dim=2)
-                v = torch.cat([mem_v, v], dim=2)
+        mem_k, mem_v = kv_cache
+        k = torch.cat([mem_k, k], dim=2)
+        v = torch.cat([mem_v, v], dim=2)
 
         y = F.scaled_dot_product_attention(
             q,
@@ -650,12 +648,8 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
         # SAVE NEW KV (last N tokens)
-        if self.kv_memory_tokens > 0:
-            new_k = k[:, :, -self.kv_memory_tokens:, :].detach()
-            new_v = v[:, :, -self.kv_memory_tokens:, :].detach()
-        else:
-            new_k = None
-            new_v = None
+        new_k = k[:, :, -self.kv_memory_tokens:, :].detach() if self.kv_memory_tokens > 0 else k[:, :, :0, :].detach()
+        new_v = v[:, :, -self.kv_memory_tokens:, :].detach() if self.kv_memory_tokens > 0 else v[:, :, :0, :].detach()
 
         return self.proj(y), (new_k, new_v)
 
@@ -778,7 +772,27 @@ class GPT(nn.Module):
 
         # init KV memory per layer
         if memories is None:
-            kv_memories = [None] * self.num_layers
+            kv_memories = [
+                (
+                    torch.zeros(
+                        input_ids.size(0),
+                        self.blocks[i].attn.num_kv_heads,
+                        0,
+                        self.blocks[i].attn.head_dim,
+                        device=input_ids.device,
+                        dtype=x.dtype,
+                    ),
+                    torch.zeros(
+                        input_ids.size(0),
+                        self.blocks[i].attn.num_kv_heads,
+                        0,
+                        self.blocks[i].attn.head_dim,
+                        device=input_ids.device,
+                        dtype=x.dtype,
+                    ),
+                )
+                for i in range(self.num_layers)
+            ]
         else:
             kv_memories = memories
 
@@ -790,7 +804,7 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             positions = torch.arange(x.size(1), device=x.device)
 
-            kv = None
+            kv = kv_memories[i]
 
             x, new_kv = self.blocks[i](
                 x,
@@ -961,9 +975,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = base_model
     model: nn.Module = (
-        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True)
+        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
         if distributed
         else compiled_model
     )
