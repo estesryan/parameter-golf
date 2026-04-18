@@ -59,7 +59,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
     warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.30))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 0))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 262_144))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
@@ -76,7 +76,7 @@ class Hyperparameters:
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
-    head_lr = float(os.environ.get("HEAD_LR", 0.012))
+    head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
