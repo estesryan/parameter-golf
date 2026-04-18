@@ -74,15 +74,10 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 576))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.25))
+    kv_memory_tokens = int(os.environ.get("KV_MEMORY_TOKENS", 32))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-
-    # Recurrent memory.
-    use_recurrence = bool(int(os.environ.get("USE_RECURRENCE", "1")))
-    memory_tokens = int(os.environ.get("MEMORY_TOKENS", 32))
-    memory_layers = int(os.environ.get("MEMORY_LAYERS", 2))  # 0 = memory in ALL decoder layers
-    memory_momentum = float(os.environ.get("MEMORY_MOMENTUM", 0.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -596,6 +591,7 @@ class CausalSelfAttention(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
+        kv_memory_tokens: int,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -606,6 +602,7 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        self.kv_memory_tokens = kv_memory_tokens
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
@@ -617,7 +614,6 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
-        self.kv_memory_tokens = 32
 
     def forward(self, x: Tensor, positions: Tensor, kv_cache=None):
         bsz, seqlen, dim = x.shape
@@ -653,8 +649,12 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
         # SAVE NEW KV (last N tokens)
-        new_k = k[:, :, -self.kv_memory_tokens:, :].detach()
-        new_v = v[:, :, -self.kv_memory_tokens:, :].detach()
+        if self.kv_memory_tokens > 0:
+            new_k = k[:, :, -self.kv_memory_tokens:, :].detach()
+            new_v = v[:, :, -self.kv_memory_tokens:, :].detach()
+        else:
+            new_k = None
+            new_v = None
 
         return self.proj(y), (new_k, new_v)
 
@@ -680,6 +680,7 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        kv_memory_tokens: int,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -690,6 +691,7 @@ class Block(nn.Module):
             dim,
             num_heads,
             num_kv_heads,
+            kv_memory_tokens,
             rope_base,
             qk_gain_init,
         )
@@ -714,19 +716,17 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        kv_memory_tokens:int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        use_recurrence: bool = False,
-        memory_tokens: int = 64,
-        memory_layers: int = 0,
-        memory_momentum: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.kv_memory_tokens = kv_memory_tokens
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -743,6 +743,7 @@ class GPT(nn.Module):
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
+                    kv_memory_tokens,
                     rope_base,
                     qk_gain_init,
                 )
@@ -788,7 +789,7 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             positions = torch.arange(x.size(1), device=x.device)
 
-            kv = kv_memories[i] if i >= self.num_layers - 2 else None
+            kv = None
 
             x, new_kv = self.blocks[i](
                 x,
@@ -797,10 +798,7 @@ class GPT(nn.Module):
                 kv,
             )
 
-            if (i >= self.num_layers - 2):
-                new_kv_memories.append(new_kv)
-            else:
-                new_kv_memories.append(None)
+            new_kv_memories.append(new_kv)
             skips.append(x)
 
         # decoder
@@ -816,7 +814,7 @@ class GPT(nn.Module):
             x = tok
             positions = torch.arange(x.size(1), device=x.device)
 
-            kv = kv_memories[block_idx] if block_idx >= self.num_layers - 2 else None
+            kv = kv_memories[block_idx]
 
             x, new_kv = self.blocks[block_idx](
                 x,
@@ -825,7 +823,7 @@ class GPT(nn.Module):
                 kv,
             )
 
-            new_kv_memories.append(new_kv if kv is not None else None)
+            new_kv_memories.append(new_kv)
 
         # head
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -951,29 +949,19 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        kv_memory_tokens=args.kv_memory_tokens,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        use_recurrence=args.use_recurrence,
-        memory_tokens=args.memory_tokens,
-        memory_layers=args.memory_layers,
-        memory_momentum=args.memory_momentum,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    #compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    #model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-    compiled_model = torch.compile(base_model, dynamic=False)
-
-    model: nn.Module = (
-        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
-        if distributed
-        else compiled_model
-    )
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR (untied) or TIED_EMBED_LR (tied)
