@@ -18,3 +18,9 @@ print(f'Total sampled: {total}')
 for k,v in buckets.items():
     print(f'{k}: {v} ({100*v/total:.1f}%)')
 #" 2>/dev/null
+
+#Results:
+#cap     trunc%  kept_bytes%     uniq_tok        uniq_bigram
+#4096    17.70   68.07   99.97%  101.26%
+#8192    5.21    81.53   99.97%  100.79%
+#16384   1.70    89.77   100.00% 100.00%

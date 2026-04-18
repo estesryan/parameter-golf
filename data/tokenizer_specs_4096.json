@@ -10,7 +10,7 @@
         "shuffle_input_sentence": true,
         "remove_extra_whitespaces": true,
         "character_coverage": 0.9995,
-        "max_sentence_length": 16384
+        "max_sentence_length": 4096
       }
     }
   ]
