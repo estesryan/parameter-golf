@@ -634,8 +634,9 @@ class CausalSelfAttention(nn.Module):
         # KV MEMORY INJECTION
         if kv_cache is not None:
             mem_k, mem_v = kv_cache
-            k = torch.cat([mem_k, k], dim=2)
-            v = torch.cat([mem_v, v], dim=2)
+            if mem_k is not None:
+                k = torch.cat([mem_k, k], dim=2)
+                v = torch.cat([mem_v, v], dim=2)
 
         y = F.scaled_dot_product_attention(
             q,
