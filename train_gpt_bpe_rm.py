@@ -574,10 +574,13 @@ class Rotary(nn.Module):
         ):
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
             freqs = torch.outer(t, self.inv_freq.to(device))
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
+            self._cos_cached = freqs.cos()[None, None, :, :].detach()
+            self._sin_cached = freqs.sin()[None, None, :, :].detach()
             self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+        return (
+            self._cos_cached.to(dtype=dtype).clone(),
+            self._sin_cached.to(dtype=dtype).clone(),
+        )
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
