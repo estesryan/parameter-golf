@@ -773,18 +773,20 @@ class GPT(nn.Module):
         memories: list[Tensor | None] | None = None,
         return_memories: bool = False,
     ) -> Tensor | tuple[Tensor, list[Tensor | None]]:
+
         x = self.tok_emb(input_ids)
         orig_seq_len = x.size(1)
 
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+
         skips: list[Tensor] = []
 
+        # encoder
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x)
             skips.append(x)
 
-        # inject memory only into decoder half
+        # inject memory before decoder
         memory = None
         if self.use_recurrence and memories is not None:
             candidate = memories[-1]
@@ -792,42 +794,50 @@ class GPT(nn.Module):
                 memory = candidate
                 x = torch.cat([memory, x], dim=1)
 
+        # decoder
         for i in range(self.num_decoder_layers):
             block_idx = self.num_encoder_layers + i
 
+            # split memory / tokens
+            if memory is not None:
+                mem = x[:, :self.memory_tokens, :]
+                tok = x[:, self.memory_tokens:, :]
+            else:
+                mem = None
+                tok = x
+
+            # apply skip only to token region
             if skips:
                 skip = skips.pop()
+                tok = tok + self.skip_weights[i].to(dtype=tok.dtype)[None, None, :] * skip
 
-                if x.size(1) != skip.size(1):
-                    # remove memory part from x before adding skip
-                    x_main = x[:, -skip.size(1):, :]
-                    x = x_main + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
+            # reassemble
+            if mem is not None:
+                x = torch.cat([mem, tok], dim=1)
+            else:
+                x = tok
 
-                    # reattach memory after skip
-                    if memory is not None:
-                        x = torch.cat([memory, x], dim=1)
-                else:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
+            # standard block
+            x = self.blocks[block_idx](x, x)
 
-            x = self.blocks[block_idx](x, x0)
-
-        # Update memory from the final hidden states before trimming.
+        # update memory from full sequence
         new_memory: Tensor | None = None
         if self.use_recurrence:
             new_memory = self._update_memory(memory, x.detach())
 
-        # Remove memory prefix before computing loss.
+        # strip memory before head
         if memory is not None:
             x = x[:, -orig_seq_len:, :]
 
+        # head
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
+
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
@@ -835,6 +845,7 @@ class GPT(nn.Module):
             if self.use_recurrence:
                 return loss, [new_memory]
             return loss, [None]
+
         return loss
 
 
