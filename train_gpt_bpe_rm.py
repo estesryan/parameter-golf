@@ -776,8 +776,6 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         orig_seq_len = x.size(1)
 
-        memory: Tensor | None = None
-
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -796,8 +794,15 @@ class GPT(nn.Module):
 
         for i in range(self.num_decoder_layers):
             block_idx = self.num_encoder_layers + i
+
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                skip = skips.pop()
+
+                if x.size(1) != skip.size(1):
+                    skip = skip[:, -x.size(1):, :]
+
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
+
             x = self.blocks[block_idx](x, x0)
 
         # Update memory from the final hidden states before trimming.
