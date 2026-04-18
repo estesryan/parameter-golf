@@ -617,8 +617,9 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.kv_memory_tokens = 32
 
-    def forward(self, x: Tensor, positions: Tensor) -> Tensor:
+    def forward(self, x: Tensor, positions: Tensor, kv_cache=None):
         bsz, seqlen, dim = x.shape
 
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -634,6 +635,12 @@ class CausalSelfAttention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
+        # KV MEMORY INJECTION
+        if kv_cache is not None:
+            mem_k, mem_v = kv_cache
+            k = torch.cat([mem_k, k], dim=2)
+            v = torch.cat([mem_v, v], dim=2)
+
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -644,7 +651,12 @@ class CausalSelfAttention(nn.Module):
         )
 
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+
+        # SAVE NEW KV (last N tokens)
+        new_k = k[:, :, -self.kv_memory_tokens:, :].detach()
+        new_v = v[:, :, -self.kv_memory_tokens:, :].detach()
+
+        return self.proj(y), (new_k, new_v)
 
 
 class MLP(nn.Module):
@@ -686,15 +698,11 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, positions: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-
-        attn_out = self.attn(self.attn_norm(x), positions)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+    def forward(self, x, x0, positions, kv_cache=None):
+        attn_out, new_kv = self.attn(self.attn_norm(x), positions, kv_cache)
+        x = x + self.attn_scale[None, None, :] * attn_out
+        x = x + self.mlp_scale[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x, new_kv
 
 
 class GPT(nn.Module):
@@ -728,12 +736,6 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.use_recurrence = use_recurrence
-        self.memory_tokens = memory_tokens
-        self.memory_layers = memory_layers
-        self.memory_momentum = memory_momentum
-        self.eos_id = 2
-        self.bos_id = 1
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -760,98 +762,50 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
-
-    # EOS-aware pooled memory:
-    # - pool only tokens AFTER the last EOS in the tail window
-    # - prevents mixing unrelated sequences across boundaries
-    # - falls back to zero if EOS is the final token (no suffix)
-    # - improves stability vs naive mean pooling or last-token copying
-    def _update_memory(self, old_memory: Tensor | None, hidden: Tensor, input_ids: Tensor) -> Tensor:
-        tail_hidden = hidden[:, -self.memory_tokens:, :]
-        tail_ids = input_ids[:, -self.memory_tokens:]
-
-        eos_mask = (tail_ids == self.eos_id)
-        has_eos = eos_mask.any(dim=1)
-
-        idx = torch.arange(self.memory_tokens, device=hidden.device).unsqueeze(0)
-        last_eos = torch.where(
-            has_eos,
-            eos_mask.size(1) - 1 - torch.flip(eos_mask, dims=[1]).float().argmax(dim=1),
-            torch.zeros_like(has_eos, dtype=torch.long),
-        )
-
-        keep_tokens = torch.where(
-            has_eos.unsqueeze(1),
-            idx > last_eos.unsqueeze(1),
-            torch.ones_like(idx, dtype=torch.bool),
-        )
-
-        keep_tokens_f = keep_tokens.unsqueeze(-1).to(tail_hidden.dtype)
-        denom = keep_tokens_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-
-        pooled = (tail_hidden * keep_tokens_f).sum(dim=1, keepdim=True) / denom
-
-        has_suffix = keep_tokens.any(dim=1, keepdim=True).unsqueeze(-1)
-        pooled = torch.where(has_suffix, pooled, torch.zeros_like(pooled))
-
-        new_memory = pooled.expand(-1, self.memory_tokens, -1)
-
-        if old_memory is None:
-            return F.rms_norm(new_memory, (new_memory.size(-1),))
-
-        saw_eos = has_eos.unsqueeze(-1).unsqueeze(-1)
-
-        if self.memory_momentum <= 0.0:
-            return new_memory
-
-        keep = torch.where(
-            saw_eos,
-            torch.zeros_like(old_memory[:, :1, :]),
-            torch.full_like(old_memory[:, :1, :], self.memory_momentum),
-        )
-        take = 1.0 - keep
-        blended = keep * old_memory + take * new_memory
-        return F.rms_norm(blended, (blended.size(-1),))
+    
     
     def forward(
         self,
         input_ids: Tensor,
         target_ids: Tensor,
-        memories: list[Tensor | None] | None = None,
+        memories: list[tuple[Tensor, Tensor] | None] | None = None,
         return_memories: bool = False,
-    ) -> Tensor | tuple[Tensor, list[Tensor | None]]:
-
+    ):
         x = self.tok_emb(input_ids)
-        orig_seq_len = x.size(1)
-
         x = F.rms_norm(x, (x.size(-1),))
+
+        # init KV memory per layer
+        if memories is None:
+            kv_memories = [None] * self.num_layers
+        else:
+            kv_memories = memories
+
+        new_kv_memories = []
 
         skips: list[Tensor] = []
 
         # encoder
         for i in range(self.num_encoder_layers):
             positions = torch.arange(x.size(1), device=x.device)
-            x = self.blocks[i](x, x, positions)
-            skips.append(x)
 
-        # inject memory before decoder
-        memory = None
-        if self.use_recurrence and memories is not None:
-            candidate = memories[-1]
-            if candidate is not None and candidate.size(0) == x.size(0):
-                memory = candidate
+            kv = kv_memories[i] if i >= self.num_layers - 2 else None
+
+            x, new_kv = self.blocks[i](
+                x,
+                x,
+                positions,
+                kv,
+            )
+
+            if (i >= self.num_layers - 2):
+                new_kv_memories.append(new_kv)
+            else:
+                new_kv_memories.append(None)
+            skips.append(x)
 
         # decoder
         for i in range(self.num_decoder_layers):
             block_idx = self.num_encoder_layers + i
-
-            use_memory = (
-                memory is not None
-                and (
-                    self.memory_layers == 0
-                    or i >= (self.num_decoder_layers - self.memory_layers)
-                )
-            )
 
             tok = x
             if skips:
@@ -859,30 +813,19 @@ class GPT(nn.Module):
                 tok = tok[:, -skip.size(1):, :]
                 tok = tok + self.skip_weights[i].to(dtype=tok.dtype)[None, None, :] * skip
 
-            if use_memory:
-                x = torch.cat([memory, tok], dim=1)
-                x0_block = torch.cat([memory.detach(), tok], dim=1)
+            x = tok
+            positions = torch.arange(x.size(1), device=x.device)
 
-                mem_len = memory.size(1)
-                tok_len = tok.size(1)
-                mem_pos = torch.arange(mem_len, device=x.device)
-                tok_pos = torch.arange(tok_len, device=x.device) + mem_len
-                positions = torch.cat([mem_pos, tok_pos], dim=0)
-            else:
-                x = tok
-                x0_block = tok
-                positions = torch.arange(x.size(1), device=x.device)
+            kv = kv_memories[block_idx] if block_idx >= self.num_layers - 2 else None
 
-            x = self.blocks[block_idx](x, x0_block, positions)
+            x, new_kv = self.blocks[block_idx](
+                x,
+                x,
+                positions,
+                kv,
+            )
 
-        # update memory from full sequence
-        new_memory: Tensor | None = None
-        if self.use_recurrence:
-            new_memory = self._update_memory(memory, x.detach(), input_ids)
-
-        # strip memory before head
-        if memory is not None:
-            x = x[:, -orig_seq_len:, :]
+            new_kv_memories.append(new_kv if kv is not None else None)
 
         # head
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -897,9 +840,7 @@ class GPT(nn.Module):
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
         if return_memories:
-            if self.use_recurrence:
-                return loss, [new_memory]
-            return loss, [None]
+            return loss, new_kv_memories
 
         return loss
 
