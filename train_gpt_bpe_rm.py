@@ -745,19 +745,54 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    # EOS-aware pooled memory:
+    # - pool only tokens AFTER the last EOS in the tail window
+    # - prevents mixing unrelated sequences across boundaries
+    # - falls back to zero if EOS is the final token (no suffix)
+    # - improves stability vs naive mean pooling or last-token copying
     def _update_memory(self, old_memory: Tensor | None, hidden: Tensor, input_ids: Tensor) -> Tensor:
-        tail_hidden = hidden[:, -self.memory_tokens :, :]
-        new_memory = tail_hidden.mean(dim=1, keepdim=True).expand(-1, self.memory_tokens, -1)  # EOS-aware pooled summary of recent tokens (stable long-range context vs copying noisy last tokens)
+        tail_hidden = hidden[:, -self.memory_tokens:, :]
+        tail_ids = input_ids[:, -self.memory_tokens:]
+
+        eos_mask = (tail_ids == self.eos_id)
+        has_eos = eos_mask.any(dim=1)
+
+        idx = torch.arange(self.memory_tokens, device=hidden.device).unsqueeze(0)
+        last_eos = torch.where(
+            has_eos,
+            eos_mask.size(1) - 1 - torch.flip(eos_mask, dims=[1]).float().argmax(dim=1),
+            torch.zeros_like(has_eos, dtype=torch.long),
+        )
+
+        keep_tokens = torch.where(
+            has_eos.unsqueeze(1),
+            idx > last_eos.unsqueeze(1),
+            torch.ones_like(idx, dtype=torch.bool),
+        )
+
+        keep_tokens_f = keep_tokens.unsqueeze(-1).to(tail_hidden.dtype)
+        denom = keep_tokens_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+        pooled = (tail_hidden * keep_tokens_f).sum(dim=1, keepdim=True) / denom
+
+        has_suffix = keep_tokens.any(dim=1, keepdim=True).unsqueeze(-1)
+        pooled = torch.where(has_suffix, pooled, torch.zeros_like(pooled))
+
+        new_memory = pooled.expand(-1, self.memory_tokens, -1)
 
         if old_memory is None:
             return new_memory
 
-        saw_eos = (input_ids[:, -self.memory_tokens:] == self.eos_id).any(dim=1, keepdim=True).unsqueeze(-1)
+        saw_eos = has_eos.unsqueeze(-1).unsqueeze(-1)
 
         if self.memory_momentum <= 0.0:
             return new_memory
 
-        keep = torch.where(saw_eos, torch.zeros_like(old_memory[:, :1, :]), torch.full_like(old_memory[:, :1, :], self.memory_momentum))
+        keep = torch.where(
+            saw_eos,
+            torch.zeros_like(old_memory[:, :1, :]),
+            torch.full_like(old_memory[:, :1, :], self.memory_momentum),
+        )
         take = 1.0 - keep
         return keep * old_memory + take * new_memory
     
