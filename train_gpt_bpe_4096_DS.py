@@ -471,97 +471,53 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-class EosTokenStream:
+class TokenStream:
+    # Reads shards sequentially and wraps around forever. The training loop therefore
+    # has deterministic, simple streaming behavior with no sampling or workers.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
-        self.tokens = load_data_shard(self.files[0]).to(torch.int64)
+        self.tokens = load_data_shard(self.files[0])
         self.pos = 0
 
-    def _advance_file(self):
+    def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx]).to(torch.int64)
+        self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
-    def next_chunk(self, chunk_size: int = 65536) -> Tensor:
-        if self.pos >= self.tokens.numel():
-            self._advance_file()
-
-        end = min(self.pos + chunk_size, self.tokens.numel())
-        chunk = self.tokens[self.pos:end]
-        self.pos = end
-        return chunk
+    def take(self, n: int) -> Tensor:
+        chunks: list[Tensor] = []
+        remaining = n
+        while remaining > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance_file()
+                continue
+            k = min(remaining, avail)
+            chunks.append(self.tokens[self.pos : self.pos + k])
+            self.pos += k
+            remaining -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
 
 class DistributedTokenLoader:
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, eos_id: int):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.eos_id = eos_id
+        self.stream = TokenStream(pattern)
 
-        self.stream = EosTokenStream(pattern)
-
-        self.pending_doc = torch.empty(0, dtype=torch.int64)
-        self.pack_buffer = torch.empty(0, dtype=torch.int64)
-
-    def _fill_buffer(self, needed_tokens: int):
-        while self.pack_buffer.numel() < needed_tokens:
-            chunk = self.stream.next_chunk()
-
-            # find EOS positions
-            eos_mask = (chunk == self.eos_id)
-            if not eos_mask.any():
-                self.pending_doc = torch.cat([self.pending_doc, chunk])
-                continue
-
-            eos_indices = eos_mask.nonzero(as_tuple=False).flatten()
-
-            start = 0
-            for idx in eos_indices:
-                idx = int(idx.item())
-
-                piece = chunk[start:idx + 1]  # include EOS
-
-                if self.pending_doc.numel() > 0:
-                    piece = torch.cat([self.pending_doc, piece])
-                    self.pending_doc = torch.empty(0, dtype=torch.int64)
-
-                self.pack_buffer = torch.cat([self.pack_buffer, piece])
-                start = idx + 1
-
-            # leftover tail (no EOS)
-            if start < chunk.numel():
-                tail = chunk[start:]
-                self.pending_doc = torch.cat([self.pending_doc, tail])
-
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int):
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        if local_tokens % seq_len != 0:
-            raise ValueError
-
-        local_batch_seqs = local_tokens // seq_len
-        total_needed = (local_batch_seqs * self.world_size) * (seq_len + 1)
-
-        self._fill_buffer(total_needed)
-
-        buf = self.pack_buffer[:total_needed]
-        self.pack_buffer = self.pack_buffer[total_needed:]
-
-        buf = buf.view(local_batch_seqs * self.world_size, seq_len + 1)
-
-        x_all = buf[:, :-1]
-        y_all = buf[:, 1:]
-
-        start = self.rank * local_batch_seqs
-        end = start + local_batch_seqs
-
-        x = x_all[start:end].to(self.device, non_blocking=True)
-        y = y_all[start:end].to(self.device, non_blocking=True)
-
-        return x, y
+        per_rank_span = local_tokens + 1
+        chunk = self.stream.take(per_rank_span * self.world_size)
+        start = self.rank * per_rank_span
+        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -739,6 +695,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.eos_id = 2  # SentencePiece EOS token
+        self.doc_start_emb = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
         self.num_layers = num_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -773,6 +731,12 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+
+        # inject learned doc_start signal at position 0 and after every EOS
+        is_doc_start = torch.zeros_like(input_ids, dtype=torch.bool)
+        is_doc_start[:, 0] = True
+        is_doc_start[:, 1:] = (input_ids[:, :-1] == self.eos_id)
+        x = x + self.doc_start_emb.to(dtype=x.dtype) * is_doc_start.unsqueeze(-1).to(dtype=x.dtype)
 
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -883,9 +847,6 @@ def main() -> None:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
-    eos_id = int(sp.eos_id())
-    if eos_id < 0:
-        raise ValueError("Tokenizer must have EOS enabled for eosstream loader")
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
@@ -992,7 +953,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, eos_id)
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1048,7 +1009,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, eos_id)
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
