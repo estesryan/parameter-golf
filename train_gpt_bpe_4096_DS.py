@@ -471,46 +471,28 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-class EosDocumentStream:
-    def __init__(self, pattern: str, eos_id: int):
+class EosTokenStream:
+    def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.eos_id = eos_id
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0]).to(torch.int64)
         self.pos = 0
-        self.pending = torch.empty(0, dtype=torch.int64)
 
-    def _advance_file(self) -> None:
+    def _advance_file(self):
         self.file_idx = (self.file_idx + 1) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx]).to(torch.int64)
         self.pos = 0
 
-    def next_document(self) -> Tensor:
-        while True:
-            if self.pos >= self.tokens.numel():
-                self._advance_file()
-                continue
+    def next_chunk(self, chunk_size: int = 65536) -> Tensor:
+        if self.pos >= self.tokens.numel():
+            self._advance_file()
 
-            rel_eos = (self.tokens[self.pos:] == self.eos_id).nonzero(as_tuple=False)
-
-            if rel_eos.numel() == 0:
-                tail = self.tokens[self.pos:]
-                self.pending = torch.cat([self.pending, tail]) if self.pending.numel() > 0 else tail.clone()
-                self._advance_file()
-                continue
-
-            end = self.pos + int(rel_eos[0].item()) + 1  # include EOS
-            doc_part = self.tokens[self.pos:end]
-            self.pos = end
-
-            if self.pending.numel() > 0:
-                doc = torch.cat([self.pending, doc_part])
-                self.pending = torch.empty(0, dtype=torch.int64)
-                return doc
-
-            return doc_part
+        end = min(self.pos + chunk_size, self.tokens.numel())
+        chunk = self.tokens[self.pos:end]
+        self.pos = end
+        return chunk
 
 
 class DistributedTokenLoader:
@@ -518,44 +500,67 @@ class DistributedTokenLoader:
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = EosDocumentStream(pattern, eos_id)
-        self.doc_tokens: Tensor | None = None
-        self.doc_pos = 0
+        self.eos_id = eos_id
 
-    def _next_long_enough_doc(self, seq_len: int) -> None:
-        while True:
-            doc = self.stream.next_document()
-            if doc.numel() >= seq_len + 1:
-                self.doc_tokens = doc
-                self.doc_pos = 0
-                return
+        self.stream = EosTokenStream(pattern)
 
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        self.pending_doc = torch.empty(0, dtype=torch.int64)
+        self.pack_buffer = torch.empty(0, dtype=torch.int64)
+
+    def _fill_buffer(self, needed_tokens: int):
+        while self.pack_buffer.numel() < needed_tokens:
+            chunk = self.stream.next_chunk()
+
+            # find EOS positions
+            eos_mask = (chunk == self.eos_id)
+            if not eos_mask.any():
+                self.pending_doc = torch.cat([self.pending_doc, chunk])
+                continue
+
+            eos_indices = eos_mask.nonzero(as_tuple=False).flatten()
+
+            start = 0
+            for idx in eos_indices:
+                idx = int(idx.item())
+
+                piece = chunk[start:idx + 1]  # include EOS
+
+                if self.pending_doc.numel() > 0:
+                    piece = torch.cat([self.pending_doc, piece])
+                    self.pending_doc = torch.empty(0, dtype=torch.int64)
+
+                self.pack_buffer = torch.cat([self.pack_buffer, piece])
+                start = idx + 1
+
+            # leftover tail (no EOS)
+            if start < chunk.numel():
+                tail = chunk[start:]
+                self.pending_doc = torch.cat([self.pending_doc, tail])
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int):
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         if local_tokens % seq_len != 0:
-            raise ValueError(f"local_tokens={local_tokens} must be divisible by seq_len={seq_len}")
+            raise ValueError
+
         local_batch_seqs = local_tokens // seq_len
+        total_needed = (local_batch_seqs * self.world_size) * (seq_len + 1)
 
-        total_needed = local_batch_seqs * self.world_size
-        xs: list[Tensor] = []
-        ys: list[Tensor] = []
+        self._fill_buffer(total_needed)
 
-        while len(xs) < total_needed:
-            if self.doc_tokens is None or self.doc_pos + seq_len + 1 > self.doc_tokens.numel():
-                self._next_long_enough_doc(seq_len)
+        buf = self.pack_buffer[:total_needed]
+        self.pack_buffer = self.pack_buffer[total_needed:]
 
-            sample = self.doc_tokens[self.doc_pos:self.doc_pos + seq_len + 1]
-            xs.append(sample[:-1])
-            ys.append(sample[1:])
-            self.doc_pos += seq_len
+        buf = buf.view(local_batch_seqs * self.world_size, seq_len + 1)
 
-        x_all = torch.stack(xs)
-        y_all = torch.stack(ys)
+        x_all = buf[:, :-1]
+        y_all = buf[:, 1:]
 
         start = self.rank * local_batch_seqs
         end = start + local_batch_seqs
+
         x = x_all[start:end].to(self.device, non_blocking=True)
         y = y_all[start:end].to(self.device, non_blocking=True)
+
         return x, y
 
 # -----------------------------
