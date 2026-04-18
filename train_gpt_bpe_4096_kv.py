@@ -271,6 +271,7 @@ def eval_val(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss, val_memory = model(x, y, memory=val_memory, return_memory=True)
                 batch_loss = batch_loss.detach()
+                val_memory = val_memory.clone()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
