@@ -648,8 +648,8 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
         # SAVE NEW KV (last N tokens)
-        new_k = k[:, :, -self.kv_memory_tokens:, :].detach() if self.kv_memory_tokens > 0 else k[:, :, :0, :].detach()
-        new_v = v[:, :, -self.kv_memory_tokens:, :].detach() if self.kv_memory_tokens > 0 else v[:, :, :0, :].detach()
+        new_k = k[:, :, -self.kv_memory_tokens:, :] if self.kv_memory_tokens > 0 else k[:, :, :0, :]
+        new_v = v[:, :, -self.kv_memory_tokens:, :] if self.kv_memory_tokens > 0 else v[:, :, :0, :]
 
         return self.proj(y), (new_k, new_v)
 
