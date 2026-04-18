@@ -794,7 +794,7 @@ class GPT(nn.Module):
             torch.full_like(old_memory[:, :1, :], self.memory_momentum),
         )
         take = 1.0 - keep
-        blended = keep * old_memory + take * new_memory
+        blended = keep * old_memory.detach() + take * new_memory
         return F.rms_norm(blended, (blended.size(-1),))
     
     def forward(
