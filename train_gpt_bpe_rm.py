@@ -781,7 +781,7 @@ class GPT(nn.Module):
         new_memory = pooled.expand(-1, self.memory_tokens, -1)
 
         if old_memory is None:
-            return new_memory
+            return F.rms_norm(new_memory, (new_memory.size(-1),))
 
         saw_eos = has_eos.unsqueeze(-1).unsqueeze(-1)
 
@@ -794,7 +794,8 @@ class GPT(nn.Module):
             torch.full_like(old_memory[:, :1, :], self.memory_momentum),
         )
         take = 1.0 - keep
-        return keep * old_memory + take * new_memory
+        blended = keep * old_memory + take * new_memory
+        return F.rms_norm(blended, (blended.size(-1),))
     
     def forward(
         self,
