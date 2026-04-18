@@ -731,6 +731,8 @@ class GPT(nn.Module):
         self.memory_tokens = memory_tokens
         self.memory_layers = memory_layers
         self.memory_momentum = memory_momentum
+        self.eos_id = 2
+        self.bos_id = 1
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -765,8 +767,7 @@ class GPT(nn.Module):
         if old_memory is None:
             return new_memory
 
-        eos_id = 1
-        saw_eos = (input_ids[:, -self.memory_tokens :] == eos_id).any(dim=1, keepdim=True).unsqueeze(-1)
+        saw_eos = (input_ids[:, -self.memory_tokens:] == self.eos_id).any(dim=1, keepdim=True).unsqueeze(-1)
         old_memory = torch.where(saw_eos, torch.zeros_like(old_memory), old_memory)
 
         if self.memory_momentum <= 0.0:
