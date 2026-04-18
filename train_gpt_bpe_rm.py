@@ -618,24 +618,35 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, positions: Tensor, kv_cache=None):
         bsz, seqlen, dim = x.shape
 
+        # projections
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
+        # normalize
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
 
+        # rotary
         cos, sin = self.rotary(positions, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
+        # per-head scaling
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        # KV MEMORY INJECTION
-        mem_k, mem_v = kv_cache
+        # ---- KV MEMORY (ALWAYS TENSORS) ----
+        if kv_cache is None:
+            mem_k = k[:, :, :0, :]
+            mem_v = v[:, :, :0, :]
+        else:
+            mem_k, mem_v = kv_cache
+
+        # CONCAT MEMORY (THIS IS THE POINT)
         k = torch.cat([mem_k, k], dim=2)
         v = torch.cat([mem_v, v], dim=2)
 
+        # attention
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -647,9 +658,13 @@ class CausalSelfAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
-        # SAVE NEW KV (last N tokens)
-        new_k = k[:, :, -self.kv_memory_tokens:, :] if self.kv_memory_tokens > 0 else k[:, :, :0, :]
-        new_v = v[:, :, -self.kv_memory_tokens:, :] if self.kv_memory_tokens > 0 else v[:, :, :0, :]
+        # ---- SAVE NEW MEMORY ----
+        if self.kv_memory_tokens > 0:
+            new_k = k[:, :, -self.kv_memory_tokens:, :]
+            new_v = v[:, :, -self.kv_memory_tokens:, :]
+        else:
+            new_k = k[:, :, :0, :]
+            new_v = v[:, :, :0, :]
 
         return self.proj(y), (new_k, new_v)
 
@@ -1091,30 +1106,42 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+
         for warmup_step in range(args.warmup_steps):
+
             zero_grad_all()
+            step_memories = train_memories
+
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+
+                x, y = train_loader.next_batch(
+                    args.train_batch_tokens,
+                    args.train_seq_len,
+                    grad_accum_steps
+                )
+
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss, train_memories = model(
-                        x, y, memories=train_memories, return_memories=True
+                    warmup_loss, new_memories = model(
+                        x, y,
+                        memories=step_memories,
+                        return_memories=True
                     )
+
+                new_memories = [(k.detach(), v.detach()) for (k, v) in new_memories]
+                step_memories = new_memories
+
                 (warmup_loss * grad_scale).backward()
+
+            train_memories = new_memories
+
             for opt in optimizers:
                 opt.step()
+
             zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        base_model.load_state_dict(initial_model_state, strict=True)
-        for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
-            opt.load_state_dict(state)
-        zero_grad_all()
-        train_memories = None
-        if distributed:
-            model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+            log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1164,16 +1191,26 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        step_memories = train_memories
+
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss, train_memories = model(
-                    x, y, memories=train_memories, return_memories=True
+                loss, new_memories = model(
+                    x, y, memories=step_memories, return_memories=True
                 )
+
+                new_memories = [(k.detach(), v.detach()) for (k, v) in new_memories]
+                step_memories = new_memories
+
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+
+        train_memories = new_memories
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
