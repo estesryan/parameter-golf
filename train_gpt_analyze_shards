@@ -1,8 +1,8 @@
-# python - << 'EOF'
+#python - << 'EOF'
 import numpy as np
 from pathlib import Path
 
-p = Path("./data/datasets/fineweb10B_sp3072/fineweb_train_000000.bin")
+p = Path("./data/datasets/fineweb10B_sp4096/fineweb_train_000000.bin")
 eos_id, bos_id = 2, 1
 
 header_bytes = 256 * np.dtype("<i4").itemsize
@@ -12,4 +12,4 @@ t = np.fromfile(p, dtype="<u2", count=num_tokens, offset=header_bytes)
 print("EOS count:", (t == eos_id).sum())
 print("BOS count:", (t == bos_id).sum())
 print("EOS→BOS transitions:", ((t[:-1] == eos_id) & (t[1:] == bos_id)).sum())
-# EOF
+#EOF
