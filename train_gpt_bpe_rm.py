@@ -745,25 +745,27 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    # EOS-aware pooled memory:
-    # - pool only tokens AFTER the last EOS in the tail window
-    # - prevents mixing unrelated sequences across boundaries
-    # - falls back to zero if EOS is the final token (no suffix)
-    # - improves stability vs naive mean pooling or last-token copying
+    # EOS-aware chunked memory:
+    # - keep only tokens AFTER the last EOS in the tail window
+    # - split the retained tail into memory-sized chunks
+    # - mean-pool each chunk into a distinct memory slot
+    # - zero any slot whose chunk has no retained tokens
+    # - RMS-normalize the resulting memory for stable carry
     def _update_memory(self, old_memory: Tensor | None, hidden: Tensor, input_ids: Tensor) -> Tensor:
-        tail_hidden = hidden[:, -self.memory_tokens:, :]
-        tail_ids = input_ids[:, -self.memory_tokens:]
+        tail_span = self.memory_tokens * 4
+        tail_hidden = hidden[:, -tail_span:, :]
+        tail_ids = input_ids[:, -tail_span:]
 
         eos_mask = (tail_ids == self.eos_id)
         has_eos = eos_mask.any(dim=1)
 
-        idx = torch.arange(self.memory_tokens, device=hidden.device).unsqueeze(0)
         last_eos = torch.where(
             has_eos,
             eos_mask.size(1) - 1 - torch.flip(eos_mask, dims=[1]).float().argmax(dim=1),
             torch.zeros_like(has_eos, dtype=torch.long),
         )
 
+        idx = torch.arange(tail_span, device=hidden.device).unsqueeze(0)
         keep_tokens = torch.where(
             has_eos.unsqueeze(1),
             idx > last_eos.unsqueeze(1),
@@ -771,17 +773,21 @@ class GPT(nn.Module):
         )
 
         keep_tokens_f = keep_tokens.unsqueeze(-1).to(tail_hidden.dtype)
-        denom = keep_tokens_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+        masked_hidden = tail_hidden * keep_tokens_f
 
-        pooled = (tail_hidden * keep_tokens_f).sum(dim=1, keepdim=True) / denom
+        chunk_len = tail_span // self.memory_tokens
+        chunked_hidden = masked_hidden.view(hidden.size(0), self.memory_tokens, chunk_len, hidden.size(-1))
+        chunked_keep = keep_tokens_f.view(hidden.size(0), self.memory_tokens, chunk_len, 1)
 
-        has_suffix = keep_tokens.any(dim=1, keepdim=True).unsqueeze(-1)
-        pooled = torch.where(has_suffix, pooled, torch.zeros_like(pooled))
+        chunk_denom = chunked_keep.sum(dim=2).clamp_min(1.0)
+        new_memory = chunked_hidden.sum(dim=2) / chunk_denom
 
-        new_memory = pooled.expand(-1, self.memory_tokens, -1)
+        valid_chunk = chunked_keep.sum(dim=2) > 0
+        new_memory = torch.where(valid_chunk, new_memory, torch.zeros_like(new_memory))
+        new_memory = F.rms_norm(new_memory, (new_memory.size(-1),))
 
         if old_memory is None:
-            return F.rms_norm(new_memory, (new_memory.size(-1),))
+            return new_memory
 
         saw_eos = has_eos.unsqueeze(-1).unsqueeze(-1)
 
