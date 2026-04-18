@@ -560,11 +560,27 @@ class Rotary(nn.Module):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
 
-    def forward(self, positions: Tensor, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        freqs = torch.outer(positions.to(self.inv_freq.dtype), self.inv_freq.to(device))
-        cos = freqs.cos()[None, None, :, :]
-        sin = freqs.sin()[None, None, :, :]
+    def forward(self, positions: Tensor, device: torch.device, dtype: torch.dtype):
+        seq_len = positions.size(0)
+
+        if (
+            self._cos_cached is None
+            or self._seq_len_cached < seq_len
+            or self._cos_cached.device != device
+        ):
+            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq)
+            self._cos_cached = freqs.cos()[None, None, :, :]
+            self._sin_cached = freqs.sin()[None, None, :, :]
+            self._seq_len_cached = seq_len
+
+        cos = self._cos_cached[:, :, :seq_len, :]
+        sin = self._sin_cached[:, :, :seq_len, :]
+
         return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
@@ -1010,7 +1026,13 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     #compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     #model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-    model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
+    compiled_model = torch.compile(base_model, dynamic=False)
+
+    model: nn.Module = (
+        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+        if distributed
+        else compiled_model
+    )
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR (untied) or TIED_EMBED_LR (tied)
