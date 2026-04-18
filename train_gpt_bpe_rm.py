@@ -643,6 +643,10 @@ class CausalSelfAttention(nn.Module):
             mem_k, mem_v = kv_cache
 
         # CONCAT MEMORY (THIS IS THE POINT)
+        if mem_k.size(1) != k.size(1):
+            mem_k = mem_k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            mem_v = mem_v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+
         k = torch.cat([mem_k, k], dim=2)
         v = torch.cat([mem_v, v], dim=2)
 
