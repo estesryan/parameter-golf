@@ -69,19 +69,19 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
-    num_layers = int(os.environ.get("NUM_LAYERS", 5))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
+    num_layers = int(os.environ.get("NUM_LAYERS", 6))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 2))
     model_dim = int(os.environ.get("MODEL_DIM", 576))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.75))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.25))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Recurrent memory.
     use_recurrence = bool(int(os.environ.get("USE_RECURRENCE", "1")))
-    memory_tokens = int(os.environ.get("MEMORY_TOKENS", 64))
-    memory_layers = int(os.environ.get("MEMORY_LAYERS", 2))  # 0 means all layers
+    memory_tokens = int(os.environ.get("MEMORY_TOKENS", 32))
+    memory_layers = int(os.environ.get("MEMORY_LAYERS", 2))  # 0 = all layers
     memory_momentum = float(os.environ.get("MEMORY_MOMENTUM", 0.0))
 
     # Optimizer hyperparameters.
@@ -799,7 +799,15 @@ class GPT(nn.Module):
             block_idx = self.num_encoder_layers + i
 
             # split memory / tokens
-            if memory is not None:
+            use_memory = (
+                memory is not None
+                and (
+                    self.memory_layers == 0
+                    or i >= (self.num_decoder_layers - self.memory_layers)
+                )
+            )
+
+            if use_memory:
                 mem = x[:, :self.memory_tokens, :]
                 tok = x[:, self.memory_tokens:, :]
             else:
@@ -812,7 +820,7 @@ class GPT(nn.Module):
                 tok = tok + self.skip_weights[i].to(dtype=tok.dtype)[None, None, :] * skip
 
             # reassemble
-            if mem is not None:
+            if use_memory:
                 x = torch.cat([mem, tok], dim=1)
             else:
                 x = tok
