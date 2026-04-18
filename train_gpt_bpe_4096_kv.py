@@ -255,7 +255,6 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    val_memories: list[Tensor | None] | None = None
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
@@ -265,8 +264,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss, val_memories = model(x, y, memories=val_memories, return_memories=True)
-                batch_loss = batch_loss.detach()
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -550,32 +548,28 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
+    # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
-        self._cos_cached = None
-        self._sin_cached = None
+        self._cos_cached: Tensor | None = None
+        self._sin_cached: Tensor | None = None
 
-    def forward(self, positions: Tensor, device: torch.device, dtype: torch.dtype):
-        seq_len = positions.size(0)
-
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
         if (
             self._cos_cached is None
-            or self._seq_len_cached < seq_len
+            or self._sin_cached is None
+            or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
         ):
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq.to(device))
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
-
-        cos = self._cos_cached[:, :, :seq_len, :]
-        sin = self._sin_cached[:, :, :seq_len, :]
-
-        return cos.to(dtype=dtype), sin.to(dtype=dtype)
+        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -611,30 +605,18 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
-        self.kv_memory_tokens = 32
 
-    def forward(self, x: Tensor, positions: Tensor, kv_cache=None):
+    def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-
-        cos, sin = self.rotary(positions, x.device, q.dtype)
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-
-        # KV MEMORY INJECTION
-        if kv_cache is not None:
-            mem_k, mem_v = kv_cache
-            k = torch.cat([mem_k, k], dim=2)
-            v = torch.cat([mem_v, v], dim=2)
-
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -643,14 +625,8 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-
-        # SAVE NEW KV (last N tokens)
-        new_k = k[:, :, -self.kv_memory_tokens:, :].detach()
-        new_v = v[:, :, -self.kv_memory_tokens:, :].detach()
-
-        return self.proj(y), (new_k, new_v)
+        return self.proj(y)
 
 
 class MLP(nn.Module):
@@ -680,23 +656,21 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(
-            dim,
-            num_heads,
-            num_kv_heads,
-            rope_base,
-            qk_gain_init,
-        )
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x, x0, positions, kv_cache=None):
-        attn_out, new_kv = self.attn(self.attn_norm(x), positions, kv_cache)
-        x = x + self.attn_scale[None, None, :] * attn_out
-        x = x + self.mlp_scale[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x, new_kv
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+        attn_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
 
 
 class GPT(nn.Module):
@@ -752,84 +726,32 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
-    
-    
-    def forward(
-        self,
-        input_ids: Tensor,
-        target_ids: Tensor,
-        memories: list[tuple[Tensor, Tensor] | None] | None = None,
-        return_memories: bool = False,
-    ):
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+
         x = F.rms_norm(x, (x.size(-1),))
-
-        # init KV memory per layer
-        if memories is None:
-            kv_memories = [None] * self.num_layers
-        else:
-            kv_memories = memories
-
-        new_kv_memories = []
-
+        x0 = x
         skips: list[Tensor] = []
 
-        # encoder
         for i in range(self.num_encoder_layers):
-            positions = torch.arange(x.size(1), device=x.device)
-
-            kv = None
-
-            x, new_kv = self.blocks[i](
-                x,
-                x,
-                positions,
-                kv,
-            )
-
-            new_kv_memories.append(None)
+            x = self.blocks[i](x, x0)
             skips.append(x)
-
-        # decoder
         for i in range(self.num_decoder_layers):
-            block_idx = self.num_encoder_layers + i
-
-            tok = x
             if skips:
-                skip = skips.pop()
-                tok = tok[:, -skip.size(1):, :]
-                tok = tok + self.skip_weights[i].to(dtype=tok.dtype)[None, None, :] * skip
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-            x = tok
-            positions = torch.arange(x.size(1), device=x.device)
-
-            kv = kv_memories[block_idx] if block_idx >= self.num_layers - 2 else None
-
-            x, new_kv = self.blocks[block_idx](
-                x,
-                x,
-                positions,
-                kv,
-            )
-
-            new_kv_memories.append(new_kv if kv is not None else None)
-
-        # head
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-
-        if return_memories:
-            return loss, new_kv_memories
-
-        return loss
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -1024,7 +946,6 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    train_memories: list[Tensor | None] | None = None
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1067,9 +988,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss, train_memories = model(
-                        x, y, memories=train_memories, return_memories=True
-                    )
+                    warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1080,7 +999,6 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
-        train_memories = None
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1138,9 +1056,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss, train_memories = model(
-                    x, y, memories=train_memories, return_memories=True
-                )
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
