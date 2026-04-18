@@ -67,13 +67,12 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
     num_layers = int(os.environ.get("NUM_LAYERS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 2))
-    model_dim = int(os.environ.get("MODEL_DIM", 576))
+    model_dim = int(os.environ.get("MODEL_DIM", 480))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.25))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    mtp_tokens = int(os.environ.get("MTP_TOKENS", 2))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -261,7 +260,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y, use_mtp=False).detach()
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -657,7 +656,6 @@ class GPT(nn.Module):
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
-        mtp_tokens: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -665,7 +663,6 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.mtp_tokens = mtp_tokens
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_layers = num_layers
         self.blocks = nn.ModuleList(
@@ -684,13 +681,6 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        # Extra heads for offsets +2 ... +mtp_tokens; offset +1 uses the primary head above.
-        n_extra = max(0, mtp_tokens - 1)
-        self.extra_lm_heads = nn.ModuleList(
-            [CastedLinear(model_dim, vocab_size, bias=False) for _ in range(n_extra)]
-        )
-        for head in self.extra_lm_heads:
-            head._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -701,41 +691,23 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, use_mtp: bool = True) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
 
         for block in self.blocks:
             x = block(x)
 
-        x_flat = self.final_norm(x).reshape(-1, x.size(-1))
-        targets_flat = target_ids.reshape(-1)
-
-        # Primary head: offset +1 (standard next-token). targets_flat[i] is already the +1 token.
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x_flat, self.tok_emb.weight)
+            logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x_flat)
+            logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        loss = F.cross_entropy(logits.float(), targets_flat, reduction="mean")
-
-        # Extra MTP heads for offsets +2 ... +mtp_tokens.
-        # For offset +(j+2), shift j+1: x_flat[:-shift] predicts targets_flat[shift:].
-        # (targets_flat is pre-shifted by 1, so targets_flat[i+shift] = token at position i+shift+1.)
-        if use_mtp and self.mtp_tokens > 1:
-            for j, head in enumerate(self.extra_lm_heads):
-                shift = j + 1
-                extra_logits = self.logit_softcap * torch.tanh(
-                    head(x_flat[:-shift]) / self.logit_softcap
-                )
-                loss = loss + F.cross_entropy(
-                    extra_logits.float(), targets_flat[shift:], reduction="mean"
-                )
-            loss = loss / self.mtp_tokens
-
-        return loss
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -848,12 +820,7 @@ def main() -> None:
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
-        mtp_tokens=args.mtp_tokens,
     ).to(device).bfloat16()
-    global INT8_EXACT_NAMES
-    INT8_EXACT_NAMES = set(INT8_EXACT_NAMES)
-    for i in range(len(base_model.extra_lm_heads)):
-        INT8_EXACT_NAMES.add(f"extra_lm_heads.{i}.weight")
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -891,13 +858,9 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    head_params = []
     if base_model.lm_head is not None:
-        head_params.append(base_model.lm_head.weight)
-    head_params.extend(base_model.extra_lm_heads.parameters())
-    if head_params:
         optimizer_head = torch.optim.Adam(
-            [{"params": head_params, "lr": args.head_lr, "base_lr": args.head_lr}],
+            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -906,15 +869,13 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"mtp_tokens:{args.mtp_tokens}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     attn_mode = "gqa" if args.num_kv_heads != args.num_heads else "mha"
     log0(f"attention_mode:{attn_mode} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    has_head_params = (base_model.lm_head is not None) or (len(base_model.extra_lm_heads) > 0)
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if has_head_params else 0.0} "
+        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
