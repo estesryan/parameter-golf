@@ -271,7 +271,7 @@ def eval_val(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss, val_memory = model(x, y, memory=val_memory, return_memory=True)
                 batch_loss = batch_loss.detach()
-                val_memory = val_memory.clone()
+                val_memory = val_memory.detach().clone().requires_grad_(False)
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -1091,6 +1091,7 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            train_memory = None
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
