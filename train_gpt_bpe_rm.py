@@ -799,9 +799,15 @@ class GPT(nn.Module):
                 skip = skips.pop()
 
                 if x.size(1) != skip.size(1):
-                    skip = skip[:, -x.size(1):, :]
+                    # remove memory part from x before adding skip
+                    x_main = x[:, -skip.size(1):, :]
+                    x = x_main + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
 
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
+                    # reattach memory after skip
+                    if memory is not None:
+                        x = torch.cat([memory, x], dim=1)
+                else:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
 
             x = self.blocks[block_idx](x, x0)
 
