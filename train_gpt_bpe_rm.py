@@ -594,7 +594,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        use_recurrence: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -614,9 +613,8 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
-        self.use_recurrence = use_recurrence
 
-    def forward(self, x: Tensor, memory: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
 
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -632,39 +630,14 @@ class CausalSelfAttention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        if self.use_recurrence and memory is not None:
-            mem_len = memory.size(1)
-
-            mk = self.c_k(memory).reshape(bsz, mem_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            mv = self.c_v(memory).reshape(bsz, mem_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-            mk = F.rms_norm(mk, (mk.size(-1),))
-
-            # Memory is treated as prefix context, so no RoPE is applied initially.
-            # Keep this simple first; relative positioning tricks can come later.
-
-            k_all = torch.cat([mk, k], dim=2)
-            v_all = torch.cat([mv, v], dim=2)
-
-            # Build causal mask so each token can attend to all memory + past/current chunk tokens.
-            mask = torch.ones((seqlen, mem_len + seqlen), device=x.device, dtype=torch.bool).tril(diagonal=mem_len)
-            y = F.scaled_dot_product_attention(
-                q,
-                k_all,
-                v_all,
-                attn_mask=mask[None, None, :, :],
-                is_causal=False,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
-            )
-        else:
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                is_causal=True,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
-            )
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
 
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
@@ -693,7 +666,6 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        use_recurrence: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -704,18 +676,17 @@ class Block(nn.Module):
             num_kv_heads,
             rope_base,
             qk_gain_init,
-            use_recurrence=use_recurrence,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, memory: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
-        attn_out = self.attn(self.attn_norm(x), memory=memory)
+        attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -766,7 +737,6 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    use_recurrence=use_recurrence,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -801,37 +771,36 @@ class GPT(nn.Module):
         return_memories: bool = False,
     ) -> Tensor | tuple[Tensor, list[Tensor | None]]:
         x = self.tok_emb(input_ids)
+        orig_seq_len = x.size(1)
+
+        memory: Tensor | None = None
+        if self.use_recurrence and memories is not None:
+            memory = memories[-1]
+            if memory is not None:
+                x = torch.cat([memory, x], dim=1)
 
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
-        if memories is None:
-            memories = [None] * self.num_layers
-        new_memories: list[Tensor | None] = [None] * self.num_layers
-
-        def use_mem_for_layer(layer_idx: int) -> bool:
-            if not self.use_recurrence:
-                return False
-            if self.memory_layers <= 0:
-                return True
-            return layer_idx >= self.num_layers - self.memory_layers
-
         for i in range(self.num_encoder_layers):
-            mem = memories[i] if use_mem_for_layer(i) else None
-            x = self.blocks[i](x, x0, memory=mem)
+            x = self.blocks[i](x, x0)
             skips.append(x)
-            if use_mem_for_layer(i):
-                new_memories[i] = self._update_memory(mem, x.detach())
 
         for i in range(self.num_decoder_layers):
             block_idx = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            mem = memories[block_idx] if use_mem_for_layer(block_idx) else None
-            x = self.blocks[block_idx](x, x0, memory=mem)
-            if use_mem_for_layer(block_idx):
-                new_memories[block_idx] = self._update_memory(mem, x.detach())
+            x = self.blocks[block_idx](x, x0)
+
+        # Update memory from the final hidden states before trimming.
+        new_memory: Tensor | None = None
+        if self.use_recurrence:
+            new_memory = self._update_memory(memory, x.detach())
+
+        # Remove memory prefix before computing loss.
+        if memory is not None:
+            x = x[:, -orig_seq_len:, :]
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -845,7 +814,9 @@ class GPT(nn.Module):
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
         if return_memories:
-            return loss, new_memories
+            if self.use_recurrence:
+                return loss, [new_memory]
+            return loss, [None]
         return loss
 
 
@@ -891,7 +862,7 @@ def main() -> None:
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(True)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -969,9 +940,8 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    #compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    #model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-    model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR (untied) or TIED_EMBED_LR (tied)
@@ -1026,7 +996,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=True")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     attn_mode = "gqa" if args.num_kv_heads != args.num_heads else "mha"
     log0(f"attention_mode:{attn_mode} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
