@@ -778,14 +778,6 @@ class GPT(nn.Module):
 
         memory: Tensor | None = None
 
-        if self.use_recurrence and memories is not None:
-            candidate = memories[-1]
-
-            # Only use memory if batch size matches
-            if candidate is not None and candidate.size(0) == x.size(0):
-                memory = candidate
-                x = torch.cat([memory, x], dim=1)
-
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -793,6 +785,14 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
+
+        # inject memory only into decoder half
+        memory = None
+        if self.use_recurrence and memories is not None:
+            candidate = memories[-1]
+            if candidate is not None and candidate.size(0) == x.size(0):
+                memory = candidate
+                x = torch.cat([memory, x], dim=1)
 
         for i in range(self.num_decoder_layers):
             block_idx = self.num_encoder_layers + i
