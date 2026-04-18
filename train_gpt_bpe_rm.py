@@ -807,7 +807,7 @@ class GPT(nn.Module):
                 )
             )
 
-            if use_memory:
+            if memory is not None:
                 mem = x[:, :self.memory_tokens, :]
                 tok = x[:, self.memory_tokens:, :]
             else:
