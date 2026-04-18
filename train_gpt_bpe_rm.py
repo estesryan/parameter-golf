@@ -774,9 +774,13 @@ class GPT(nn.Module):
         orig_seq_len = x.size(1)
 
         memory: Tensor | None = None
+
         if self.use_recurrence and memories is not None:
-            memory = memories[-1]
-            if memory is not None:
+            candidate = memories[-1]
+
+            # Only use memory if batch size matches
+            if candidate is not None and candidate.size(0) == x.size(0):
+                memory = candidate
                 x = torch.cat([memory, x], dim=1)
 
         x = F.rms_norm(x, (x.size(-1),))
