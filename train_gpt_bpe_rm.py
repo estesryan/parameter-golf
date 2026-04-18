@@ -45,10 +45,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp5120")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp4096")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_5120_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_4096_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -68,7 +68,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 2.0))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 3072))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
     num_layers = int(os.environ.get("NUM_LAYERS", 5))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 576))
@@ -77,6 +77,12 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Recurrent memory.
+    use_recurrence = bool(int(os.environ.get("USE_RECURRENCE", "1")))
+    memory_tokens = int(os.environ.get("MEMORY_TOKENS", 64))
+    memory_layers = int(os.environ.get("MEMORY_LAYERS", 2))  # 0 means all layers
+    memory_momentum = float(os.environ.get("MEMORY_MOMENTUM", 0.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -255,6 +261,7 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
+    val_memories: list[Tensor | None] | None = None
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
@@ -264,7 +271,8 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss, val_memories = model(x, y, memories=val_memories, return_memories=True)
+                batch_loss = batch_loss.detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -586,6 +594,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_recurrence: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -605,26 +614,58 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_recurrence = use_recurrence
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, memory: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
+
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
+
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+
+        if self.use_recurrence and memory is not None:
+            mem_len = memory.size(1)
+
+            mk = self.c_k(memory).reshape(bsz, mem_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            mv = self.c_v(memory).reshape(bsz, mem_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+            mk = F.rms_norm(mk, (mk.size(-1),))
+
+            # Memory is treated as prefix context, so no RoPE is applied initially.
+            # Keep this simple first; relative positioning tricks can come later.
+
+            k_all = torch.cat([mk, k], dim=2)
+            v_all = torch.cat([mv, v], dim=2)
+
+            # Build causal mask so each token can attend to all memory + past/current chunk tokens.
+            mask = torch.ones((seqlen, mem_len + seqlen), device=x.device, dtype=torch.bool).tril(diagonal=mem_len)
+            y = F.scaled_dot_product_attention(
+                q,
+                k_all,
+                v_all,
+                attn_mask=mask[None, None, :, :],
+                is_causal=False,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -652,21 +693,29 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_recurrence: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            use_recurrence=use_recurrence,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, memory: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), memory=memory)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -687,6 +736,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_recurrence: bool = False,
+        memory_tokens: int = 64,
+        memory_layers: int = 0,
+        memory_momentum: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -700,6 +753,10 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.use_recurrence = use_recurrence
+        self.memory_tokens = memory_tokens
+        self.memory_layers = memory_layers
+        self.memory_momentum = memory_momentum
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -709,6 +766,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_recurrence=use_recurrence,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -727,20 +785,53 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def _update_memory(self, old_memory: Tensor | None, hidden: Tensor) -> Tensor:
+        new_memory = hidden[:, -self.memory_tokens :, :]
+        if old_memory is None or self.memory_momentum <= 0.0:
+            return new_memory
+        keep = self.memory_momentum
+        take = 1.0 - keep
+        return keep * old_memory + take * new_memory
+    
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        memories: list[Tensor | None] | None = None,
+        return_memories: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor | None]]:
         x = self.tok_emb(input_ids)
 
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
+        if memories is None:
+            memories = [None] * self.num_layers
+        new_memories: list[Tensor | None] = [None] * self.num_layers
+
+        def use_mem_for_layer(layer_idx: int) -> bool:
+            if not self.use_recurrence:
+                return False
+            if self.memory_layers <= 0:
+                return True
+            return layer_idx >= self.num_layers - self.memory_layers
+
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            mem = memories[i] if use_mem_for_layer(i) else None
+            x = self.blocks[i](x, x0, memory=mem)
             skips.append(x)
+            if use_mem_for_layer(i):
+                new_memories[i] = self._update_memory(mem, x.detach())
+
         for i in range(self.num_decoder_layers):
+            block_idx = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            mem = memories[block_idx] if use_mem_for_layer(block_idx) else None
+            x = self.blocks[block_idx](x, x0, memory=mem)
+            if use_mem_for_layer(block_idx):
+                new_memories[block_idx] = self._update_memory(mem, x.detach())
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -751,7 +842,11 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        if return_memories:
+            return loss, new_memories
+        return loss
 
 
 # -----------------------------
@@ -865,6 +960,10 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_recurrence=args.use_recurrence,
+        memory_tokens=args.memory_tokens,
+        memory_layers=args.memory_layers,
+        memory_momentum=args.memory_momentum,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -946,6 +1045,7 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_memories: list[Tensor | None] | None = None
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -988,7 +1088,9 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss, train_memories = model(
+                        x, y, memories=train_memories, return_memories=True
+                    )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -999,6 +1101,7 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
+        train_memories = None
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1056,7 +1159,9 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss, train_memories = model(
+                    x, y, memories=train_memories, return_memories=True
+                )
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
