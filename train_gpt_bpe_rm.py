@@ -1026,7 +1026,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=True")
     attn_mode = "gqa" if args.num_kv_heads != args.num_heads else "mha"
     log0(f"attention_mode:{attn_mode} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
