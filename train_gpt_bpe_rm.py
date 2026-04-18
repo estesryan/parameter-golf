@@ -792,13 +792,11 @@ class GPT(nn.Module):
             candidate = memories[-1]
             if candidate is not None and candidate.size(0) == x.size(0):
                 memory = candidate
-                x = torch.cat([memory, x], dim=1)
 
         # decoder
         for i in range(self.num_decoder_layers):
             block_idx = self.num_encoder_layers + i
 
-            # split memory / tokens
             use_memory = (
                 memory is not None
                 and (
@@ -807,26 +805,20 @@ class GPT(nn.Module):
                 )
             )
 
-            if memory is not None:
-                mem = x[:, :self.memory_tokens, :]
-                tok = x[:, self.memory_tokens:, :]
-            else:
-                mem = None
-                tok = x
-
-            # apply skip only to token region
+            tok = x
             if skips:
                 skip = skips.pop()
+                tok = tok[:, -skip.size(1):, :]
                 tok = tok + self.skip_weights[i].to(dtype=tok.dtype)[None, None, :] * skip
 
-            # reassemble
             if use_memory:
-                x = torch.cat([mem, tok], dim=1)
+                x = torch.cat([memory, tok], dim=1)
+                x0_block = torch.cat([memory.detach(), tok], dim=1)
             else:
                 x = tok
+                x0_block = tok
 
-            # standard block
-            x = self.blocks[block_idx](x, x)
+            x = self.blocks[block_idx](x, x0_block)
 
         # update memory from full sequence
         new_memory: Tensor | None = None
