@@ -762,18 +762,17 @@ class GPT(nn.Module):
 
     def _update_memory(self, old_memory: Tensor | None, hidden: Tensor, input_ids: Tensor) -> Tensor:
         tail_hidden = hidden[:, -self.memory_tokens :, :]
-        new_memory = tail_hidden.mean(dim=1, keepdim=True).expand(-1, self.memory_tokens, -1)  # pooled summary of recent tokens (stable long-range context vs copying noisy last tokens)
+        new_memory = tail_hidden.mean(dim=1, keepdim=True).expand(-1, self.memory_tokens, -1)  # EOS-aware pooled summary of recent tokens (stable long-range context vs copying noisy last tokens)
 
         if old_memory is None:
             return new_memory
 
         saw_eos = (input_ids[:, -self.memory_tokens:] == self.eos_id).any(dim=1, keepdim=True).unsqueeze(-1)
-        old_memory = torch.where(saw_eos, torch.zeros_like(old_memory), old_memory)
 
         if self.memory_momentum <= 0.0:
             return new_memory
 
-        keep = self.memory_momentum
+        keep = torch.where(saw_eos, torch.zeros_like(old_memory[:, :1, :]), torch.full_like(old_memory[:, :1, :], self.memory_momentum))
         take = 1.0 - keep
         return keep * old_memory + take * new_memory
     
