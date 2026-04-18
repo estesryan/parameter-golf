@@ -74,7 +74,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 576))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.25))
-    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -655,15 +655,16 @@ class CausalSelfAttention(nn.Module):
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         else:
+            if self.num_kv_heads != self.num_heads:
+                repeat_factor = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeat_factor, dim=1)
+                v = v.repeat_interleave(repeat_factor, dim=1)
+
+            scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
             mask = torch.ones(seqlen, kv_len, device=x.device, dtype=torch.bool).tril(diagonal=mem_len)
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask[None, None, :, :],
-                is_causal=False,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
-            )
+            scores = scores.masked_fill(~mask[None, None, :, :], float("-inf"))
+            attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(dtype=q.dtype)
+            y = torch.matmul(attn, v)
 
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
