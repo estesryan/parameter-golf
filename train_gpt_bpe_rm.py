@@ -81,7 +81,7 @@ class Hyperparameters:
     # Recurrent memory.
     use_recurrence = bool(int(os.environ.get("USE_RECURRENCE", "1")))
     memory_tokens = int(os.environ.get("MEMORY_TOKENS", 32))
-    memory_layers = int(os.environ.get("MEMORY_LAYERS", 2))  # 0 = all layers
+    memory_layers = int(os.environ.get("MEMORY_LAYERS", 2))  # 0 = memory in ALL decoder layers
     memory_momentum = float(os.environ.get("MEMORY_MOMENTUM", 0.0))
 
     # Optimizer hyperparameters.
@@ -759,7 +759,7 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def _update_memory(self, old_memory: Tensor | None, hidden: Tensor) -> Tensor:
-        new_memory = hidden[:, -self.memory_tokens :, :]
+        new_memory = hidden[:, -self.memory_tokens :, :].mean(dim=1, keepdim=True).expand(-1, self.memory_tokens, -1)
         if old_memory is None or self.memory_momentum <= 0.0:
             return new_memory
         keep = self.memory_momentum
