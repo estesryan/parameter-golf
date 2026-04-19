@@ -878,7 +878,7 @@ def main() -> None:
         prob = freq / freq.sum()
         prob.clamp_(min=1e-12)
 
-        tau = 5.0
+        tau = 2.0
         with torch.no_grad():
             base_model.output_bias.copy_(tau * torch.log(prob).to(device=device, dtype=torch.float32))
 
