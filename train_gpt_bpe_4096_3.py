@@ -64,6 +64,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 196_608))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
+    seq_len_schedule = os.environ.get("SEQ_LEN_SCHEDULE", "0.0:1024,0.3:2048")
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 2.0))
 
@@ -93,7 +94,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
-    seq_len_schedule = os.environ.get("SEQ_LEN_SCHEDULE", "0.0:1024,0.3:2048")
 
 # -----------------------------
 # SEQ LEN SCHEDULE HELPERS
