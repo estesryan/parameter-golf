@@ -880,7 +880,7 @@ def main() -> None:
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR (untied) or TIED_EMBED_LR (tied)
-    # - untied lm_head (Adam) uses HEAD_LR
+    # - untied lm_head.weight uses MATRIX_LR via Muon; lm_head.bias uses SCALAR_LR via Adam
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
@@ -895,9 +895,13 @@ def main() -> None:
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
+    if base_model.lm_head is not None:
+        matrix_params.append(base_model.lm_head.weight)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.logit_scale)
+    if base_model.lm_head is not None and base_model.lm_head.bias is not None:
+        scalar_params.append(base_model.lm_head.bias)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -920,14 +924,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight, base_model.lm_head.bias], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -937,7 +933,8 @@ def main() -> None:
     log0(f"attention_mode:{attn_mode} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+        f"head_weight_lr:{args.matrix_lr if base_model.lm_head is not None else 0.0} "
+        f"head_bias_lr:{args.scalar_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
