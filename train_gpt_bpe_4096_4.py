@@ -621,7 +621,7 @@ class CastedLinear(nn.Linear):
     def refresh_forward_weight(self) -> None:
         # Update the bf16 forward-weight buffer in place when possible to avoid
         # replacing the buffer object on every step (more stable for torch.compile).
-        w = self.weight.detach().to(torch.bfloat16)
+        w = self.weight.to(torch.bfloat16)
         if (
             self.weight_bf16 is None
             or self.weight_bf16.shape != w.shape
