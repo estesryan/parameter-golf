@@ -634,14 +634,12 @@ class MLP(nn.Module):
         super().__init__()
         hidden = int(round(mlp_mult * dim))
         self.fc = CastedLinear(dim, hidden, bias=False)
-        self.gate = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        f = self.fc(x)
-        g = torch.sigmoid(self.gate(x))
-        return self.proj(f * g)
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
 
 
 class Block(nn.Module):
