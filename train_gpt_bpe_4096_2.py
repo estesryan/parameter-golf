@@ -852,18 +852,6 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
-    freq_counts = torch.zeros(args.vocab_size, dtype=torch.float64)
-    freq_loader = TokenStream(args.train_files)
-    freq_sample_tokens = 5_000_000
-    sample = freq_loader.take(freq_sample_tokens)
-    counts = torch.bincount(sample.to(torch.int64), minlength=args.vocab_size)
-    freq_counts += counts.double()
-    freq_probs = freq_counts / freq_counts.sum()
-    weights = torch.sqrt(freq_probs + 1e-8)
-    weights = weights / weights.mean()
-    freq_weights = weights.to(device=device, dtype=torch.float32)
-    log0(f"freq_weights:computed sample_tokens:{freq_sample_tokens} min:{freq_weights.min().item():.4f} max:{freq_weights.max().item():.4f}")
-
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
@@ -1071,10 +1059,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = model.module.forward_logits(x) if isinstance(model, DDP) else model.forward_logits(x)
-                targets = y.reshape(-1)
-                per_token_loss = F.cross_entropy(logits.float(), targets, reduction="none")
-                loss = (per_token_loss * freq_weights[targets]).mean()
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
