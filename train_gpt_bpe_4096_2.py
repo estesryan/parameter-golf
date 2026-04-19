@@ -658,8 +658,10 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
+        self.mlp2 = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp2_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -669,7 +671,9 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_in = self.mlp_norm(x)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_in)
+        x = x + self.mlp2_scale.to(dtype=x.dtype)[None, None, :] * self.mlp2(mlp_in)
         return x
 
 
@@ -714,7 +718,6 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
-        self.logit_scale = nn.Parameter(torch.ones(vocab_size, dtype=torch.float32))
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=True)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -750,7 +753,6 @@ class GPT(nn.Module):
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
-        logits_proj = logits_proj * self.logit_scale.to(dtype=logits_proj.dtype)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -895,13 +897,8 @@ def main() -> None:
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
-    if base_model.lm_head is not None:
-        matrix_params.append(base_model.lm_head.weight)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_params.append(base_model.logit_scale)
-    if base_model.lm_head is not None and base_model.lm_head.bias is not None:
-        scalar_params.append(base_model.lm_head.bias)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -909,6 +906,14 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
+    optimizer_head = None
+    if base_model.lm_head is not None:
+        optimizer_head = torch.optim.Adam(
+            [{"params": base_model.lm_head.parameters(), "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
@@ -923,7 +928,10 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok]
+    if optimizer_head is not None:
+        optimizers.append(optimizer_head)
+    optimizers.extend([optimizer_muon, optimizer_scalar])
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -933,8 +941,7 @@ def main() -> None:
     log0(f"attention_mode:{attn_mode} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_weight_lr:{args.matrix_lr if base_model.lm_head is not None else 0.0} "
-        f"head_bias_lr:{args.scalar_lr if base_model.lm_head is not None else 0.0} "
+        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
