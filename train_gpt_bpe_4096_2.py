@@ -714,6 +714,7 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        self.logit_scale = nn.Parameter(torch.ones(vocab_size, dtype=torch.float32))
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=True)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -749,6 +750,7 @@ class GPT(nn.Module):
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
+        logits_proj = logits_proj * self.logit_scale.to(dtype=logits_proj.dtype)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -895,6 +897,7 @@ def main() -> None:
 
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_params.append(base_model.logit_scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
