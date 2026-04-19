@@ -8,7 +8,6 @@ GPT training script using a 4096-vocab BPE tokenizer.
 - Per-head q_gain scaling with QK RMSNorm
 - RoPE positional embeddings
 - relu² MLP activation
-- Logit soft-capping prior to cross-entropy
 - Muon optimizer for matrix-shaped parameters; Adam for embeddings and scalars
 - Mixed int6/int8 post-training quantization with GPTQ-Lite per-row optimal clip search
   and zstd compression (level 22)
@@ -714,13 +713,9 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
-        if tie_embeddings:
-            self.lm_head = None
-        else:
-            self.mos_k = 2
-            self.mos_proj = CastedLinear(model_dim, self.mos_k * model_dim, bias=False)
-            self.mos_gate = CastedLinear(model_dim, self.mos_k, bias=True)
-            self.lm_head = CastedLinear(model_dim, vocab_size, bias=True)
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=True)
+        if self.lm_head is not None:
+            self.lm_head._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -751,18 +746,10 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-            logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-            return F.cross_entropy(logits.float(), targets, reduction="mean")
+            logits = F.linear(x, self.tok_emb.weight)
         else:
-            h = self.mos_proj(x).view(-1, self.mos_k, x.size(-1))
-            gate_logits = self.mos_gate(x).float()
-            gate_log_probs = F.log_softmax(gate_logits, dim=-1)
-            component_logits = self.lm_head(h.reshape(-1, x.size(-1))).view(-1, self.mos_k, self.lm_head.out_features)
-            component_logits = self.logit_softcap * torch.tanh(component_logits / self.logit_softcap)
-            component_log_probs = F.log_softmax(component_logits.float(), dim=-1)
-            mix_log_probs = torch.logsumexp(component_log_probs + gate_log_probs.unsqueeze(-1), dim=1)
-            return F.nll_loss(mix_log_probs, targets, reduction="mean")
+            logits = self.lm_head(x)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -927,13 +914,7 @@ def main() -> None:
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
-            [{"params": [
-                base_model.mos_proj.weight,
-                base_model.mos_gate.weight,
-                base_model.mos_gate.bias,
-                base_model.lm_head.weight,
-                base_model.lm_head.bias,
-            ], "lr": args.head_lr, "base_lr": args.head_lr}],
+            [{"params": [base_model.lm_head.weight, base_model.lm_head.bias], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
