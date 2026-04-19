@@ -93,9 +93,57 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
+    seq_len_schedule = os.environ.get("SEQ_LEN_SCHEDULE", "0.0:1024,0.3:2048")
 
 # -----------------------------
-# MUON OPTIMIZER 
+# SEQ LEN SCHEDULE HELPERS
+# -----------------------------
+
+def parse_seq_len_schedule(spec: str | None, default_seq_len: int) -> list[tuple[float, int]]:
+    if not spec:
+        return [(0.0, default_seq_len)]
+    entries = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        frac_str, seq_str = part.split(":")
+        frac = float(frac_str.strip())
+        seq = int(seq_str.strip())
+        if not (0.0 <= frac <= 1.0):
+            raise ValueError(f"SEQ_LEN_SCHEDULE fraction {frac} out of [0, 1]")
+        if seq <= 0:
+            raise ValueError(f"SEQ_LEN_SCHEDULE seq_len {seq} must be positive")
+        entries.append((frac, seq))
+    if not entries:
+        return [(0.0, default_seq_len)]
+    if entries[0][0] != 0.0:
+        raise ValueError("SEQ_LEN_SCHEDULE first entry must have fraction 0.0")
+    for i in range(1, len(entries)):
+        if entries[i][0] <= entries[i - 1][0]:
+            raise ValueError("SEQ_LEN_SCHEDULE fractions must be strictly ascending")
+    return entries
+
+
+def get_scheduled_seq_len(
+    schedule: list[tuple[float, int]],
+    elapsed_ms: float,
+    max_wallclock_ms: float | None,
+    fallback_seq_len: int,
+) -> int:
+    if max_wallclock_ms is None:
+        return fallback_seq_len
+    frac = min(max(elapsed_ms / max_wallclock_ms, 0.0), 1.0)
+    active = schedule[0][1]
+    for entry_frac, entry_seq in schedule:
+        if frac >= entry_frac:
+            active = entry_seq
+        else:
+            break
+    return active
+
+# -----------------------------
+# MUON OPTIMIZER
 # -----------------------------
 # 
 # As borrowed from modded-nanogpt
@@ -793,6 +841,7 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    seq_len_schedule = parse_seq_len_schedule(args.seq_len_schedule, args.train_seq_len)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -973,6 +1022,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"seq_len_schedule:{seq_len_schedule}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1010,24 +1060,40 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
+    # All distinct scheduled seq_lens are warmed to avoid compile/specialization stalls
+    # during timed training when the schedule transitions to a new sequence length.
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
-        for warmup_step in range(args.warmup_steps):
+
+        # Build an ordered list of warmup seq_lens: one pass through each distinct
+        # scheduled length (in schedule order), then fill remaining steps with the
+        # initial seq_len so the total warmup step count stays at args.warmup_steps.
+        distinct_seq_lens = list(dict.fromkeys(sl for _, sl in seq_len_schedule))
+        warmup_seq_lens = distinct_seq_lens[:]
+        remaining = args.warmup_steps - len(distinct_seq_lens)
+        if remaining > 0:
+            warmup_seq_lens += [seq_len_schedule[0][1]] * remaining
+        elif remaining < 0:
+            # More distinct lengths than warmup_steps — still warm every shape.
+            warmup_seq_lens = distinct_seq_lens
+
+        total_warmup = len(warmup_seq_lens)
+        for warmup_step, w_seq_len in enumerate(warmup_seq_lens):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(args.train_batch_tokens, w_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            if total_warmup <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == total_warmup:
+                log0(f"warmup_step:{warmup_step + 1}/{total_warmup} seq_len:{w_seq_len}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1042,6 +1108,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    active_seq_len: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1082,12 +1149,17 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        seq_len = get_scheduled_seq_len(seq_len_schedule, elapsed_ms, max_wallclock_ms, args.train_seq_len)
+        if seq_len != active_seq_len:
+            frac_now = elapsed_ms / max_wallclock_ms if max_wallclock_ms else 0.0
+            log0(f"seq_len_switch step:{step} frac:{frac_now:.3f} new_seq_len:{seq_len}")
+            active_seq_len = seq_len
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
