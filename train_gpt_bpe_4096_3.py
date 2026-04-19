@@ -588,7 +588,8 @@ class DistributedTokenLoader:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         self.stream.advance(self.rank * per_rank_span)
-        local = self.stream.take(per_rank_span).to(dtype=torch.int64)
+        # Pin host batch so non_blocking=True device copies below are truly asynchronous.
+        local = self.stream.take(per_rank_span).to(dtype=torch.int64).pin_memory()
         self.stream.advance((self.world_size - self.rank - 1) * per_rank_span)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
