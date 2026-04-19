@@ -58,13 +58,12 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 100000))
+    iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
     warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.30))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 196_608))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
-    seq_len_schedule = os.environ.get("SEQ_LEN_SCHEDULE", "")
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 2.0))
 
@@ -488,6 +487,19 @@ class TokenStream:
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
+    def advance(self, n: int) -> None:
+        # Skip forward n tokens without reading their values. Shard boundaries
+        # are handled the same way as take() so stream position stays consistent.
+        remaining = n
+        while remaining > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance_file()
+                continue
+            skip = min(remaining, avail)
+            self.pos += skip
+            remaining -= skip
+
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
         remaining = n
@@ -511,11 +523,16 @@ class DistributedTokenLoader:
         self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        # Rank-local partitioning at the stream level: each rank reads only its own
+        # non-overlapping span of per_rank_span tokens from the global chunk.
+        # Ranks before this one are skipped with advance() (no data copy), and ranks
+        # after are skipped the same way, so every rank's stream advances identically
+        # by per_rank_span * world_size and the global token order is preserved.
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
-        start = self.rank * per_rank_span
-        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        self.stream.advance(self.rank * per_rank_span)
+        local = self.stream.take(per_rank_span).to(dtype=torch.int64)
+        self.stream.advance((self.world_size - self.rank - 1) * per_rank_span)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
@@ -759,77 +776,6 @@ class GPT(nn.Module):
 
 
 # -----------------------------
-# SEQ_LEN SCHEDULE HELPERS
-# -----------------------------
-
-def parse_seq_len_schedule(spec: str | None, default_seq_len: int) -> list[tuple[float, int]]:
-    """Parse SEQ_LEN_SCHEDULE env var into a sorted list of (fraction, seq_len) tuples.
-
-    Format: "0.0:2048,0.6:4096"
-    Returns [(0.0, default_seq_len)] when spec is empty or None.
-    """
-    if not spec:
-        return [(0.0, default_seq_len)]
-
-    entries: list[tuple[float, int]] = []
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if ":" not in part:
-            raise ValueError(f"SEQ_LEN_SCHEDULE entry missing ':': {part!r}")
-        frac_str, sl_str = part.split(":", 1)
-        try:
-            frac = float(frac_str)
-        except ValueError:
-            raise ValueError(f"SEQ_LEN_SCHEDULE fraction not a float: {frac_str!r}")
-        try:
-            sl = int(sl_str)
-        except ValueError:
-            raise ValueError(f"SEQ_LEN_SCHEDULE seq_len not an integer: {sl_str!r}")
-        if not (0.0 <= frac <= 1.0):
-            raise ValueError(f"SEQ_LEN_SCHEDULE fraction {frac} not in [0.0, 1.0]")
-        if sl <= 0:
-            raise ValueError(f"SEQ_LEN_SCHEDULE seq_len must be positive, got {sl}")
-        if sl & (sl - 1) != 0:
-            print(f"WARNING: SEQ_LEN_SCHEDULE seq_len {sl} is not a power of two")
-        entries.append((frac, sl))
-
-    if not entries:
-        return [(0.0, default_seq_len)]
-
-    entries.sort(key=lambda t: t[0])
-    if entries[0][0] != 0.0:
-        raise ValueError(f"SEQ_LEN_SCHEDULE first fraction must be 0.0, got {entries[0][0]}")
-    for i in range(1, len(entries)):
-        if entries[i][0] <= entries[i - 1][0]:
-            raise ValueError(
-                f"SEQ_LEN_SCHEDULE fractions must be strictly ascending; "
-                f"{entries[i - 1][0]} >= {entries[i][0]}"
-            )
-    return entries
-
-
-def get_scheduled_seq_len(
-    schedule: list[tuple[float, int]],
-    elapsed_ms: float,
-    max_wallclock_ms: float | None,
-    fallback_seq_len: int,
-) -> int:
-    """Return the active seq_len for the current elapsed time."""
-    if max_wallclock_ms is None:
-        return fallback_seq_len
-    frac = min(elapsed_ms / max_wallclock_ms, 1.0)
-    active = schedule[0][1]
-    for threshold_frac, sl in schedule:
-        if frac >= threshold_frac:
-            active = sl
-        else:
-            break
-    return active
-
-
-# -----------------------------
 # TRAINING
 # -----------------------------
 
@@ -838,7 +784,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    seq_len_schedule = parse_seq_len_schedule(args.seq_len_schedule, args.train_seq_len)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1019,7 +964,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(f"seq_len_schedule:{seq_len_schedule}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1066,8 +1010,7 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                warmup_seq_len = get_scheduled_seq_len(seq_len_schedule, 0.0, max_wallclock_ms, args.train_seq_len)
-                x, y = train_loader.next_batch(args.train_batch_tokens, warmup_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1090,7 +1033,6 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    active_seq_len = get_scheduled_seq_len(seq_len_schedule, 0.0, max_wallclock_ms, args.train_seq_len)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1130,18 +1072,13 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        seq_len = get_scheduled_seq_len(seq_len_schedule, elapsed_ms, max_wallclock_ms, args.train_seq_len)
-        if seq_len != active_seq_len:
-            sched_frac = min(elapsed_ms / max_wallclock_ms, 1.0) if max_wallclock_ms is not None else 0.0
-            log0(f"seq_len_switch step:{step} frac:{sched_frac:.3f} new_seq_len:{seq_len}")
-            active_seq_len = seq_len
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
