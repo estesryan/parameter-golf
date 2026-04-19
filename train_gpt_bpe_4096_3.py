@@ -634,13 +634,27 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         hidden = int(round(mlp_mult * dim))
+
+        # ensure even for clean split
+        if hidden % 2 != 0:
+            hidden += 1
+
         self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+
+        self.proj1 = CastedLinear(hidden // 2, dim, bias=False)
+        self.proj2 = CastedLinear(hidden // 2, dim, bias=False)
+
+        self.proj1._zero_init = True
+        self.proj2._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        h = self.fc(x)
+        h1, h2 = torch.chunk(h, 2, dim=-1)
+
+        y1 = self.proj1(torch.relu(h1).square())
+        y2 = self.proj2(torch.relu(h2).square())
+
+        return y1 + y2
 
 
 class Block(nn.Module):
