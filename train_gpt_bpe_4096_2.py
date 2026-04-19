@@ -721,9 +721,6 @@ class GPT(nn.Module):
             self.mos_proj = CastedLinear(model_dim, self.mos_k * model_dim, bias=False)
             self.mos_gate = CastedLinear(model_dim, self.mos_k, bias=True)
             self.lm_head = CastedLinear(model_dim, vocab_size, bias=True)
-            self.mos_proj._zero_init = True
-            self.mos_gate._zero_init = True
-            self.lm_head._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
