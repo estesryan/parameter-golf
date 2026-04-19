@@ -695,7 +695,6 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.output_bias = nn.Parameter(torch.zeros(vocab_size, dtype=torch.float32))
         self.num_layers = num_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -746,7 +745,7 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight, self.output_bias)
+            logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -867,21 +866,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
-
-    if args.tie_embeddings:
-        # initialize output bias to log unigram token frequency (faster early calibration)
-        freq = torch.zeros(args.vocab_size, dtype=torch.float64)
-        for file in sorted(glob.glob(args.train_files)):
-            shard = load_data_shard(Path(file)).to(torch.int64)
-            freq += torch.bincount(shard, minlength=args.vocab_size).to(torch.float64)
-
-        prob = freq / freq.sum()
-        prob.clamp_(min=1e-12)
-
-        tau = 2.0
-        with torch.no_grad():
-            base_model.output_bias.copy_(tau * torch.log(prob).to(device=device, dtype=torch.float32))
-
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -910,7 +894,7 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight, base_model.output_bias], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
