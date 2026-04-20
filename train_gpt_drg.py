@@ -74,13 +74,14 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 576))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
-    max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 4))
-    recur_num_layers = int(os.environ.get("RECUR_NUM_LAYERS", 1))
-    recur_mlp_mult = float(os.environ.get("RECUR_MLP_MULT", 0.0))
-    recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 1.2))
+    max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 3))
+    recur_gate_loss_weight = float(os.environ.get("RECUR_GATE_LOSS_WEIGHT", 0.1))
+    recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 0.8))
+    use_recur_exit_gate = bool(int(os.environ.get("USE_RECUR_EXIT_GATE", "1")))
     log_recur_depth_mix = bool(int(os.environ.get("LOG_RECUR_DEPTH_MIX", "0")))
+    log_recur_gate_stats = bool(int(os.environ.get("LOG_RECUR_GATE_STATS", "0")))
+    recur_gate_margin = float(os.environ.get("RECUR_GATE_MARGIN", 0.02))
     recur_compute_penalty = float(os.environ.get("RECUR_COMPUTE_PENALTY", 0.01))
-    recur_skip_prob = float(os.environ.get("RECUR_SKIP_PROB", 0.3))
     recur_depth_alpha = float(os.environ.get("RECUR_DEPTH_ALPHA", 0.8))
     recur_warmup_frac_full = float(os.environ.get("RECUR_WARMUP_FRAC_FULL", 0.05))
     recur_warmup_frac_transition = float(os.environ.get("RECUR_WARMUP_FRAC_TRANSITION", 0.15))
@@ -642,8 +643,6 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        if mlp_mult <= 0:
-            raise ValueError("MLP should not be constructed with mlp_mult <= 0")
         hidden = int(round(mlp_mult * dim))
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
@@ -668,7 +667,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult) if mlp_mult > 0 else None
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -680,10 +679,24 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
-        if self.mlp is not None:
-            mlp_in = self.mlp_norm(x)
-            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_in)
+        mlp_in = self.mlp_norm(x)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_in)
         return x
+
+
+class ExitGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.proj = nn.Linear(dim, 1, bias=True)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.constant_(self.proj.bias, -2.0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Returns raw exit-gate logits of shape (B*T, 1)
+        h = self.norm(x).reshape(-1, x.size(-1))
+        return self.proj(h.to(self.proj.weight.dtype))
+
 
 class GPT(nn.Module):
     def __init__(
@@ -700,9 +713,6 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         max_recur_loops: int,
-        recur_num_layers: int,
-        recur_mlp_mult: float,
-        recur_skip_prob: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -711,9 +721,9 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.max_recur_loops = max_recur_loops
+        self.requested_loops = max_recur_loops
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.loop_emb = nn.Embedding(max_recur_loops, model_dim)
-        self.loop_scale = nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
         nn.init.zeros_(self.loop_emb.weight)
         self.num_layers = num_layers
         self.num_encoder_layers = num_layers // 2
@@ -733,22 +743,8 @@ class GPT(nn.Module):
                 for _ in range(self.num_layers)
             ]
         )
-        self.recur_num_layers = recur_num_layers
-        self.recur_mlp_mult = recur_mlp_mult
-        self.recur_skip_prob = recur_skip_prob
-        self.recur_blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    max(1, num_heads // 2),
-                    num_kv_heads,
-                    recur_mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for _ in range(self.recur_num_layers)
-            ]
-        )
+        # Gates sit between loop transitions: one per non-final loop
+        self.exit_gates = nn.ModuleList([ExitGate(model_dim) for _ in range(max_recur_loops - 1)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=True)
         if self.lm_head is not None:
@@ -776,11 +772,6 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         return x
 
-    def _run_recur_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
-        for block in self.recur_blocks:
-            x = block(x, x0)
-        return x
-
     def _to_logits(self, x: Tensor) -> Tensor:
         h = self.final_norm(x).reshape(-1, x.size(-1))
         if self.tie_embeddings:
@@ -794,61 +785,114 @@ class GPT(nn.Module):
         input_ids: Tensor,
         target_ids: Tensor,
         recur_aux_loss_weight: float = 0.5,
+        recur_gate_loss_weight: float = 0.1,
+        use_recur_exit_gate: bool = True,
+        recur_gate_margin: float = 0.02,
     ) -> tuple[Tensor, Tensor, Tensor, dict]:
-        loops_to_run = self.max_recur_loops
+        # requested_loops selects which logits/gates/losses are active; graph always runs full depth
+        requested_loops = self.requested_loops
+        if requested_loops < 1:
+            requested_loops = self.max_recur_loops
+
+        requested_idx = requested_loops - 1
+        loop_index = torch.arange(self.max_recur_loops, device=input_ids.device)
+        final_mask = (loop_index == requested_idx).to(dtype=torch.float32)
+        aux_mask = (loop_index[:-1] < requested_idx).to(dtype=torch.float32)
+        gate_mask = (loop_index[:-1] < requested_idx).to(dtype=torch.float32)
 
         x_base = self.tok_emb(input_ids)
         x_base = F.rms_norm(x_base, (x_base.size(-1),))
         targets = target_ids.reshape(-1)
 
         all_logits: list[Tensor] = []
+        gate_scores: list[Tensor] = []  # populated only when use_recur_exit_gate=True
+        dummy_gate_usage = x_base.new_zeros(())
 
         x = x_base
-        loop_embs = self.loop_emb.weight[:loops_to_run].to(dtype=x_base.dtype)
-        scale = self.loop_scale.to(dtype=x_base.dtype)[None, None, :]
-        skip_mask = (
-            torch.rand(loops_to_run - 1, device=x.device) < self.recur_skip_prob
-            if self.training else None
-        )
-        for loop_idx in range(loops_to_run):
-            loop_vec = loop_embs[loop_idx]
-            x0_loop = x_base * (1 + scale * loop_vec) + loop_vec[None, None, :]
-
-            if loop_idx == 0:
-                x = self._run_blocks(x, x0_loop)
-            else:
-                if skip_mask is not None and skip_mask[loop_idx - 1]:
-                    pass
-                else:
-                    x = self._run_recur_blocks(x, x0_loop)
-
+        for loop_idx in range(self.max_recur_loops):
+            loop_vec = self.loop_emb.weight[loop_idx].to(dtype=x_base.dtype)
+            x0_loop = x_base + loop_vec[None, None, :]
+            x = self._run_blocks(x, x0_loop)
             logits = self._to_logits(x)
             all_logits.append(logits)
+            # All gates execute every forward for DDP all-reduce correctness.
+            # Only gates within the requested depth are supervised; others use zero weight.
+            if loop_idx < len(self.exit_gates):
+                gs = self.exit_gates[loop_idx](x)
+                gate_scores.append(gs)
 
-        final_logits = all_logits[-1]
-        final_lm_loss = F.cross_entropy(final_logits.float(), targets, reduction="mean")
+        per_loop_final_losses = torch.stack([
+            F.cross_entropy(logits.float(), targets, reduction="mean")
+            for logits in all_logits
+        ])
+        final_lm_loss = (per_loop_final_losses * final_mask).sum()
 
-        recur_aux_lm_losses: list[Tensor] = []
-        for logits in all_logits[:-1]:
-            recur_aux_lm_losses.append(F.cross_entropy(logits.float(), targets, reduction="mean"))
-
-        if recur_aux_lm_losses:
-            weights = torch.tensor(
-                [1.5 ** (len(recur_aux_lm_losses) - i - 1) for i in range(len(recur_aux_lm_losses))],
-                device=final_logits.device,
-                dtype=final_logits.dtype
-            )
-            weights = weights / weights.sum()
-            recur_aux_lm_mean = sum(w * l for w, l in zip(weights, recur_aux_lm_losses))
-            total_lm = final_lm_loss + recur_aux_loss_weight * recur_aux_lm_mean
+        if self.max_recur_loops > 1:
+            per_loop_aux_losses = torch.stack([
+                F.cross_entropy(logits.float(), targets, reduction="mean")
+                for logits in all_logits[:-1]
+            ])
+            aux_denom = aux_mask.sum().clamp(min=1.0)
+            recur_aux_lm_mean = (per_loop_aux_losses * aux_mask).sum() / aux_denom
+            has_aux = (aux_mask.sum() > 0).to(dtype=final_lm_loss.dtype)
+            total_lm = final_lm_loss + has_aux * recur_aux_loss_weight * recur_aux_lm_mean
         else:
+            recur_aux_lm_mean = final_lm_loss
             total_lm = final_lm_loss
-        total_loss = total_lm
+
+        gate_loss = final_lm_loss.new_zeros(())
+        mean_gate_stop_prob = final_lm_loss.new_zeros(())
+        mean_gate_target = final_lm_loss.new_zeros(())
+        if use_recur_exit_gate and len(gate_scores) > 0:
+            B, T = input_ids.shape
+            final_ce_per_token_all = [
+                F.cross_entropy(logits.detach().float(), targets, reduction="none").reshape(B, T).mean(dim=1)
+                for logits in all_logits
+            ]
+            final_seq_ce = torch.stack(final_ce_per_token_all, dim=0)[requested_idx]
+
+            gate_loss_terms = []
+            gate_prob_terms = []
+            gate_target_terms = []
+
+            for loop_i, gs in enumerate(gate_scores):
+                inter_seq_ce = final_ce_per_token_all[loop_i]
+                delta = inter_seq_ce - final_seq_ce
+                stop_target = (delta <= recur_gate_margin).float()
+                valid_mask = (delta.abs() > 1e-6).float()
+                seq_gate_logits = gs.reshape(B, T).mean(dim=1)
+
+                per_seq_gate_loss = F.binary_cross_entropy_with_logits(
+                    seq_gate_logits, stop_target, reduction="none"
+                )
+                denom = valid_mask.sum().clamp(min=1.0)
+
+                gate_loss_terms.append((per_seq_gate_loss * valid_mask).sum() / denom)
+                gate_prob_terms.append((torch.sigmoid(seq_gate_logits) * valid_mask).sum() / denom)
+                gate_target_terms.append((stop_target * valid_mask).sum() / denom)
+
+            gate_loss_terms = torch.stack(gate_loss_terms)
+            gate_prob_terms = torch.stack(gate_prob_terms)
+            gate_target_terms = torch.stack(gate_target_terms)
+
+            gate_denom = gate_mask.sum().clamp(min=1.0)
+            active_gate = (gate_mask.sum() > 0).to(dtype=final_lm_loss.dtype)
+
+            gate_loss = active_gate * (gate_loss_terms * gate_mask).sum() / gate_denom
+            mean_gate_stop_prob = active_gate * (gate_prob_terms * gate_mask).sum() / gate_denom
+            mean_gate_target = active_gate * (gate_target_terms * gate_mask).sum() / gate_denom
+
+            total_loss = total_lm + recur_gate_loss_weight * gate_loss + dummy_gate_usage
+        else:
+            total_loss = total_lm + dummy_gate_usage
 
         stats = {
             "final_lm_loss": final_lm_loss.detach(),
+            "gate_loss": gate_loss.detach(),
+            "mean_gate_stop_prob": mean_gate_stop_prob.detach(),
+            "mean_gate_target": mean_gate_target.detach(),
         }
-        return final_lm_loss, torch.zeros_like(final_lm_loss), total_loss, stats
+        return final_lm_loss, gate_loss, total_loss, stats
 
 
 
@@ -979,8 +1023,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         max_recur_loops=args.max_recur_loops,
-        recur_num_layers=args.recur_num_layers,
-        recur_mlp_mult=args.recur_mlp_mult,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -989,19 +1031,20 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    transformer_named_params = (
-        [(f"blocks.{name}", p) for name, p in base_model.blocks.named_parameters()] +
-        [(f"recur_blocks.{name}", p) for name, p in base_model.recur_blocks.named_parameters()]
-    )
-
+    # Optimizer split:
+    # - token embedding (Adam) uses EMBED_LR (untied) or TIED_EMBED_LR (tied)
+    # - untied lm_head.weight uses MATRIX_LR via Muon; lm_head.bias uses SCALAR_LR via Adam
+    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - vectors/scalars use SCALAR_LR via Adam
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
-        for name, p in transformer_named_params
+        for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in transformer_named_params
+        for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
 
@@ -1009,6 +1052,7 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     # loop_emb and exit_gates are control/scalar tensors → Adam
     scalar_params.extend(list(base_model.loop_emb.parameters()))
+    scalar_params.extend(list(base_model.exit_gates.parameters()))
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1063,13 +1107,17 @@ def main() -> None:
     log0(
         f"recurrence max_recur_loops:{args.max_recur_loops} "
         f"recur_aux_loss_weight:{args.recur_aux_loss_weight} "
+        f"use_recur_exit_gate:{args.use_recur_exit_gate} "
+        f"recur_gate_loss_weight:{args.recur_gate_loss_weight}"
     )
     log0(
         f"recur_compute_penalty:{args.recur_compute_penalty} "
         f"recur_depth_alpha:{args.recur_depth_alpha} "
         f"recur_warmup_frac_full:{args.recur_warmup_frac_full} "
         f"recur_warmup_frac_transition:{args.recur_warmup_frac_transition} "
-        f"log_recur_depth_mix:{args.log_recur_depth_mix}"
+        f"log_recur_depth_mix:{args.log_recur_depth_mix} "
+        f"recur_gate_margin:{args.recur_gate_margin} "
+        f"log_recur_gate_stats:{args.log_recur_gate_stats}"
     )
 
     # -----------------------------
@@ -1113,17 +1161,20 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
-            # First max_recur_loops steps cover loop counts 1..max_recur_loops to precompile all graphs.
+            # Warmup cycles num_loops 1..max to expose the model to all recurrence depths early
             warmup_loops = (warmup_step + 1) if warmup_step < args.max_recur_loops else args.max_recur_loops
+            base_model.requested_loops = warmup_loops
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    _floss, _, warmup_loss, _stats = model(
+                    _floss, _gloss, warmup_loss, _stats = model(
                         x, y,
                         recur_aux_loss_weight=args.recur_aux_loss_weight,
+                        recur_gate_loss_weight=args.recur_gate_loss_weight,
+                        use_recur_exit_gate=False,
                     )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1143,6 +1194,11 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    recur_depth_weights = torch.exp(
+        -args.recur_depth_alpha * torch.arange(1, args.max_recur_loops + 1, device=device, dtype=torch.float32)
+    )
+    recur_depth_probs = recur_depth_weights / recur_depth_weights.sum()
+
     training_time_ms = 0.0
     loop_hist = torch.zeros(args.max_recur_loops + 1, dtype=torch.long, device=device)
     stop_after_step: int | None = None
@@ -1157,6 +1213,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            base_model.requested_loops = args.max_recur_loops
             val_loss, val_bpb = eval_val(
                 args,
                 model,
@@ -1188,6 +1245,10 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
 
+        recur_sampled_loops = int(
+            torch.multinomial(recur_depth_probs, num_samples=1).item() + 1
+        )
+
         recur_min_loops = min_depth_schedule(
             elapsed_ms,
             max_wallclock_ms,
@@ -1196,24 +1257,40 @@ def main() -> None:
             args.recur_warmup_frac_transition,
         )
 
-        recur_loops_to_run = args.max_recur_loops
+        recur_loops_to_run = max(recur_sampled_loops, recur_min_loops)
         loop_hist[recur_loops_to_run] += 1
+        base_model.requested_loops = recur_loops_to_run
 
         train_final_loss = torch.zeros((), device=device)
+        train_gate_loss = torch.zeros((), device=device)
+        train_gate_stop_prob = torch.zeros((), device=device)
+        train_gate_target = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                final_lm_loss, _, total_loss, _fwd_stats = model(
+                final_lm_loss, _gate_loss, total_loss, fwd_stats = model(
                     x, y,
                     recur_aux_loss_weight=args.recur_aux_loss_weight,
+                    recur_gate_loss_weight=args.recur_gate_loss_weight,
+                    use_recur_exit_gate=args.use_recur_exit_gate,
+                    recur_gate_margin=args.recur_gate_margin,
                 )
-            norm_cost = 1.0
-            total_loss = total_loss + args.recur_compute_penalty * norm_cost
+            if args.max_recur_loops > 1:
+                norm_k = (recur_loops_to_run - 1) / (args.max_recur_loops - 1)
+            else:
+                norm_k = 0.0
+            total_loss = total_loss + args.recur_compute_penalty * norm_k
             train_final_loss += final_lm_loss.detach()
+            train_gate_loss += fwd_stats["gate_loss"]
+            train_gate_stop_prob += fwd_stats["mean_gate_stop_prob"]
+            train_gate_target += fwd_stats["mean_gate_target"]
             (total_loss * grad_scale).backward()
         train_final_loss /= grad_accum_steps
+        train_gate_loss /= grad_accum_steps
+        train_gate_stop_prob /= grad_accum_steps
+        train_gate_target /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1240,7 +1317,14 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_final_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f" recur_loops:{recur_loops_to_run}"
             )
+            if args.log_recur_gate_stats:
+                log0(
+                    f"recur_gate_stats: gate_loss:{train_gate_loss.item():.4f} "
+                    f"stop_prob:{train_gate_stop_prob.item():.4f} "
+                    f"stop_target:{train_gate_target.item():.4f}"
+                )
 
         if args.log_recur_depth_mix and args.train_log_every > 0 and step % args.train_log_every == 0 and step > 0:
             total = loop_hist.sum().item()
@@ -1332,6 +1416,7 @@ def main() -> None:
     zstd_decompressor = zstd.ZstdDecompressor()
     quant_state = torch.load(io.BytesIO(zstd_decompressor.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_mixed(quant_state), strict=True)
+    base_model.requested_loops = args.max_recur_loops
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
