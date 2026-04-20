@@ -793,6 +793,7 @@ class GPT(nn.Module):
 
         all_logits: list[Tensor] = []
         gate_scores: list[Tensor] = []  # intermediate gates only (loops 0..loops_to_run-2)
+        dummy_gate_usage = x_base.new_zeros(())
 
         x = x_base
         for loop_idx in range(loops_to_run):
@@ -801,9 +802,19 @@ class GPT(nn.Module):
             x = self._run_blocks(x, x0_loop)
             logits = self._to_logits(x)
             all_logits.append(logits)
-            # Only attach a gate after non-final loops, and only if the gate exists
-            if loop_idx < loops_to_run - 1 and loop_idx < len(self.exit_gates):
-                gate_scores.append(self.exit_gates[loop_idx](x))
+            # Every gate must be executed every forward to satisfy DDP's all-reduce requirement.
+            # Active gates contribute to gate_scores; inactive ones attach with zero weight.
+            if loop_idx < len(self.exit_gates):
+                gs = self.exit_gates[loop_idx](x)
+                if loop_idx < loops_to_run - 1:
+                    gate_scores.append(gs)
+                else:
+                    dummy_gate_usage = dummy_gate_usage + 0.0 * gs.sum()
+
+        # Gates beyond loops_to_run are never entered by the loop above; touch them
+        # with zero weight so DDP sees every gate parameter in every forward pass.
+        for gate_idx in range(loops_to_run, len(self.exit_gates)):
+            dummy_gate_usage = dummy_gate_usage + 0.0 * self.exit_gates[gate_idx](x).sum()
 
         final_logits = all_logits[-1]
         final_lm_loss = F.cross_entropy(final_logits.float(), targets, reduction="mean")
@@ -832,7 +843,7 @@ class GPT(nn.Module):
             total_lm = final_lm_loss + intermediate_lm_loss_weight * inter_mean
         else:
             total_lm = final_lm_loss
-        total_loss = total_lm + gate_loss_weight * gate_loss
+        total_loss = total_lm + gate_loss_weight * gate_loss + dummy_gate_usage
 
         stats = {
             "exit_rate": exit_rate,
