@@ -808,10 +808,12 @@ class GPT(nn.Module):
             if loop_idx == 0:
                 x = self._run_blocks(x, x0_loop)
             else:
-                if skip_mask is not None and skip_mask[loop_idx - 1]:
-                    pass
+                out = self._run_recur_blocks(x, x0_loop)
+                if skip_mask is not None:
+                    mask = skip_mask[loop_idx - 1].to(dtype=x.dtype)
+                    x = mask * x + (1 - mask) * out
                 else:
-                    x = self._run_recur_blocks(x, x0_loop)
+                    x = out
 
             logits = self._to_logits(x)
             all_logits.append(logits)
