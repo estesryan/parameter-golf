@@ -75,9 +75,13 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
     max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 3))
-    recur_exit_gate_loss_weight = float(os.environ.get("RECUR_EXIT_GATE_LOSS_WEIGHT", 0.1))
-    recur_early_loss_weight = float(os.environ.get("RECUR_EARLY_LOSS_WEIGHT", 0.5))
+    recur_gate_loss_weight = float(os.environ.get("RECUR_GATE_LOSS_WEIGHT", 0.1))
+    recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 0.8))
     use_recur_exit_gate = bool(int(os.environ.get("USE_RECUR_EXIT_GATE", "1")))
+    recur_compute_penalty = float(os.environ.get("RECUR_COMPUTE_PENALTY", 0.01))
+    recur_depth_alpha = float(os.environ.get("RECUR_DEPTH_ALPHA", 0.8))
+    recur_warmup_frac_full = float(os.environ.get("RECUR_WARMUP_FRAC_FULL", 0.05))
+    recur_warmup_frac_transition = float(os.environ.get("RECUR_WARMUP_FRAC_TRANSITION", 0.15))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -777,8 +781,8 @@ class GPT(nn.Module):
         input_ids: Tensor,
         target_ids: Tensor,
         num_loops: int = -1,
-        recur_early_loss_weight: float = 0.5,
-        recur_exit_gate_loss_weight: float = 0.1,
+        recur_aux_loss_weight: float = 0.5,
+        recur_gate_loss_weight: float = 0.1,
         use_recur_exit_gate: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor, dict]:
         # num_loops=-1 means use max_recur_loops (validation / gate mode)
@@ -816,13 +820,13 @@ class GPT(nn.Module):
         final_logits = all_logits[-1]
         final_lm_loss = F.cross_entropy(final_logits.float(), targets, reduction="mean")
 
-        recur_early_lm_losses: list[Tensor] = []
+        recur_aux_lm_losses: list[Tensor] = []
         for logits in all_logits[:-1]:
-            recur_early_lm_losses.append(F.cross_entropy(logits.float(), targets, reduction="mean"))
+            recur_aux_lm_losses.append(F.cross_entropy(logits.float(), targets, reduction="mean"))
 
-        recur_early_lm_mean = sum(recur_early_lm_losses) / len(recur_early_lm_losses) if recur_early_lm_losses else final_lm_loss
-        if recur_early_lm_losses:
-            total_lm = final_lm_loss + recur_early_loss_weight * recur_early_lm_mean
+        recur_aux_lm_mean = sum(recur_aux_lm_losses) / len(recur_aux_lm_losses) if recur_aux_lm_losses else final_lm_loss
+        if recur_aux_lm_losses:
+            total_lm = final_lm_loss + recur_aux_loss_weight * recur_aux_lm_mean
         else:
             total_lm = final_lm_loss
 
@@ -837,7 +841,7 @@ class GPT(nn.Module):
                 gate_loss = gate_loss + F.binary_cross_entropy_with_logits(gs.squeeze(-1), soft_target, reduction="mean")
             if gate_scores:
                 gate_loss = gate_loss / len(gate_scores)
-            total_loss = total_lm + recur_exit_gate_loss_weight * gate_loss + dummy_gate_usage
+            total_loss = total_lm + recur_gate_loss_weight * gate_loss + dummy_gate_usage
         else:
             total_loss = total_lm + dummy_gate_usage
 
@@ -845,6 +849,22 @@ class GPT(nn.Module):
             "final_lm_loss": final_lm_loss.detach(),
         }
         return final_lm_loss, gate_loss, total_loss, stats
+
+
+
+def min_depth_schedule(elapsed_ms: float, max_wallclock_ms: float | None, max_loops: int, full_frac: float, transition_frac: float) -> int:
+    if max_wallclock_ms is None:
+        return 1
+
+    frac = min(elapsed_ms / max_wallclock_ms, 1.0)
+
+    if frac < full_frac:
+        return max_loops
+    elif frac < transition_frac:
+        t = (frac - full_frac) / max(transition_frac - full_frac, 1e-9)
+        return int(round(max_loops * (1 - t) + 1 * t))
+    else:
+        return 1
 
 
 # -----------------------------
@@ -1042,9 +1062,15 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     log0(
         f"recurrence max_recur_loops:{args.max_recur_loops} "
-        f"recur_early_loss_weight:{args.recur_early_loss_weight} "
+        f"recur_aux_loss_weight:{args.recur_aux_loss_weight} "
         f"use_recur_exit_gate:{args.use_recur_exit_gate} "
-        f"recur_exit_gate_loss_weight:{args.recur_exit_gate_loss_weight}"
+        f"recur_gate_loss_weight:{args.recur_gate_loss_weight}"
+    )
+    log0(
+        f"recur_compute_penalty:{args.recur_compute_penalty} "
+        f"recur_depth_alpha:{args.recur_depth_alpha} "
+        f"recur_warmup_frac_full:{args.recur_warmup_frac_full} "
+        f"recur_warmup_frac_transition:{args.recur_warmup_frac_transition}"
     )
 
     # -----------------------------
@@ -1099,9 +1125,9 @@ def main() -> None:
                     _floss, _gloss, warmup_loss, _stats = model(
                         x, y,
                         num_loops=warmup_loops,
-                        recur_early_loss_weight=args.recur_early_loss_weight,
-                        recur_exit_gate_loss_weight=args.recur_exit_gate_loss_weight,
-                        use_recur_exit_gate=args.use_recur_exit_gate,
+                        recur_aux_loss_weight=args.recur_aux_loss_weight,
+                        recur_gate_loss_weight=args.recur_gate_loss_weight,
+                        use_recur_exit_gate=False,
                     )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1121,7 +1147,13 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    recur_depth_weights = torch.exp(
+        -args.recur_depth_alpha * torch.arange(1, args.max_recur_loops + 1, device=device, dtype=torch.float32)
+    )
+    recur_depth_probs = recur_depth_weights / recur_depth_weights.sum()
+
     training_time_ms = 0.0
+    loop_hist = torch.zeros(args.max_recur_loops + 1, dtype=torch.long, device=device)
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1165,7 +1197,20 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
 
-        num_loops_to_run = args.max_recur_loops
+        recur_sampled_loops = int(
+            torch.multinomial(recur_depth_probs, num_samples=1).item() + 1
+        )
+
+        recur_min_loops = min_depth_schedule(
+            elapsed_ms,
+            max_wallclock_ms,
+            args.max_recur_loops,
+            args.recur_warmup_frac_full,
+            args.recur_warmup_frac_transition,
+        )
+
+        recur_loops_to_run = max(recur_sampled_loops, recur_min_loops)
+        loop_hist[recur_loops_to_run] += 1
 
         train_final_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1175,11 +1220,16 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 final_lm_loss, _gate_loss, total_loss, _fwd_stats = model(
                     x, y,
-                    num_loops=num_loops_to_run,
-                    recur_early_loss_weight=args.recur_early_loss_weight,
-                    recur_exit_gate_loss_weight=args.recur_exit_gate_loss_weight,
-                    use_recur_exit_gate=args.use_recur_exit_gate,
+                    num_loops=recur_loops_to_run,
+                    recur_aux_loss_weight=args.recur_aux_loss_weight,
+                    recur_gate_loss_weight=args.recur_gate_loss_weight,
+                    use_recur_exit_gate=False,
                 )
+            if args.max_recur_loops > 1:
+                norm_k = (recur_loops_to_run - 1) / (args.max_recur_loops - 1)
+            else:
+                norm_k = 0.0
+            total_loss = total_loss + args.recur_compute_penalty * norm_k
             train_final_loss += final_lm_loss.detach()
             (total_loss * grad_scale).backward()
         train_final_loss /= grad_accum_steps
@@ -1209,7 +1259,16 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_final_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f" recur_loops:{recur_loops_to_run}"
             )
+            if step % args.train_log_every == 0 and step > 0:
+                total = loop_hist.sum().item()
+                if total > 0:
+                    usage = " ".join(
+                        f"k{i}:{(loop_hist[i].item() / total):.2f}"
+                        for i in range(1, args.max_recur_loops + 1)
+                    )
+                    log0(f"loop_usage: {usage}")
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1226,7 +1285,7 @@ def main() -> None:
     )
 
     if master_process:
-        log0("=== CONTROL TENSORS ===")
+        log0("=== SCALAR PARAMETERS ===")
         for i, block in enumerate(base_model.blocks):
             log0(
                 f"layer:{i} attn_scale_mean:{block.attn_scale.mean().item():.6f} "
