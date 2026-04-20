@@ -75,8 +75,8 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
     max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 3))
-    gate_loss_weight = float(os.environ.get("GATE_LOSS_WEIGHT", 0.1))
-    intermediate_lm_loss_weight = float(os.environ.get("INTERMEDIATE_LM_LOSS_WEIGHT", 0.5))
+    recur_exit_gate_loss_weight = float(os.environ.get("RECUR_EXIT_GATE_LOSS_WEIGHT", 0.1))
+    recur_early_loss_weight = float(os.environ.get("RECUR_EARLY_LOSS_WEIGHT", 0.5))
     ema_beta = float(os.environ.get("EMA_BETA", 0.98))
     recur_min_rel_delta = float(os.environ.get("RECUR_MIN_REL_DELTA", 0.02))  # min marginal gain of deepest loop; switch when final-loop improvement falls below this
     recur_min_exit_rate = float(os.environ.get("RECUR_MIN_EXIT_RATE", 0.10))
@@ -690,7 +690,7 @@ class ExitGate(nn.Module):
         nn.init.constant_(self.proj.bias, -2.0)
 
     def forward(self, x: Tensor) -> Tensor:
-        # Returns (B*T, 1) gate scores in [0, 1]
+        # Returns raw exit-gate logits of shape (B*T, 1)
         h = self.norm(x).reshape(-1, x.size(-1))
         return self.proj(h.to(self.proj.weight.dtype))
 
@@ -781,8 +781,8 @@ class GPT(nn.Module):
         input_ids: Tensor,
         target_ids: Tensor,
         num_loops: int = -1,
-        intermediate_lm_loss_weight: float = 0.5,
-        gate_loss_weight: float = 0.1,
+        recur_early_loss_weight: float = 0.5,
+        recur_exit_gate_loss_weight: float = 0.1,
     ) -> tuple[Tensor, Tensor, Tensor, dict]:
         # num_loops=-1 means use max_recur_loops (validation / gate mode)
         loops_to_run = self.max_recur_loops if num_loops < 1 else num_loops
@@ -819,9 +819,9 @@ class GPT(nn.Module):
         final_logits = all_logits[-1]
         final_lm_loss = F.cross_entropy(final_logits.float(), targets, reduction="mean")
 
-        intermediate_lm_losses: list[Tensor] = []
+        recur_early_lm_losses: list[Tensor] = []
         for logits in all_logits[:-1]:
-            intermediate_lm_losses.append(F.cross_entropy(logits.float(), targets, reduction="mean"))
+            recur_early_lm_losses.append(F.cross_entropy(logits.float(), targets, reduction="mean"))
 
         # Gate supervision: KL soft target; intermediate logits NOT detached
         final_log_probs = F.log_softmax(final_logits.detach().float(), dim=-1)
@@ -838,14 +838,14 @@ class GPT(nn.Module):
         exit_rates = [(torch.sigmoid(gs.squeeze(-1)) >= 0.5).float().mean() for gs in gate_scores]
         exit_rate = torch.stack(exit_rates).mean() if exit_rates else final_logits.new_zeros(())
 
-        inter_mean = sum(intermediate_lm_losses) / len(intermediate_lm_losses) if intermediate_lm_losses else final_lm_loss
-        if intermediate_lm_losses:
-            total_lm = final_lm_loss + intermediate_lm_loss_weight * inter_mean
+        recur_early_lm_mean = sum(recur_early_lm_losses) / len(recur_early_lm_losses) if recur_early_lm_losses else final_lm_loss
+        if recur_early_lm_losses:
+            total_lm = final_lm_loss + recur_early_loss_weight * recur_early_lm_mean
         else:
             total_lm = final_lm_loss
-        total_loss = total_lm + gate_loss_weight * gate_loss + dummy_gate_usage
+        total_loss = total_lm + recur_exit_gate_loss_weight * gate_loss + dummy_gate_usage
 
-        penultimate_lm_loss = intermediate_lm_losses[-1].detach() if intermediate_lm_losses else final_lm_loss.detach()
+        penultimate_lm_loss = recur_early_lm_losses[-1].detach() if recur_early_lm_losses else final_lm_loss.detach()
         stats = {
             "exit_rate": exit_rate,
             "penultimate_lm_loss": penultimate_lm_loss,
@@ -1049,8 +1049,8 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     log0(
         f"recurrence max_recur_loops:{args.max_recur_loops} "
-        f"intermediate_lm_loss_weight:{args.intermediate_lm_loss_weight} "
-        f"gate_loss_weight:{args.gate_loss_weight}"
+        f"recur_early_loss_weight:{args.recur_early_loss_weight} "
+        f"recur_exit_gate_loss_weight:{args.recur_exit_gate_loss_weight}"
     )
     log0(
         f"recur_exit_gate recur_min_rel_delta:{args.recur_min_rel_delta} "
@@ -1097,7 +1097,6 @@ def main() -> None:
     recur_mode = "random"
     recur_rel_delta_ema = 1.0   # marginal gain of deepest added loop: (penultimate - final) / penultimate
     recur_exit_rate_ema = 0.0
-    log0("recur_mode:random step:0")
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1117,8 +1116,8 @@ def main() -> None:
                     _floss, _gloss, warmup_loss, _stats = model(
                         x, y,
                         num_loops=warmup_loops,
-                        intermediate_lm_loss_weight=args.intermediate_lm_loss_weight,
-                        gate_loss_weight=args.gate_loss_weight,
+                        recur_early_loss_weight=args.recur_early_loss_weight,
+                        recur_exit_gate_loss_weight=args.recur_exit_gate_loss_weight,
                     )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1167,6 +1166,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if step == 0:
+                log0("recur_mode:random")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1217,8 +1218,8 @@ def main() -> None:
                 final_lm_loss, gate_loss, total_loss, fwd_stats = model(
                     x, y,
                     num_loops=num_loops_to_run,
-                    intermediate_lm_loss_weight=args.intermediate_lm_loss_weight,
-                    gate_loss_weight=args.gate_loss_weight,
+                    recur_early_loss_weight=args.recur_early_loss_weight,
+                    recur_exit_gate_loss_weight=args.recur_exit_gate_loss_weight,
                 )
             train_final_loss += final_lm_loss.detach()
             train_gate_loss += gate_loss.detach()
