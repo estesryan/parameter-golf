@@ -78,9 +78,9 @@ class Hyperparameters:
     gate_loss_weight = float(os.environ.get("GATE_LOSS_WEIGHT", 0.1))
     intermediate_lm_loss_weight = float(os.environ.get("INTERMEDIATE_LM_LOSS_WEIGHT", 0.5))
     ema_beta = float(os.environ.get("EMA_BETA", 0.98))
-    gate_min_rel_delta = float(os.environ.get("GATE_MIN_REL_DELTA", 0.02))  # min marginal gain of deepest loop; switch when final-loop improvement falls below this
-    gate_min_exit_rate = float(os.environ.get("GATE_MIN_EXIT_RATE", 0.10))
-    gate_max_exit_rate = float(os.environ.get("GATE_MAX_EXIT_RATE", 0.90))
+    recur_min_rel_delta = float(os.environ.get("RECUR_MIN_REL_DELTA", 0.02))  # min marginal gain of deepest loop; switch when final-loop improvement falls below this
+    recur_min_exit_rate = float(os.environ.get("RECUR_MIN_EXIT_RATE", 0.10))
+    recur_max_exit_rate = float(os.environ.get("RECUR_MAX_EXIT_RATE", 0.90))
     full_depth_supervision_prob = float(os.environ.get("FULL_DEPTH_SUPERVISION_PROB", 0.2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -1053,9 +1053,9 @@ def main() -> None:
         f"gate_loss_weight:{args.gate_loss_weight}"
     )
     log0(
-        f"controller gate_min_rel_delta:{args.gate_min_rel_delta} "
+        f"recur_exit_gate recur_min_rel_delta:{args.recur_min_rel_delta} "
         f"(marginal gain of deepest loop=(penultimate-final)/penultimate; switch when <=threshold) "
-        f"gate_min_exit_rate:{args.gate_min_exit_rate} gate_max_exit_rate:{args.gate_max_exit_rate} "
+        f"recur_min_exit_rate:{args.recur_min_exit_rate} recur_max_exit_rate:{args.recur_max_exit_rate} "
         f"full_depth_supervision_prob:{args.full_depth_supervision_prob} ema_beta:{args.ema_beta}"
     )
 
@@ -1094,9 +1094,10 @@ def main() -> None:
         return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
 
     # Controller state
-    ctrl_mode = "random"
-    rel_delta_ema = 1.0   # marginal gain of deepest added loop: (penultimate - final) / penultimate
-    exit_rate_ema = 0.0
+    recur_mode = "random"
+    recur_rel_delta_ema = 1.0   # marginal gain of deepest added loop: (penultimate - final) / penultimate
+    recur_exit_rate_ema = 0.0
+    log0("recur_mode:random step:0")
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1182,7 +1183,7 @@ def main() -> None:
         zero_grad_all()
 
         # --- Controller: decide num_loops_to_run (DDP-safe, torch-RNG only) ---
-        if ctrl_mode == "random" or ctrl_mode == "mix":
+        if recur_mode == "random" or recur_mode == "mix":
             if rank == 0:
                 num_loops_t = torch.randint(1, args.max_recur_loops + 1, (1,), device=device)
             else:
@@ -1190,7 +1191,7 @@ def main() -> None:
             if dist.is_available() and dist.is_initialized():
                 dist.broadcast(num_loops_t, src=0)
             num_loops_to_run = int(num_loops_t.item())
-            if ctrl_mode == "mix":
+            if recur_mode == "mix":
                 if rank == 0:
                     full_depth_flag = (torch.rand(1, device=device) < args.full_depth_supervision_prob).to(torch.int32)
                 else:
@@ -1205,9 +1206,9 @@ def main() -> None:
         train_final_loss = torch.zeros((), device=device)
         train_gate_loss = torch.zeros((), device=device)
         train_total_loss = torch.zeros((), device=device)
-        step_exit_rate = 0.0
-        step_penultimate_lm_mean = 0.0
-        step_final_lm_mean = 0.0
+        recur_step_exit_rate = 0.0
+        recur_penultimate_lm_mean = 0.0
+        recur_final_lm_mean = 0.0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1222,32 +1223,32 @@ def main() -> None:
             train_final_loss += final_lm_loss.detach()
             train_gate_loss += gate_loss.detach()
             train_total_loss += total_loss.detach()
-            step_exit_rate += fwd_stats["exit_rate"].item()
-            step_penultimate_lm_mean += fwd_stats["penultimate_lm_loss"].item()
-            step_final_lm_mean += fwd_stats["final_lm_loss"].item()
+            recur_step_exit_rate += fwd_stats["exit_rate"].item()
+            recur_penultimate_lm_mean += fwd_stats["penultimate_lm_loss"].item()
+            recur_final_lm_mean += fwd_stats["final_lm_loss"].item()
             (total_loss * grad_scale).backward()
         train_final_loss /= grad_accum_steps
         train_gate_loss /= grad_accum_steps
         train_total_loss /= grad_accum_steps
-        step_exit_rate /= grad_accum_steps
-        step_penultimate_lm_mean /= grad_accum_steps
-        step_final_lm_mean /= grad_accum_steps
+        recur_step_exit_rate /= grad_accum_steps
+        recur_penultimate_lm_mean /= grad_accum_steps
+        recur_final_lm_mean /= grad_accum_steps
 
         # Update EMAs only on eligible batches (num_loops >= 2 gives a meaningful penultimate signal)
         if num_loops_to_run >= 2:
-            rel_delta = (step_penultimate_lm_mean - step_final_lm_mean) / max(step_penultimate_lm_mean, 1e-9)
-            rel_delta_ema = args.ema_beta * rel_delta_ema + (1 - args.ema_beta) * rel_delta
-            exit_rate_ema = args.ema_beta * exit_rate_ema + (1 - args.ema_beta) * step_exit_rate
+            rel_delta = (recur_penultimate_lm_mean - recur_final_lm_mean) / max(recur_penultimate_lm_mean, 1e-9)
+            recur_rel_delta_ema = args.ema_beta * recur_rel_delta_ema + (1 - args.ema_beta) * rel_delta
+            recur_exit_rate_ema = args.ema_beta * recur_exit_rate_ema + (1 - args.ema_beta) * recur_step_exit_rate
 
         # Controller mode transitions
-        if ctrl_mode == "random" and rel_delta_ema <= args.gate_min_rel_delta:
-            ctrl_mode = "mix"
-            log0(f"mode_switch: random -> mix rel_delta_ema={rel_delta_ema:.6f} loops={num_loops_to_run}")
-        elif ctrl_mode == "mix":
-            if (rel_delta_ema <= args.gate_min_rel_delta
-                    and args.gate_min_exit_rate <= exit_rate_ema <= args.gate_max_exit_rate):
-                ctrl_mode = "gate"
-                log0(f"mode_switch: mix -> gate rel_delta_ema={rel_delta_ema:.6f} exit_rate_ema={exit_rate_ema:.4f} loops={num_loops_to_run}")
+        if recur_mode == "random" and recur_rel_delta_ema <= args.recur_min_rel_delta:
+            recur_mode = "mix"
+            log0(f"recur_mode:mix step:{step} recur_rel_delta_ema:{recur_rel_delta_ema:.4f} recur_exit_rate_ema:{recur_exit_rate_ema:.4f}")
+        elif recur_mode == "mix":
+            if (recur_rel_delta_ema <= args.recur_min_rel_delta
+                    and args.recur_min_exit_rate <= recur_exit_rate_ema <= args.recur_max_exit_rate):
+                recur_mode = "gate"
+                log0(f"recur_mode:gate step:{step} recur_rel_delta_ema:{recur_rel_delta_ema:.4f} recur_exit_rate_ema:{recur_exit_rate_ema:.4f}")
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1272,9 +1273,7 @@ def main() -> None:
         )
         if should_log_train:
             log0(
-                f"step:{step}/{args.iterations} mode:{ctrl_mode} loops:{num_loops_to_run} "
-                f"final_lm_loss:{train_final_loss.item():.4f} "
-                f"gate_loss:{train_gate_loss.item():.4f} total_loss:{train_total_loss.item():.4f} "
+                f"step:{step}/{args.iterations} train_loss:{train_final_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
