@@ -77,11 +77,7 @@ class Hyperparameters:
     max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 3))
     recur_exit_gate_loss_weight = float(os.environ.get("RECUR_EXIT_GATE_LOSS_WEIGHT", 0.1))
     recur_early_loss_weight = float(os.environ.get("RECUR_EARLY_LOSS_WEIGHT", 0.5))
-    ema_beta = float(os.environ.get("EMA_BETA", 0.98))
-    recur_min_rel_delta = float(os.environ.get("RECUR_MIN_REL_DELTA", 0.02))  # min marginal gain of deepest loop; switch when final-loop improvement falls below this
-    recur_min_exit_rate = float(os.environ.get("RECUR_MIN_EXIT_RATE", 0.10))
-    recur_max_exit_rate = float(os.environ.get("RECUR_MAX_EXIT_RATE", 0.90))
-    full_depth_supervision_prob = float(os.environ.get("FULL_DEPTH_SUPERVISION_PROB", 0.2))
+    use_recur_exit_gate = bool(int(os.environ.get("USE_RECUR_EXIT_GATE", "1")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -783,6 +779,7 @@ class GPT(nn.Module):
         num_loops: int = -1,
         recur_early_loss_weight: float = 0.5,
         recur_exit_gate_loss_weight: float = 0.1,
+        use_recur_exit_gate: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor, dict]:
         # num_loops=-1 means use max_recur_loops (validation / gate mode)
         loops_to_run = self.max_recur_loops if num_loops < 1 else num_loops
@@ -792,7 +789,7 @@ class GPT(nn.Module):
         targets = target_ids.reshape(-1)
 
         all_logits: list[Tensor] = []
-        gate_scores: list[Tensor] = []  # intermediate gates only (loops 0..loops_to_run-2)
+        gate_scores: list[Tensor] = []  # populated only when use_recur_exit_gate=True
         dummy_gate_usage = x_base.new_zeros(())
 
         x = x_base
@@ -803,10 +800,10 @@ class GPT(nn.Module):
             logits = self._to_logits(x)
             all_logits.append(logits)
             # Every gate must be executed every forward to satisfy DDP's all-reduce requirement.
-            # Active gates contribute to gate_scores; inactive ones attach with zero weight.
+            # Active gates contribute to gate_scores (when enabled); others attach with zero weight.
             if loop_idx < len(self.exit_gates):
                 gs = self.exit_gates[loop_idx](x)
-                if loop_idx < loops_to_run - 1:
+                if use_recur_exit_gate and loop_idx < loops_to_run - 1:
                     gate_scores.append(gs)
                 else:
                     dummy_gate_usage = dummy_gate_usage + 0.0 * gs.sum()
@@ -823,32 +820,28 @@ class GPT(nn.Module):
         for logits in all_logits[:-1]:
             recur_early_lm_losses.append(F.cross_entropy(logits.float(), targets, reduction="mean"))
 
-        # Gate supervision: KL soft target; intermediate logits NOT detached
-        final_log_probs = F.log_softmax(final_logits.detach().float(), dim=-1)
-        gate_loss = final_logits.new_zeros(())
-        for loop_i, gs in enumerate(gate_scores):
-            inter_log_probs = F.log_softmax(all_logits[loop_i].float(), dim=-1)
-            kl = F.kl_div(inter_log_probs, final_log_probs, reduction="none", log_target=True).sum(-1)
-            soft_target = torch.exp(-kl).to(gs.dtype)
-            gate_loss = gate_loss + F.binary_cross_entropy_with_logits(gs.squeeze(-1), soft_target, reduction="mean")
-        if gate_scores:
-            gate_loss = gate_loss / len(gate_scores)
-
-        # exit_rate: fraction of tokens where any intermediate gate >= 0.5
-        exit_rates = [(torch.sigmoid(gs.squeeze(-1)) >= 0.5).float().mean() for gs in gate_scores]
-        exit_rate = torch.stack(exit_rates).mean() if exit_rates else final_logits.new_zeros(())
-
         recur_early_lm_mean = sum(recur_early_lm_losses) / len(recur_early_lm_losses) if recur_early_lm_losses else final_lm_loss
         if recur_early_lm_losses:
             total_lm = final_lm_loss + recur_early_loss_weight * recur_early_lm_mean
         else:
             total_lm = final_lm_loss
-        total_loss = total_lm + recur_exit_gate_loss_weight * gate_loss + dummy_gate_usage
 
-        penultimate_lm_loss = recur_early_lm_losses[-1].detach() if recur_early_lm_losses else final_lm_loss.detach()
+        gate_loss = final_logits.new_zeros(())
+        if use_recur_exit_gate:
+            # Gate supervision: KL soft target from final distribution agreement
+            final_log_probs = F.log_softmax(final_logits.detach().float(), dim=-1)
+            for loop_i, gs in enumerate(gate_scores):
+                inter_log_probs = F.log_softmax(all_logits[loop_i].float(), dim=-1)
+                kl = F.kl_div(inter_log_probs, final_log_probs, reduction="none", log_target=True).sum(-1)
+                soft_target = torch.exp(-kl).to(gs.dtype)
+                gate_loss = gate_loss + F.binary_cross_entropy_with_logits(gs.squeeze(-1), soft_target, reduction="mean")
+            if gate_scores:
+                gate_loss = gate_loss / len(gate_scores)
+            total_loss = total_lm + recur_exit_gate_loss_weight * gate_loss + dummy_gate_usage
+        else:
+            total_loss = total_lm + dummy_gate_usage
+
         stats = {
-            "exit_rate": exit_rate,
-            "penultimate_lm_loss": penultimate_lm_loss,
             "final_lm_loss": final_lm_loss.detach(),
         }
         return final_lm_loss, gate_loss, total_loss, stats
@@ -1050,13 +1043,8 @@ def main() -> None:
     log0(
         f"recurrence max_recur_loops:{args.max_recur_loops} "
         f"recur_early_loss_weight:{args.recur_early_loss_weight} "
+        f"use_recur_exit_gate:{args.use_recur_exit_gate} "
         f"recur_exit_gate_loss_weight:{args.recur_exit_gate_loss_weight}"
-    )
-    log0(
-        f"recur_exit_gate recur_min_rel_delta:{args.recur_min_rel_delta} "
-        f"(marginal gain of deepest loop=(penultimate-final)/penultimate; switch when <=threshold) "
-        f"recur_min_exit_rate:{args.recur_min_exit_rate} recur_max_exit_rate:{args.recur_max_exit_rate} "
-        f"full_depth_supervision_prob:{args.full_depth_supervision_prob} ema_beta:{args.ema_beta}"
     )
 
     # -----------------------------
@@ -1093,11 +1081,6 @@ def main() -> None:
 
         return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
 
-    # Controller state
-    recur_mode = "random"
-    recur_rel_delta_ema = 1.0   # marginal gain of deepest added loop: (penultimate - final) / penultimate
-    recur_exit_rate_ema = 0.0
-
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -1118,6 +1101,7 @@ def main() -> None:
                         num_loops=warmup_loops,
                         recur_early_loss_weight=args.recur_early_loss_weight,
                         recur_exit_gate_loss_weight=args.recur_exit_gate_loss_weight,
+                        use_recur_exit_gate=args.use_recur_exit_gate,
                     )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1166,8 +1150,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            if step == 0:
-                log0("recur_mode:random")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1183,73 +1165,24 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
 
-        # --- Controller: decide num_loops_to_run (DDP-safe, torch-RNG only) ---
-        if recur_mode == "random" or recur_mode == "mix":
-            if rank == 0:
-                num_loops_t = torch.randint(1, args.max_recur_loops + 1, (1,), device=device)
-            else:
-                num_loops_t = torch.zeros(1, device=device, dtype=torch.int64)
-            if dist.is_available() and dist.is_initialized():
-                dist.broadcast(num_loops_t, src=0)
-            num_loops_to_run = int(num_loops_t.item())
-            if recur_mode == "mix":
-                if rank == 0:
-                    full_depth_flag = (torch.rand(1, device=device) < args.full_depth_supervision_prob).to(torch.int32)
-                else:
-                    full_depth_flag = torch.zeros(1, device=device, dtype=torch.int32)
-                if dist.is_available() and dist.is_initialized():
-                    dist.broadcast(full_depth_flag, src=0)
-                if full_depth_flag.item():
-                    num_loops_to_run = args.max_recur_loops
-        else:
-            num_loops_to_run = args.max_recur_loops
+        num_loops_to_run = args.max_recur_loops
 
         train_final_loss = torch.zeros((), device=device)
-        train_gate_loss = torch.zeros((), device=device)
-        train_total_loss = torch.zeros((), device=device)
-        recur_step_exit_rate = 0.0
-        recur_penultimate_lm_mean = 0.0
-        recur_final_lm_mean = 0.0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                final_lm_loss, gate_loss, total_loss, fwd_stats = model(
+                final_lm_loss, _gate_loss, total_loss, _fwd_stats = model(
                     x, y,
                     num_loops=num_loops_to_run,
                     recur_early_loss_weight=args.recur_early_loss_weight,
                     recur_exit_gate_loss_weight=args.recur_exit_gate_loss_weight,
+                    use_recur_exit_gate=args.use_recur_exit_gate,
                 )
             train_final_loss += final_lm_loss.detach()
-            train_gate_loss += gate_loss.detach()
-            train_total_loss += total_loss.detach()
-            recur_step_exit_rate += fwd_stats["exit_rate"].item()
-            recur_penultimate_lm_mean += fwd_stats["penultimate_lm_loss"].item()
-            recur_final_lm_mean += fwd_stats["final_lm_loss"].item()
             (total_loss * grad_scale).backward()
         train_final_loss /= grad_accum_steps
-        train_gate_loss /= grad_accum_steps
-        train_total_loss /= grad_accum_steps
-        recur_step_exit_rate /= grad_accum_steps
-        recur_penultimate_lm_mean /= grad_accum_steps
-        recur_final_lm_mean /= grad_accum_steps
-
-        # Update EMAs only on eligible batches (num_loops >= 2 gives a meaningful penultimate signal)
-        if num_loops_to_run >= 2:
-            rel_delta = (recur_penultimate_lm_mean - recur_final_lm_mean) / max(recur_penultimate_lm_mean, 1e-9)
-            recur_rel_delta_ema = args.ema_beta * recur_rel_delta_ema + (1 - args.ema_beta) * rel_delta
-            recur_exit_rate_ema = args.ema_beta * recur_exit_rate_ema + (1 - args.ema_beta) * recur_step_exit_rate
-
-        # Controller mode transitions
-        if recur_mode == "random" and recur_rel_delta_ema <= args.recur_min_rel_delta:
-            recur_mode = "mix"
-            log0(f"recur_mode:mix step:{step} recur_rel_delta_ema:{recur_rel_delta_ema:.4f} recur_exit_rate_ema:{recur_exit_rate_ema:.4f}")
-        elif recur_mode == "mix":
-            if (recur_rel_delta_ema <= args.recur_min_rel_delta
-                    and args.recur_min_exit_rate <= recur_exit_rate_ema <= args.recur_max_exit_rate):
-                recur_mode = "gate"
-                log0(f"recur_mode:gate step:{step} recur_rel_delta_ema:{recur_rel_delta_ema:.4f} recur_exit_rate_ema:{recur_exit_rate_ema:.4f}")
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
