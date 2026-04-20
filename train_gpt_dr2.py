@@ -854,10 +854,10 @@ class GPT(nn.Module):
                 seq_gate_logits = gs.reshape(B, T).mean(dim=1)  # (B,)
                 per_seq_gate_loss = F.binary_cross_entropy_with_logits(seq_gate_logits, stop_target, reduction="none")
                 masked_loss = per_seq_gate_loss * valid_mask
-                if valid_mask.sum() > 0:
-                    gate_losses.append(masked_loss.sum() / valid_mask.sum())
-                    all_gate_stop_probs.append(torch.sigmoid(seq_gate_logits[valid_mask.bool()]).mean().detach())
-                    all_gate_targets.append(stop_target[valid_mask.bool()].mean().detach())
+                denom = valid_mask.sum().clamp(min=1.0)
+                gate_losses.append(masked_loss.sum() / denom)
+                all_gate_stop_probs.append((torch.sigmoid(seq_gate_logits) * valid_mask).sum() / denom)
+                all_gate_targets.append((stop_target * valid_mask).sum() / denom)
             if gate_losses:
                 gate_loss = torch.stack(gate_losses).mean()
                 mean_gate_stop_prob = torch.stack(all_gate_stop_probs).mean()
