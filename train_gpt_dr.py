@@ -78,7 +78,7 @@ class Hyperparameters:
     gate_loss_weight = float(os.environ.get("GATE_LOSS_WEIGHT", 0.1))
     intermediate_lm_loss_weight = float(os.environ.get("INTERMEDIATE_LM_LOSS_WEIGHT", 0.5))
     ema_beta = float(os.environ.get("EMA_BETA", 0.98))
-    gate_warmup_loss_ratio = float(os.environ.get("GATE_WARMUP_LOSS_RATIO", 1.10))  # ratio of intermediate to final loss; ~1.0 = loops converged
+    gate_min_rel_delta = float(os.environ.get("GATE_MIN_REL_DELTA", 0.02))  # min marginal gain of deepest loop; switch when final-loop improvement falls below this
     gate_min_exit_rate = float(os.environ.get("GATE_MIN_EXIT_RATE", 0.10))
     gate_max_exit_rate = float(os.environ.get("GATE_MAX_EXIT_RATE", 0.90))
     full_depth_supervision_prob = float(os.environ.get("FULL_DEPTH_SUPERVISION_PROB", 0.2))
@@ -845,9 +845,10 @@ class GPT(nn.Module):
             total_lm = final_lm_loss
         total_loss = total_lm + gate_loss_weight * gate_loss + dummy_gate_usage
 
+        penultimate_lm_loss = intermediate_lm_losses[-1].detach() if intermediate_lm_losses else final_lm_loss.detach()
         stats = {
             "exit_rate": exit_rate,
-            "intermediate_lm_mean": inter_mean.detach(),
+            "penultimate_lm_loss": penultimate_lm_loss,
             "final_lm_loss": final_lm_loss.detach(),
         }
         return final_lm_loss, gate_loss, total_loss, stats
@@ -1052,8 +1053,8 @@ def main() -> None:
         f"gate_loss_weight:{args.gate_loss_weight}"
     )
     log0(
-        f"controller gate_warmup_loss_ratio:{args.gate_warmup_loss_ratio} "
-        f"(intermediate/final loss; switch when <=threshold) "
+        f"controller gate_min_rel_delta:{args.gate_min_rel_delta} "
+        f"(marginal gain of deepest loop=(penultimate-final)/penultimate; switch when <=threshold) "
         f"gate_min_exit_rate:{args.gate_min_exit_rate} gate_max_exit_rate:{args.gate_max_exit_rate} "
         f"full_depth_supervision_prob:{args.full_depth_supervision_prob} ema_beta:{args.ema_beta}"
     )
@@ -1094,7 +1095,7 @@ def main() -> None:
 
     # Controller state
     ctrl_mode = "random"
-    loss_ratio_ema = 1.0   # intermediate_lm_mean / final_lm_loss (starts high, falls as model learns)
+    rel_delta_ema = 1.0   # marginal gain of deepest added loop: (penultimate - final) / penultimate
     exit_rate_ema = 0.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
@@ -1205,7 +1206,7 @@ def main() -> None:
         train_gate_loss = torch.zeros((), device=device)
         train_total_loss = torch.zeros((), device=device)
         step_exit_rate = 0.0
-        step_intermediate_lm_mean = 0.0
+        step_penultimate_lm_mean = 0.0
         step_final_lm_mean = 0.0
         for micro_step in range(grad_accum_steps):
             if distributed:
@@ -1222,30 +1223,31 @@ def main() -> None:
             train_gate_loss += gate_loss.detach()
             train_total_loss += total_loss.detach()
             step_exit_rate += fwd_stats["exit_rate"].item()
-            step_intermediate_lm_mean += fwd_stats["intermediate_lm_mean"].item()
+            step_penultimate_lm_mean += fwd_stats["penultimate_lm_loss"].item()
             step_final_lm_mean += fwd_stats["final_lm_loss"].item()
             (total_loss * grad_scale).backward()
         train_final_loss /= grad_accum_steps
         train_gate_loss /= grad_accum_steps
         train_total_loss /= grad_accum_steps
         step_exit_rate /= grad_accum_steps
-        step_intermediate_lm_mean /= grad_accum_steps
+        step_penultimate_lm_mean /= grad_accum_steps
         step_final_lm_mean /= grad_accum_steps
 
-        # Update EMAs (averaged across micro-steps)
-        cur_loss_ratio = step_intermediate_lm_mean / max(step_final_lm_mean, 1e-9)
-        loss_ratio_ema = args.ema_beta * loss_ratio_ema + (1 - args.ema_beta) * cur_loss_ratio
-        exit_rate_ema = args.ema_beta * exit_rate_ema + (1 - args.ema_beta) * step_exit_rate
+        # Update EMAs only on eligible batches (num_loops >= 2 gives a meaningful penultimate signal)
+        if num_loops_to_run >= 2:
+            rel_delta = (step_penultimate_lm_mean - step_final_lm_mean) / max(step_penultimate_lm_mean, 1e-9)
+            rel_delta_ema = args.ema_beta * rel_delta_ema + (1 - args.ema_beta) * rel_delta
+            exit_rate_ema = args.ema_beta * exit_rate_ema + (1 - args.ema_beta) * step_exit_rate
 
         # Controller mode transitions
-        if ctrl_mode == "random" and loss_ratio_ema <= args.gate_warmup_loss_ratio:
+        if ctrl_mode == "random" and rel_delta_ema <= args.gate_min_rel_delta:
             ctrl_mode = "mix"
-            log0(f"mode_switch: random -> mix loss_ratio_ema={loss_ratio_ema:.6f}")
+            log0(f"mode_switch: random -> mix rel_delta_ema={rel_delta_ema:.6f} loops={num_loops_to_run}")
         elif ctrl_mode == "mix":
-            if (loss_ratio_ema <= args.gate_warmup_loss_ratio
+            if (rel_delta_ema <= args.gate_min_rel_delta
                     and args.gate_min_exit_rate <= exit_rate_ema <= args.gate_max_exit_rate):
                 ctrl_mode = "gate"
-                log0(f"mode_switch: mix -> gate loss_ratio_ema={loss_ratio_ema:.6f} exit_rate_ema={exit_rate_ema:.4f}")
+                log0(f"mode_switch: mix -> gate rel_delta_ema={rel_delta_ema:.6f} exit_rate_ema={exit_rate_ema:.4f} loops={num_loops_to_run}")
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1273,8 +1275,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} mode:{ctrl_mode} loops:{num_loops_to_run} "
                 f"final_lm_loss:{train_final_loss.item():.4f} "
                 f"gate_loss:{train_gate_loss.item():.4f} total_loss:{train_total_loss.item():.4f} "
-                f"loss_ratio:{cur_loss_ratio:.4f} loss_ratio_ema:{loss_ratio_ema:.4f} "
-                f"exit_rate:{step_exit_rate:.4f} exit_rate_ema:{exit_rate_ema:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
