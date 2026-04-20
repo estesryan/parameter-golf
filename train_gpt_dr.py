@@ -825,7 +825,7 @@ class GPT(nn.Module):
 
         # exit_rate: fraction of tokens where any intermediate gate >= 0.5
         exit_rates = [(gs.squeeze(-1) >= 0.5).float().mean() for gs in gate_scores]
-        exit_rate = float(torch.stack(exit_rates).mean().item()) if exit_rates else 0.0
+        exit_rate = torch.stack(exit_rates).mean() if exit_rates else final_logits.new_zeros(())
 
         inter_mean = sum(intermediate_lm_losses) / len(intermediate_lm_losses) if intermediate_lm_losses else final_lm_loss
         if intermediate_lm_losses:
@@ -836,8 +836,8 @@ class GPT(nn.Module):
 
         stats = {
             "exit_rate": exit_rate,
-            "intermediate_lm_mean": float(inter_mean.detach().item()),
-            "final_lm_loss": float(final_lm_loss.detach().item()),
+            "intermediate_lm_mean": inter_mean.detach(),
+            "final_lm_loss": final_lm_loss.detach(),
         }
         return final_lm_loss, gate_loss, total_loss, stats
 
@@ -1210,9 +1210,9 @@ def main() -> None:
             train_final_loss += final_lm_loss.detach()
             train_gate_loss += gate_loss.detach()
             train_total_loss += total_loss.detach()
-            step_exit_rate += fwd_stats["exit_rate"]
-            step_intermediate_lm_mean += fwd_stats["intermediate_lm_mean"]
-            step_final_lm_mean += fwd_stats["final_lm_loss"]
+            step_exit_rate += fwd_stats["exit_rate"].item()
+            step_intermediate_lm_mean += fwd_stats["intermediate_lm_mean"].item()
+            step_final_lm_mean += fwd_stats["final_lm_loss"].item()
             (total_loss * grad_scale).backward()
         train_final_loss /= grad_accum_steps
         train_gate_loss /= grad_accum_steps
