@@ -725,7 +725,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for _ in range(recur_num_layers)
+                for _ in range(num_layers)
             ]
         )
         self.recur_num_layers = recur_num_layers
