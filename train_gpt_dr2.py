@@ -78,6 +78,9 @@ class Hyperparameters:
     recur_gate_loss_weight = float(os.environ.get("RECUR_GATE_LOSS_WEIGHT", 0.1))
     recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 0.8))
     use_recur_exit_gate = bool(int(os.environ.get("USE_RECUR_EXIT_GATE", "1")))
+    log_recur_depth_mix = bool(int(os.environ.get("LOG_RECUR_DEPTH_MIX", "0")))
+    log_recur_gate_stats = bool(int(os.environ.get("LOG_RECUR_GATE_STATS", "0")))
+    recur_gate_margin = float(os.environ.get("RECUR_GATE_MARGIN", 0.02))
     recur_compute_penalty = float(os.environ.get("RECUR_COMPUTE_PENALTY", 0.01))
     recur_depth_alpha = float(os.environ.get("RECUR_DEPTH_ALPHA", 0.8))
     recur_warmup_frac_full = float(os.environ.get("RECUR_WARMUP_FRAC_FULL", 0.05))
@@ -784,6 +787,7 @@ class GPT(nn.Module):
         recur_aux_loss_weight: float = 0.5,
         recur_gate_loss_weight: float = 0.1,
         use_recur_exit_gate: bool = True,
+        recur_gate_margin: float = 0.02,
     ) -> tuple[Tensor, Tensor, Tensor, dict]:
         # num_loops=-1 means use max_recur_loops (validation / gate mode)
         loops_to_run = self.max_recur_loops if num_loops < 1 else num_loops
@@ -831,22 +835,42 @@ class GPT(nn.Module):
             total_lm = final_lm_loss
 
         gate_loss = final_logits.new_zeros(())
-        if use_recur_exit_gate:
-            # Gate supervision: KL soft target from final distribution agreement
-            final_log_probs = F.log_softmax(final_logits.detach().float(), dim=-1)
+        mean_gate_stop_prob = final_logits.new_zeros(())
+        mean_gate_target = final_logits.new_zeros(())
+        if use_recur_exit_gate and gate_scores:
+            B, T = input_ids.shape
+            final_ce_per_token = F.cross_entropy(final_logits.detach().float(), targets, reduction="none")
+            final_seq_ce = final_ce_per_token.reshape(B, T).mean(dim=1)  # (B,)
+
+            gate_losses: list[Tensor] = []
+            all_gate_stop_probs: list[Tensor] = []
+            all_gate_targets: list[Tensor] = []
             for loop_i, gs in enumerate(gate_scores):
-                inter_log_probs = F.log_softmax(all_logits[loop_i].float(), dim=-1)
-                kl = F.kl_div(inter_log_probs, final_log_probs, reduction="none", log_target=True).sum(-1)
-                soft_target = torch.exp(-kl).to(gs.dtype)
-                gate_loss = gate_loss + F.binary_cross_entropy_with_logits(gs.squeeze(-1), soft_target, reduction="mean")
-            if gate_scores:
-                gate_loss = gate_loss / len(gate_scores)
+                inter_ce_per_token = F.cross_entropy(all_logits[loop_i].detach().float(), targets, reduction="none")
+                inter_seq_ce = inter_ce_per_token.reshape(B, T).mean(dim=1)  # (B,)
+                delta = inter_seq_ce - final_seq_ce
+                stop_target = (delta <= recur_gate_margin).float()  # (B,)
+                valid_mask = (delta.abs() > 1e-6).float()  # (B,)
+                seq_gate_logits = gs.reshape(B, T).mean(dim=1)  # (B,)
+                per_seq_gate_loss = F.binary_cross_entropy_with_logits(seq_gate_logits, stop_target, reduction="none")
+                masked_loss = per_seq_gate_loss * valid_mask
+                if valid_mask.sum() > 0:
+                    gate_losses.append(masked_loss.sum() / valid_mask.sum())
+                    all_gate_stop_probs.append(torch.sigmoid(seq_gate_logits[valid_mask.bool()]).mean().detach())
+                    all_gate_targets.append(stop_target[valid_mask.bool()].mean().detach())
+            if gate_losses:
+                gate_loss = torch.stack(gate_losses).mean()
+                mean_gate_stop_prob = torch.stack(all_gate_stop_probs).mean()
+                mean_gate_target = torch.stack(all_gate_targets).mean()
             total_loss = total_lm + recur_gate_loss_weight * gate_loss + dummy_gate_usage
         else:
             total_loss = total_lm + dummy_gate_usage
 
         stats = {
             "final_lm_loss": final_lm_loss.detach(),
+            "gate_loss": gate_loss.detach(),
+            "mean_gate_stop_prob": mean_gate_stop_prob.detach(),
+            "mean_gate_target": mean_gate_target.detach(),
         }
         return final_lm_loss, gate_loss, total_loss, stats
 
@@ -1070,7 +1094,10 @@ def main() -> None:
         f"recur_compute_penalty:{args.recur_compute_penalty} "
         f"recur_depth_alpha:{args.recur_depth_alpha} "
         f"recur_warmup_frac_full:{args.recur_warmup_frac_full} "
-        f"recur_warmup_frac_transition:{args.recur_warmup_frac_transition}"
+        f"recur_warmup_frac_transition:{args.recur_warmup_frac_transition} "
+        f"log_recur_depth_mix:{args.log_recur_depth_mix} "
+        f"recur_gate_margin:{args.recur_gate_margin} "
+        f"log_recur_gate_stats:{args.log_recur_gate_stats}"
     )
 
     # -----------------------------
@@ -1213,17 +1240,21 @@ def main() -> None:
         loop_hist[recur_loops_to_run] += 1
 
         train_final_loss = torch.zeros((), device=device)
+        train_gate_loss = torch.zeros((), device=device)
+        train_gate_stop_prob = torch.zeros((), device=device)
+        train_gate_target = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                final_lm_loss, _gate_loss, total_loss, _fwd_stats = model(
+                final_lm_loss, _gate_loss, total_loss, fwd_stats = model(
                     x, y,
                     num_loops=recur_loops_to_run,
                     recur_aux_loss_weight=args.recur_aux_loss_weight,
                     recur_gate_loss_weight=args.recur_gate_loss_weight,
-                    use_recur_exit_gate=False,
+                    use_recur_exit_gate=args.use_recur_exit_gate,
+                    recur_gate_margin=args.recur_gate_margin,
                 )
             if args.max_recur_loops > 1:
                 norm_k = (recur_loops_to_run - 1) / (args.max_recur_loops - 1)
@@ -1231,8 +1262,14 @@ def main() -> None:
                 norm_k = 0.0
             total_loss = total_loss + args.recur_compute_penalty * norm_k
             train_final_loss += final_lm_loss.detach()
+            train_gate_loss += fwd_stats["gate_loss"]
+            train_gate_stop_prob += fwd_stats["mean_gate_stop_prob"]
+            train_gate_target += fwd_stats["mean_gate_target"]
             (total_loss * grad_scale).backward()
         train_final_loss /= grad_accum_steps
+        train_gate_loss /= grad_accum_steps
+        train_gate_stop_prob /= grad_accum_steps
+        train_gate_target /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1261,14 +1298,22 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 f" recur_loops:{recur_loops_to_run}"
             )
-            if step % args.train_log_every == 0 and step > 0:
-                total = loop_hist.sum().item()
-                if total > 0:
-                    usage = " ".join(
-                        f"k{i}:{(loop_hist[i].item() / total):.2f}"
-                        for i in range(1, args.max_recur_loops + 1)
-                    )
-                    log0(f"loop_usage: {usage}")
+            if args.log_recur_gate_stats:
+                log0(
+                    f"recur_gate_stats: gate_loss:{train_gate_loss.item():.4f} "
+                    f"stop_prob:{train_gate_stop_prob.item():.4f} "
+                    f"stop_target:{train_gate_target.item():.4f}"
+                )
+
+        if args.log_recur_depth_mix and args.train_log_every > 0 and step % args.train_log_every == 0 and step > 0:
+            total = loop_hist.sum().item()
+            if total > 0:
+                mix = " ".join(
+                    f"k{i}:{(loop_hist[i].item() / total):.2f}"
+                    for i in range(1, args.max_recur_loops + 1)
+                )
+                log0(f"recur_depth_mix: {mix}")
+            loop_hist.zero_()
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
