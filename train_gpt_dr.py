@@ -692,7 +692,7 @@ class ExitGate(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         # Returns (B*T, 1) gate scores in [0, 1]
         h = self.norm(x).reshape(-1, x.size(-1))
-        return torch.sigmoid(self.proj(h.to(self.proj.weight.dtype)))
+        return self.proj(h.to(self.proj.weight.dtype))
 
 
 class GPT(nn.Module):
@@ -830,12 +830,12 @@ class GPT(nn.Module):
             inter_log_probs = F.log_softmax(all_logits[loop_i].float(), dim=-1)
             kl = F.kl_div(inter_log_probs, final_log_probs, reduction="none", log_target=True).sum(-1)
             soft_target = torch.exp(-kl).to(gs.dtype)
-            gate_loss = gate_loss + F.binary_cross_entropy(gs.squeeze(-1), soft_target, reduction="mean")
+            gate_loss = gate_loss + F.binary_cross_entropy_with_logits(gs.squeeze(-1), soft_target, reduction="mean")
         if gate_scores:
             gate_loss = gate_loss / len(gate_scores)
 
         # exit_rate: fraction of tokens where any intermediate gate >= 0.5
-        exit_rates = [(gs.squeeze(-1) >= 0.5).float().mean() for gs in gate_scores]
+        exit_rates = [(torch.sigmoid(gs.squeeze(-1)) >= 0.5).float().mean() for gs in gate_scores]
         exit_rate = torch.stack(exit_rates).mean() if exit_rates else final_logits.new_zeros(())
 
         inter_mean = sum(intermediate_lm_losses) / len(intermediate_lm_losses) if intermediate_lm_losses else final_lm_loss
