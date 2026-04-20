@@ -789,8 +789,8 @@ class GPT(nn.Module):
         use_recur_exit_gate: bool = True,
         recur_gate_margin: float = 0.02,
     ) -> tuple[Tensor, Tensor, Tensor, dict]:
-        # num_loops=-1 means use max_recur_loops (validation / gate mode)
-        loops_to_run = self.max_recur_loops if num_loops < 1 else num_loops
+        # requested_loops selects which logits/gates/losses are active; graph always runs full depth
+        requested_loops = self.max_recur_loops if num_loops < 1 else num_loops
 
         x_base = self.tok_emb(input_ids)
         x_base = F.rms_norm(x_base, (x_base.size(-1),))
@@ -801,31 +801,26 @@ class GPT(nn.Module):
         dummy_gate_usage = x_base.new_zeros(())
 
         x = x_base
-        for loop_idx in range(loops_to_run):
+        for loop_idx in range(self.max_recur_loops):
             loop_vec = self.loop_emb.weight[loop_idx].to(dtype=x_base.dtype)
             x0_loop = x_base + loop_vec[None, None, :]
             x = self._run_blocks(x, x0_loop)
             logits = self._to_logits(x)
             all_logits.append(logits)
-            # Every gate must be executed every forward to satisfy DDP's all-reduce requirement.
-            # Active gates contribute to gate_scores (when enabled); others attach with zero weight.
+            # All gates execute every forward for DDP all-reduce correctness.
+            # Only gates within the requested depth are supervised; others use zero weight.
             if loop_idx < len(self.exit_gates):
                 gs = self.exit_gates[loop_idx](x)
-                if use_recur_exit_gate and loop_idx < loops_to_run - 1:
+                if use_recur_exit_gate and loop_idx < requested_loops - 1:
                     gate_scores.append(gs)
                 else:
                     dummy_gate_usage = dummy_gate_usage + 0.0 * gs.sum()
 
-        # Gates beyond loops_to_run are never entered by the loop above; touch them
-        # with zero weight so DDP sees every gate parameter in every forward pass.
-        for gate_idx in range(loops_to_run, len(self.exit_gates)):
-            dummy_gate_usage = dummy_gate_usage + 0.0 * self.exit_gates[gate_idx](x).sum()
-
-        final_logits = all_logits[-1]
-        final_lm_loss = F.cross_entropy(final_logits.float(), targets, reduction="mean")
+        selected_final_logits = all_logits[requested_loops - 1]
+        final_lm_loss = F.cross_entropy(selected_final_logits.float(), targets, reduction="mean")
 
         recur_aux_lm_losses: list[Tensor] = []
-        for logits in all_logits[:-1]:
+        for logits in all_logits[:requested_loops - 1]:
             recur_aux_lm_losses.append(F.cross_entropy(logits.float(), targets, reduction="mean"))
 
         recur_aux_lm_mean = sum(recur_aux_lm_losses) / len(recur_aux_lm_losses) if recur_aux_lm_losses else final_lm_loss
@@ -834,12 +829,12 @@ class GPT(nn.Module):
         else:
             total_lm = final_lm_loss
 
-        gate_loss = final_logits.new_zeros(())
-        mean_gate_stop_prob = final_logits.new_zeros(())
-        mean_gate_target = final_logits.new_zeros(())
+        gate_loss = selected_final_logits.new_zeros(())
+        mean_gate_stop_prob = selected_final_logits.new_zeros(())
+        mean_gate_target = selected_final_logits.new_zeros(())
         if use_recur_exit_gate and gate_scores:
             B, T = input_ids.shape
-            final_ce_per_token = F.cross_entropy(final_logits.detach().float(), targets, reduction="none")
+            final_ce_per_token = F.cross_entropy(selected_final_logits.detach().float(), targets, reduction="none")
             final_seq_ce = final_ce_per_token.reshape(B, T).mean(dim=1)  # (B,)
 
             gate_losses: list[Tensor] = []
@@ -1141,7 +1136,7 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
-            # First max_recur_loops steps cover loop counts 1..max_recur_loops to precompile all graphs.
+            # First max_recur_loops steps vary num_loops 1..max to trigger all compile specializations.
             warmup_loops = (warmup_step + 1) if warmup_step < args.max_recur_loops else args.max_recur_loops
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
