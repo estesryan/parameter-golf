@@ -1136,7 +1136,7 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
-            # First max_recur_loops steps vary num_loops 1..max to trigger all compile specializations.
+            # Warmup cycles num_loops 1..max to expose the model to all recurrence depths early
             warmup_loops = (warmup_step + 1) if warmup_step < args.max_recur_loops else args.max_recur_loops
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
