@@ -728,7 +728,6 @@ class GPT(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.recur_num_layers = recur_num_layers
         self.recur_skip_prob = recur_skip_prob
         self.recur_blocks = nn.ModuleList(
             [
@@ -811,7 +810,7 @@ class GPT(nn.Module):
                 out = self._run_recur_blocks(x, x0_loop)
                 if skip_mask is not None:
                     mask = skip_mask[loop_idx - 1].to(dtype=x.dtype)
-                    x = mask * x + (1 - mask) * out
+                    x = x + (1 - mask) * (out - x)
                 else:
                     x = out
 
