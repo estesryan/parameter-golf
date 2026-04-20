@@ -69,11 +69,19 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 5))
+    num_layers = int(os.environ.get("NUM_LAYERS", 4))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 576))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.75))
+    mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
+    max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 3))
+    gate_loss_weight = float(os.environ.get("GATE_LOSS_WEIGHT", 0.1))
+    intermediate_lm_loss_weight = float(os.environ.get("INTERMEDIATE_LM_LOSS_WEIGHT", 0.5))
+    ema_beta = float(os.environ.get("EMA_BETA", 0.98))
+    gate_warmup_loss_ratio = float(os.environ.get("GATE_WARMUP_LOSS_RATIO", 1.10))  # ratio of intermediate to final loss; ~1.0 = loops converged
+    gate_min_exit_rate = float(os.environ.get("GATE_MIN_EXIT_RATE", 0.10))
+    gate_max_exit_rate = float(os.environ.get("GATE_MAX_EXIT_RATE", 0.90))
+    full_depth_supervision_prob = float(os.environ.get("FULL_DEPTH_SUPERVISION_PROB", 0.2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -264,7 +272,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(x, y)[0].detach()  # index 0 = final_lm_loss
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -297,7 +305,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,loop_emb,exit_gates",
     ).split(",")
     if pattern
 )
@@ -673,6 +681,20 @@ class Block(nn.Module):
         return x
 
 
+class ExitGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.proj = nn.Linear(dim, 1, bias=True)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.constant_(self.proj.bias, -2.0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Returns (B*T, 1) gate scores in [0, 1]
+        h = self.norm(x).reshape(-1, x.size(-1))
+        return torch.sigmoid(self.proj(h.to(self.proj.weight.dtype)))
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -687,6 +709,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        max_recur_loops: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -694,7 +717,10 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.max_recur_loops = max_recur_loops
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.loop_emb = nn.Embedding(max_recur_loops, model_dim)
+        nn.init.zeros_(self.loop_emb.weight)
         self.num_layers = num_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -713,6 +739,8 @@ class GPT(nn.Module):
                 for _ in range(self.num_layers)
             ]
         )
+        # Gates sit between loop transitions: one per non-final loop
+        self.exit_gates = nn.ModuleList([ExitGate(model_dim) for _ in range(max_recur_loops - 1)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=True)
         if self.lm_head is not None:
@@ -729,13 +757,8 @@ class GPT(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+    def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
         skips: list[Tensor] = []
-
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
@@ -743,18 +766,80 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return x
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+    def _to_logits(self, x: Tensor) -> Tensor:
+        h = self.final_norm(x).reshape(-1, x.size(-1))
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(h, self.tok_emb.weight)
         else:
-            logits_proj = self.lm_head(x)
+            logits_proj = self.lm_head(h)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        logits = self.forward_logits(input_ids)
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        num_loops: int = -1,
+        intermediate_lm_loss_weight: float = 0.5,
+        gate_loss_weight: float = 0.1,
+    ) -> tuple[Tensor, Tensor, Tensor, dict]:
+        # num_loops=-1 means use max_recur_loops (validation / gate mode)
+        loops_to_run = self.max_recur_loops if num_loops < 1 else num_loops
+
+        x_base = self.tok_emb(input_ids)
+        x_base = F.rms_norm(x_base, (x_base.size(-1),))
         targets = target_ids.reshape(-1)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        all_logits: list[Tensor] = []
+        gate_scores: list[Tensor] = []  # intermediate gates only (loops 0..loops_to_run-2)
+
+        x = x_base
+        for loop_idx in range(loops_to_run):
+            loop_vec = self.loop_emb.weight[loop_idx].to(dtype=x_base.dtype)
+            x0_loop = x_base + loop_vec[None, None, :]
+            x = self._run_blocks(x, x0_loop)
+            logits = self._to_logits(x)
+            all_logits.append(logits)
+            # Only attach a gate after non-final loops, and only if the gate exists
+            if loop_idx < loops_to_run - 1 and loop_idx < len(self.exit_gates):
+                gate_scores.append(self.exit_gates[loop_idx](x))
+
+        final_logits = all_logits[-1]
+        final_lm_loss = F.cross_entropy(final_logits.float(), targets, reduction="mean")
+
+        intermediate_lm_losses: list[Tensor] = []
+        for logits in all_logits[:-1]:
+            intermediate_lm_losses.append(F.cross_entropy(logits.float(), targets, reduction="mean"))
+
+        # Gate supervision: KL soft target; intermediate logits NOT detached
+        final_log_probs = F.log_softmax(final_logits.detach().float(), dim=-1)
+        gate_loss = final_logits.new_zeros(())
+        for loop_i, gs in enumerate(gate_scores):
+            inter_log_probs = F.log_softmax(all_logits[loop_i].float(), dim=-1)
+            kl = F.kl_div(inter_log_probs, final_log_probs, reduction="none", log_target=True).sum(-1)
+            soft_target = torch.exp(-kl).to(gs.dtype)
+            gate_loss = gate_loss + F.binary_cross_entropy(gs.squeeze(-1), soft_target, reduction="mean")
+        if gate_scores:
+            gate_loss = gate_loss / len(gate_scores)
+
+        # exit_rate: fraction of tokens where any intermediate gate >= 0.5
+        exit_rates = [(gs.squeeze(-1) >= 0.5).float().mean() for gs in gate_scores]
+        exit_rate = float(torch.stack(exit_rates).mean().item()) if exit_rates else 0.0
+
+        inter_mean = sum(intermediate_lm_losses) / len(intermediate_lm_losses) if intermediate_lm_losses else final_lm_loss
+        if intermediate_lm_losses:
+            total_lm = final_lm_loss + intermediate_lm_loss_weight * inter_mean
+        else:
+            total_lm = final_lm_loss
+        total_loss = total_lm + gate_loss_weight * gate_loss
+
+        stats = {
+            "exit_rate": exit_rate,
+            "intermediate_lm_mean": float(inter_mean.detach().item()),
+            "final_lm_loss": float(final_lm_loss.detach().item()),
+        }
+        return final_lm_loss, gate_loss, total_loss, stats
 
 
 # -----------------------------
@@ -868,6 +953,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        max_recur_loops=args.max_recur_loops,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -895,6 +981,9 @@ def main() -> None:
 
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # loop_emb and exit_gates are control/scalar tensors → Adam
+    scalar_params.extend(list(base_model.loop_emb.parameters()))
+    scalar_params.extend(list(base_model.exit_gates.parameters()))
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -946,6 +1035,17 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        f"recurrence max_recur_loops:{args.max_recur_loops} "
+        f"intermediate_lm_loss_weight:{args.intermediate_lm_loss_weight} "
+        f"gate_loss_weight:{args.gate_loss_weight}"
+    )
+    log0(
+        f"controller gate_warmup_loss_ratio:{args.gate_warmup_loss_ratio} "
+        f"(intermediate/final loss; switch when <=threshold) "
+        f"gate_min_exit_rate:{args.gate_min_exit_rate} gate_max_exit_rate:{args.gate_max_exit_rate} "
+        f"full_depth_supervision_prob:{args.full_depth_supervision_prob} ema_beta:{args.ema_beta}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -981,6 +1081,11 @@ def main() -> None:
 
         return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
 
+    # Controller state
+    ctrl_mode = "random"
+    loss_ratio_ema = 1.0   # intermediate_lm_mean / final_lm_loss (starts high, falls as model learns)
+    exit_rate_ema = 0.0
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -988,19 +1093,26 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
+            # First max_recur_loops steps cover loop counts 1..max_recur_loops to precompile all graphs.
+            warmup_loops = (warmup_step + 1) if warmup_step < args.max_recur_loops else args.max_recur_loops
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    _floss, _gloss, warmup_loss, _stats = model(
+                        x, y,
+                        num_loops=warmup_loops,
+                        intermediate_lm_loss_weight=args.intermediate_lm_loss_weight,
+                        gate_loss_weight=args.gate_loss_weight,
+                    )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps} loops:{warmup_loops}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1056,16 +1168,73 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
-        train_loss = torch.zeros((), device=device)
+
+        # --- Controller: decide num_loops_to_run (DDP-safe, torch-RNG only) ---
+        if ctrl_mode == "random" or ctrl_mode == "mix":
+            if rank == 0:
+                num_loops_t = torch.randint(1, args.max_recur_loops + 1, (1,), device=device)
+            else:
+                num_loops_t = torch.zeros(1, device=device, dtype=torch.int64)
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast(num_loops_t, src=0)
+            num_loops_to_run = int(num_loops_t.item())
+            if ctrl_mode == "mix":
+                if rank == 0:
+                    full_depth_flag = (torch.rand(1, device=device) < args.full_depth_supervision_prob).to(torch.int32)
+                else:
+                    full_depth_flag = torch.zeros(1, device=device, dtype=torch.int32)
+                if dist.is_available() and dist.is_initialized():
+                    dist.broadcast(full_depth_flag, src=0)
+                if full_depth_flag.item():
+                    num_loops_to_run = args.max_recur_loops
+        else:
+            num_loops_to_run = args.max_recur_loops
+
+        train_final_loss = torch.zeros((), device=device)
+        train_gate_loss = torch.zeros((), device=device)
+        train_total_loss = torch.zeros((), device=device)
+        step_exit_rate = 0.0
+        step_intermediate_lm_mean = 0.0
+        step_final_lm_mean = 0.0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
+                final_lm_loss, gate_loss, total_loss, fwd_stats = model(
+                    x, y,
+                    num_loops=num_loops_to_run,
+                    intermediate_lm_loss_weight=args.intermediate_lm_loss_weight,
+                    gate_loss_weight=args.gate_loss_weight,
+                )
+            train_final_loss += final_lm_loss.detach()
+            train_gate_loss += gate_loss.detach()
+            train_total_loss += total_loss.detach()
+            step_exit_rate += fwd_stats["exit_rate"]
+            step_intermediate_lm_mean += fwd_stats["intermediate_lm_mean"]
+            step_final_lm_mean += fwd_stats["final_lm_loss"]
+            (total_loss * grad_scale).backward()
+        train_final_loss /= grad_accum_steps
+        train_gate_loss /= grad_accum_steps
+        train_total_loss /= grad_accum_steps
+        step_exit_rate /= grad_accum_steps
+        step_intermediate_lm_mean /= grad_accum_steps
+        step_final_lm_mean /= grad_accum_steps
+
+        # Update EMAs (averaged across micro-steps)
+        cur_loss_ratio = step_intermediate_lm_mean / max(step_final_lm_mean, 1e-9)
+        loss_ratio_ema = args.ema_beta * loss_ratio_ema + (1 - args.ema_beta) * cur_loss_ratio
+        exit_rate_ema = args.ema_beta * exit_rate_ema + (1 - args.ema_beta) * step_exit_rate
+
+        # Controller mode transitions
+        if ctrl_mode == "random" and loss_ratio_ema <= args.gate_warmup_loss_ratio:
+            ctrl_mode = "mix"
+            log0(f"mode_switch: random -> mix loss_ratio_ema={loss_ratio_ema:.6f}")
+        elif ctrl_mode == "mix":
+            if (loss_ratio_ema <= args.gate_warmup_loss_ratio
+                    and args.gate_min_exit_rate <= exit_rate_ema <= args.gate_max_exit_rate):
+                ctrl_mode = "gate"
+                log0(f"mode_switch: mix -> gate loss_ratio_ema={loss_ratio_ema:.6f} exit_rate_ema={exit_rate_ema:.4f}")
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1090,7 +1259,11 @@ def main() -> None:
         )
         if should_log_train:
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/{args.iterations} mode:{ctrl_mode} loops:{num_loops_to_run} "
+                f"final_lm_loss:{train_final_loss.item():.4f} "
+                f"gate_loss:{train_gate_loss.item():.4f} total_loss:{train_total_loss.item():.4f} "
+                f"loss_ratio:{cur_loss_ratio:.4f} loss_ratio_ema:{loss_ratio_ema:.4f} "
+                f"exit_rate:{step_exit_rate:.4f} exit_rate_ema:{exit_rate_ema:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
