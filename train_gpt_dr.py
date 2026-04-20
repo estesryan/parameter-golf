@@ -810,13 +810,15 @@ class GPT(nn.Module):
                 out = self._run_recur_blocks(x, x0_loop)
 
                 if skip_mask is not None:
-                    gate = (~skip_mask[loop_idx - 1]).to(dtype=x.dtype)
+                    mask = skip_mask[loop_idx - 1].to(dtype=x.dtype)
                 else:
-                    gate = torch.ones((), device=x.device, dtype=x.dtype)
+                    mask = torch.zeros((), device=x.device, dtype=x.dtype)
 
-                # We always compute out; stochastic depth is implemented as interpolation
-                # instead of a hard masked overwrite so gradients stay aligned with forward use.
-                x = x + gate * (out - x)
+                # hard skip in forward
+                x = x + (1 - mask) * (out - x)
+
+                # keep skipped recurrent path in autograd graph
+                x = x + 0.0 * out.sum()
 
             logits = self._to_logits(x)
             all_logits.append(logits)
