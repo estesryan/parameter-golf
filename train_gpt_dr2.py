@@ -811,6 +811,7 @@ class GPT(nn.Module):
                 if skip_mask is not None:
                     mask = skip_mask[loop_idx - 1].to(dtype=x.dtype)
                     x = x + (1 - mask) * (out - x)
+                    x = x + 1e-4 * out
                 else:
                     x = out
 
