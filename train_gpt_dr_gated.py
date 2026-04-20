@@ -78,7 +78,6 @@ class Hyperparameters:
     recur_num_layers = int(os.environ.get("RECUR_NUM_LAYERS", 1))
     recur_mlp_mult = float(os.environ.get("RECUR_MLP_MULT", 1.0))
     recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 0.6))
-    recur_gate_override_prob = float(os.environ.get("RECUR_GATE_OVERRIDE_PROB", 0.2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -697,7 +696,6 @@ class GPT(nn.Module):
         max_recur_loops: int,
         recur_num_layers: int,
         recur_mlp_mult: float,
-        recur_gate_override_prob: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -728,7 +726,6 @@ class GPT(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.recur_gate_override_prob = recur_gate_override_prob
         self.recur_blocks = nn.ModuleList(
             [
                 Block(
@@ -810,11 +807,6 @@ class GPT(nn.Module):
                 out = self._run_recur_blocks(x, x0_loop)
 
                 gate = torch.sigmoid(self.loop_gate[loop_idx - 1]).to(dtype=x.dtype)
-
-                if self.training:
-                    force = (torch.rand((), device=x.device) < self.recur_gate_override_prob).to(dtype=x.dtype)
-                    rand_gate = torch.rand((), device=x.device, dtype=x.dtype)
-                    gate = (1 - force) * gate + force * rand_gate
 
                 x = x + gate * (out - x)
 
@@ -961,7 +953,6 @@ def main() -> None:
         max_recur_loops=args.max_recur_loops,
         recur_num_layers=args.recur_num_layers,
         recur_mlp_mult=args.recur_mlp_mult,
-        recur_gate_override_prob=args.recur_gate_override_prob,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
