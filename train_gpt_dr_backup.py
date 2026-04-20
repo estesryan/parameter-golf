@@ -82,9 +82,6 @@ class Hyperparameters:
     recur_depth_alpha = float(os.environ.get("RECUR_DEPTH_ALPHA", 0.8))
     recur_warmup_frac_full = float(os.environ.get("RECUR_WARMUP_FRAC_FULL", 0.05))
     recur_warmup_frac_transition = float(os.environ.get("RECUR_WARMUP_FRAC_TRANSITION", 0.15))
-    recur_depth_log_every = int(os.environ.get("RECUR_DEPTH_LOG_EVERY", 0))
-    recur_eval_early_exit = bool(int(os.environ.get("RECUR_EVAL_EARLY_EXIT", "1")))
-    recur_eval_entropy_threshold = float(os.environ.get("RECUR_EVAL_ENTROPY_THRESHOLD", 1.20))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -246,7 +243,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-) -> tuple[float, float, dict]:
+) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
@@ -258,23 +255,12 @@ def eval_val(
             f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
         )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs_all = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs_all * rank) // world_size
-    seq_end = (total_seqs_all * (rank + 1)) // world_size
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    if args.recur_eval_early_exit:
-        eval_model = model.module if isinstance(model, DDP) else model
-        val_seq_count = torch.zeros((), device=device, dtype=torch.float64)
-        val_avg_loops_sum = torch.zeros((), device=device, dtype=torch.float64)
-        val_full_depth_sum = torch.zeros((), device=device, dtype=torch.float64)
-        val_exit_k_sums = [torch.zeros((), device=device, dtype=torch.float64) for _ in range(args.max_recur_loops)]
-    else:
-        eval_model = None
-        val_seq_count = val_avg_loops_sum = val_full_depth_sum = None
-        val_exit_k_sums = None
 
     model.eval()
     with torch.no_grad():
@@ -285,21 +271,8 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            if args.recur_eval_early_exit:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    batch_loss, batch_stats = eval_model.forward_eval_early_exit(
-                        x, y, recur_eval_entropy_threshold=args.recur_eval_entropy_threshold
-                    )
-                batch_loss = batch_loss.detach()
-                n_seqs = float(x.shape[0])
-                val_seq_count += n_seqs
-                val_avg_loops_sum += batch_stats["avg_eval_loops"] * n_seqs
-                val_full_depth_sum += batch_stats["full_depth_rate"] * n_seqs
-                for k in range(1, args.max_recur_loops + 1):
-                    val_exit_k_sums[k - 1] += batch_stats[f"exit_rate_k{k}"] * n_seqs
-            else:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    batch_loss = model(x, y)[0].detach()  # index 0 = final_lm_loss
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                batch_loss = model(x, y)[0].detach()  # index 0 = final_lm_loss
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -313,36 +286,12 @@ def eval_val(
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-        if args.recur_eval_early_exit:
-            dist.all_reduce(val_seq_count, op=dist.ReduceOp.SUM)
-            dist.all_reduce(val_avg_loops_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(val_full_depth_sum, op=dist.ReduceOp.SUM)
-            for t in val_exit_k_sums:
-                dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
-
-    if args.recur_eval_early_exit:
-        n = float(val_seq_count.item())
-        n = max(n, 1.0)
-        agg_avg_loops = float(val_avg_loops_sum.item()) / n
-        agg_full_depth = float(val_full_depth_sum.item()) / n
-        eval_stats: dict = {
-            "avg_eval_loops": agg_avg_loops,
-            "full_depth_rate": agg_full_depth,
-            "eval_loop_reduction_pct": 1.0 - agg_avg_loops / args.max_recur_loops,
-        }
-        for k in range(1, args.max_recur_loops + 1):
-            eval_stats[f"exit_rate_k{k}"] = float(val_exit_k_sums[k - 1].item()) / n
-    else:
-        eval_stats = {"avg_eval_loops": 0.0, "full_depth_rate": 0.0, "eval_loop_reduction_pct": 0.0}
-        for k in range(1, args.max_recur_loops + 1):
-            eval_stats[f"exit_rate_k{k}"] = 0.0
-
     model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte), eval_stats
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -901,91 +850,6 @@ class GPT(nn.Module):
         }
         return final_lm_loss, gate_loss, total_loss, stats
 
-    def forward_eval_early_exit_impl(
-        self,
-        input_ids: Tensor,
-        target_ids: Tensor,
-        recur_eval_entropy_threshold: float,
-    ) -> tuple[Tensor, dict]:
-        B, T = input_ids.shape
-        device = input_ids.device
-
-        x_base = self.tok_emb(input_ids)
-        x_base = F.rms_norm(x_base, (x_base.size(-1),))
-        targets = target_ids.reshape(-1)
-
-        active_idx = torch.arange(B, device=device)
-        x_active = x_base.clone()
-
-        exit_loops = torch.zeros(B, dtype=torch.long, device=device)
-        final_logits_buf: Tensor | None = None
-        exit_counts: dict[int, int] = {}
-        t_range = torch.arange(T, device=device)
-
-        for loop_idx in range(self.max_recur_loops):
-            B_active = active_idx.shape[0]
-            loop_vec = self.loop_emb.weight[loop_idx].to(dtype=x_active.dtype)
-            x0_loop = x_base[active_idx] + loop_vec[None, None, :]
-            x_active = self._run_blocks(x_active, x0_loop)
-            logits = self._to_logits(x_active)  # (B_active*T, V)
-
-            if final_logits_buf is None:
-                V = logits.shape[-1]
-                final_logits_buf = torch.zeros(B * T, V, dtype=logits.dtype, device=device)
-
-            flat_dst = (active_idx[:, None] * T + t_range[None, :]).reshape(-1)
-            is_final_loop = loop_idx == self.max_recur_loops - 1
-
-            if is_final_loop:
-                final_logits_buf[flat_dst] = logits
-                exit_loops[active_idx] = loop_idx + 1
-                exit_counts[loop_idx + 1] = exit_counts.get(loop_idx + 1, 0) + B_active
-            else:
-                logits_3d = logits.reshape(B_active, T, -1).float()
-                probs = torch.softmax(logits_3d, dim=-1)
-                token_entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)  # (B_active, T)
-                seq_entropy = token_entropy.mean(dim=-1)  # (B_active,)
-
-                exit_mask = seq_entropy <= recur_eval_entropy_threshold
-                exit_rel = exit_mask.nonzero(as_tuple=True)[0]
-                stay_rel = (~exit_mask).nonzero(as_tuple=True)[0]
-
-                if exit_rel.numel() > 0:
-                    exiting_abs = active_idx[exit_rel]
-                    exit_dst = (exiting_abs[:, None] * T + t_range[None, :]).reshape(-1)
-                    exit_src = (exit_rel[:, None] * T + t_range[None, :]).reshape(-1)
-                    final_logits_buf[exit_dst] = logits[exit_src]
-                    exit_loops[exiting_abs] = loop_idx + 1
-                    exit_counts[loop_idx + 1] = exit_counts.get(loop_idx + 1, 0) + exit_rel.numel()
-
-                if stay_rel.numel() == 0:
-                    break
-                active_idx = active_idx[stay_rel]
-                x_active = x_active[stay_rel]
-
-        batch_loss = F.cross_entropy(final_logits_buf.float(), targets, reduction="mean")
-
-        avg_eval_loops = exit_loops.float().mean().item()
-        full_depth_rate = (exit_loops == self.max_recur_loops).float().mean().item()
-        eval_loop_reduction_pct = 1.0 - (avg_eval_loops / self.max_recur_loops)
-
-        stats: dict = {
-            "avg_eval_loops": avg_eval_loops,
-            "full_depth_rate": full_depth_rate,
-            "eval_loop_reduction_pct": eval_loop_reduction_pct,
-        }
-        for k in range(1, self.max_recur_loops + 1):
-            stats[f"exit_rate_k{k}"] = exit_counts.get(k, 0) / B
-
-        return batch_loss, stats
-
-    def forward_eval_early_exit(
-        self,
-        input_ids: Tensor,
-        target_ids: Tensor,
-        recur_eval_entropy_threshold: float,
-    ) -> tuple[Tensor, dict]:
-        return self.forward_eval_early_exit_impl(input_ids, target_ids, recur_eval_entropy_threshold)
 
 
 def min_depth_schedule(elapsed_ms: float, max_wallclock_ms: float | None, max_loops: int, full_frac: float, transition_frac: float) -> int:
@@ -1208,11 +1072,6 @@ def main() -> None:
         f"recur_warmup_frac_full:{args.recur_warmup_frac_full} "
         f"recur_warmup_frac_transition:{args.recur_warmup_frac_transition}"
     )
-    log0(
-        f"recur_depth_log_every:{args.recur_depth_log_every} "
-        f"recur_eval_early_exit:{args.recur_eval_early_exit} "
-        f"recur_eval_entropy_threshold:{args.recur_eval_entropy_threshold}"
-    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1307,7 +1166,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb, val_eval_stats = eval_val(
+            val_loss, val_bpb = eval_val(
                 args,
                 model,
                 rank,
@@ -1323,17 +1182,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            if args.recur_eval_early_exit:
-                k_parts = " ".join(
-                    f"k{k}:{val_eval_stats[f'exit_rate_k{k}']:.4f}"
-                    for k in range(1, args.max_recur_loops + 1)
-                )
-                log0(
-                    f"recur_eval_exit: "
-                    f"avg_eval_loops:{val_eval_stats['avg_eval_loops']:.4f} "
-                    f"eval_loop_reduction_pct:{val_eval_stats['eval_loop_reduction_pct']:.4f} "
-                    f"full_depth_rate:{val_eval_stats['full_depth_rate']:.4f} {k_parts}"
-                )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1413,16 +1261,14 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 f" recur_loops:{recur_loops_to_run}"
             )
-
-        if args.recur_depth_log_every > 0 and step % args.recur_depth_log_every == 0 and step > 0:
-            total = loop_hist.sum().item()
-            if total > 0:
-                mix = " ".join(
-                    f"k{i}:{(loop_hist[i].item() / total):.2f}"
-                    for i in range(1, args.max_recur_loops + 1)
-                )
-                log0(f"recur_depth_mix: {mix}")
-            loop_hist.zero_()
+            if step % args.train_log_every == 0 and step > 0:
+                total = loop_hist.sum().item()
+                if total > 0:
+                    usage = " ".join(
+                        f"k{i}:{(loop_hist[i].item() / total):.2f}"
+                        for i in range(1, args.max_recur_loops + 1)
+                    )
+                    log0(f"loop_usage: {usage}")
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1506,7 +1352,7 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_mixed(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb, _ = eval_val(
+    q_val_loss, q_val_bpb = eval_val(
         args,
         model,
         rank,
