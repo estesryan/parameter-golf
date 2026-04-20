@@ -765,7 +765,7 @@ class GPT(nn.Module):
             x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            if skips:
+            if i < self.num_skip_weights:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         return x
