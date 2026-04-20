@@ -808,12 +808,17 @@ class GPT(nn.Module):
                 x = self._run_blocks(x, x0_loop)
             else:
                 out = self._run_recur_blocks(x, x0_loop)
+
                 if skip_mask is not None:
                     mask = skip_mask[loop_idx - 1].to(dtype=x.dtype)
-                    x = x + (1 - mask) * (out - x)
-                    x = x + 1e-4 * out
                 else:
-                    x = out
+                    mask = torch.zeros((), device=x.device, dtype=x.dtype)
+
+                # skip behavior
+                x = x + (1 - mask) * (out - x)
+
+                # FORCE GRAPH USAGE (THIS IS THE KEY LINE)
+                x = x + 0.0 * out.sum()
 
             logits = self._to_logits(x)
             all_logits.append(logits)
