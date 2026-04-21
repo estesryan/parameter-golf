@@ -45,7 +45,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp5120")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
@@ -62,7 +62,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
     warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.30))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 196_608))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 2.0))
@@ -75,8 +75,8 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.75))
     max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 2))
-    recur_num_layers = int(os.environ.get("RECUR_NUM_LAYERS", 2))
-    recur_mlp_mult = float(os.environ.get("RECUR_MLP_MULT", 1.0))
+    recur_num_layers = int(os.environ.get("RECUR_NUM_LAYERS", 1))
+    recur_mlp_mult = float(os.environ.get("RECUR_MLP_MULT", 0.0))
     recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 0.6))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
