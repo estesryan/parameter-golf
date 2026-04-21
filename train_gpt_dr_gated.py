@@ -475,52 +475,93 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
+_DOC_BOS_ID: int = 1
+_DOC_EOS_ID: int = 2
+
+
+class DocumentStream:
+    # Reads shards sequentially, segmenting tokens into documents by BOS position.
+    # Wraps around all shards forever. Each document includes its BOS and EOS tokens.
+    def __init__(self, pattern: str, start_file_idx: int = 0) -> None:
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.file_idx = 0
-        self.tokens = load_data_shard(self.files[0])
-        self.pos = 0
+        self.file_idx = start_file_idx % len(self.files)
+        self._shard: np.ndarray = np.empty(0, dtype=np.uint16)
+        self._doc_spans: list[tuple[int, int]] = []
+        self._doc_idx: int = 0
+        self._load_shard()
+
+    def _load_shard(self) -> None:
+        self._shard = load_data_shard(self.files[self.file_idx]).numpy()
+        bos_pos = np.where(self._shard == _DOC_BOS_ID)[0]
+        if bos_pos.size == 0:
+            raise RuntimeError(
+                f"No BOS tokens (id={_DOC_BOS_ID}) found in shard: {self.files[self.file_idx]}"
+            )
+        eos_count = np.count_nonzero(self._shard == _DOC_EOS_ID)
+        if eos_count == 0:
+            raise RuntimeError(
+                f"No EOS tokens (id={_DOC_EOS_ID}) found in shard: {self.files[self.file_idx]}"
+            )
+        self._doc_spans = []
+        for i, start in enumerate(bos_pos):
+            end = int(bos_pos[i + 1]) if i + 1 < len(bos_pos) else len(self._shard)
+            self._doc_spans.append((int(start), end))
+        self._doc_idx = 0
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        self.pos = 0
+        self._load_shard()
 
-    def take(self, n: int) -> Tensor:
-        chunks: list[Tensor] = []
-        remaining = n
-        while remaining > 0:
-            avail = self.tokens.numel() - self.pos
-            if avail <= 0:
-                self._advance_file()
-                continue
-            k = min(remaining, avail)
-            chunks.append(self.tokens[self.pos : self.pos + k])
-            self.pos += k
-            remaining -= k
-        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+    def next_document(self) -> np.ndarray:
+        # Returns the next complete document [BOS ... EOS], cycling shards forever.
+        while True:
+            if self._doc_idx < len(self._doc_spans):
+                start, end = self._doc_spans[self._doc_idx]
+                self._doc_idx += 1
+                return self._shard[start:end]
+            self._advance_file()
 
 
-class DistributedTokenLoader:
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+class DistributedDocumentLoader:
+    # Drop-in replacement for the flat DistributedTokenLoader.
+    #
+    # Packing strategy: documents are appended whole into a per-rank ring buffer.
+    # Fixed-length sequences are sliced from the front of that buffer. A document
+    # that is longer than one sequence budget is naturally spread across consecutive
+    # sequences without mixing other documents into its interior (it fills the buffer
+    # exclusively until consumed). No padding tokens are ever inserted.
+    #
+    # Each rank's DocumentStream starts at a different shard file (rank % num_files)
+    # so ranks train on diverse, non-overlapping portions of the data.
+
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device) -> None:
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self._stream = DocumentStream(pattern, start_file_idx=rank)
+        self._chunks: list[np.ndarray] = []
+        self._buf_len: int = 0
+
+    def _ensure(self, n: int) -> None:
+        while self._buf_len < n:
+            doc = self._stream.next_document()
+            self._chunks.append(doc)
+            self._buf_len += len(doc)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
-        start = self.rank * per_rank_span
-        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
-        x = local[:-1].reshape(-1, seq_len)
-        y = local[1:].reshape(-1, seq_len)
+        num_seqs = local_tokens // seq_len
+        raw_count = num_seqs * seq_len + 1
+        self._ensure(raw_count)
+        flat = np.concatenate(self._chunks) if len(self._chunks) > 1 else self._chunks[0].copy()
+        raw = torch.from_numpy(flat[:raw_count].astype(np.int64))
+        remainder = flat[raw_count:]
+        self._chunks = [] if remainder.size == 0 else [remainder]
+        self._buf_len = int(remainder.size)
+        x = raw[:-1].reshape(num_seqs, seq_len)
+        y = raw[1:].reshape(num_seqs, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # -----------------------------
@@ -1037,7 +1078,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedDocumentLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1096,7 +1137,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedDocumentLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
