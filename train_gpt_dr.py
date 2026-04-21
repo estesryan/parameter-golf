@@ -74,7 +74,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.75))
-    max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 2))
+    max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 3))
     recur_num_layers = int(os.environ.get("RECUR_NUM_LAYERS", 1))
     recur_mlp_mult = float(os.environ.get("RECUR_MLP_MULT", 0.0))
     recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 0.6))
