@@ -78,7 +78,6 @@ class Hyperparameters:
     recur_num_layers = int(os.environ.get("RECUR_NUM_LAYERS", 1))
     recur_mlp_mult = float(os.environ.get("RECUR_MLP_MULT", 1.0))
     recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 0.6))
-    recur_skip_prob = float(os.environ.get("RECUR_SKIP_PROB", 0.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -697,7 +696,6 @@ class GPT(nn.Module):
         max_recur_loops: int,
         recur_num_layers: int,
         recur_mlp_mult: float,
-        recur_skip_prob: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -728,7 +726,6 @@ class GPT(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.recur_skip_prob = recur_skip_prob
         self.recur_blocks = nn.ModuleList(
             [
                 Block(
@@ -786,7 +783,7 @@ class GPT(nn.Module):
         self,
         input_ids: Tensor,
         target_ids: Tensor,
-        recur_aux_loss_weight: float = 0.5,
+        recur_aux_loss_weight: float = 0.6,
     ) -> tuple[Tensor, Tensor, Tensor, dict]:
 
         x_base = self.tok_emb(input_ids)
@@ -799,7 +796,6 @@ class GPT(nn.Module):
         loops_to_run = self.max_recur_loops
         loop_embs = self.loop_emb.weight[:loops_to_run].to(dtype=x_base.dtype)
         scale = self.loop_scale.to(dtype=x_base.dtype)[None, None, :]
-        skip_mask = torch.rand(loops_to_run - 1, device=x.device) < self.recur_skip_prob if self.training else None
         for loop_idx in range(loops_to_run):
             loop_vec = loop_embs[loop_idx]
             x0_loop = x_base * (1 + scale * loop_vec) + loop_vec[None, None, :]
@@ -808,15 +804,7 @@ class GPT(nn.Module):
                 x = self._run_blocks(x, x0_loop)
             else:
                 out = self._run_recur_blocks(x, x0_loop)
-
-                if skip_mask is not None:
-                    gate = (~skip_mask[loop_idx - 1]).to(dtype=x.dtype)
-                else:
-                    gate = torch.ones((), device=x.device, dtype=x.dtype)
-
-                # We always compute out; stochastic depth is implemented as interpolation
-                # instead of a hard masked overwrite so gradients stay aligned with forward use.
-                x = x + gate * (out - x)
+                x = out
 
             logits = self._to_logits(x)
             all_logits.append(logits)
@@ -961,7 +949,6 @@ def main() -> None:
         max_recur_loops=args.max_recur_loops,
         recur_num_layers=args.recur_num_layers,
         recur_mlp_mult=args.recur_mlp_mult,
-        recur_skip_prob=args.recur_skip_prob,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
