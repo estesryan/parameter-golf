@@ -78,6 +78,8 @@ class Hyperparameters:
     recur_num_layers = int(os.environ.get("RECUR_NUM_LAYERS", 1))
     recur_mlp_mult = float(os.environ.get("RECUR_MLP_MULT", 1.0))
     recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 0.6))
+    gate_aux_loss_weight = float(os.environ.get("GATE_AUX_LOSS_WEIGHT", 0.05))
+    gate_improve_margin = float(os.environ.get("GATE_IMPROVE_MARGIN", 0.01))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -740,6 +742,8 @@ class GPT(nn.Module):
             ]
         )
         self.loop_gate = nn.Parameter(torch.zeros(max_recur_loops - 1, dtype=torch.float32))
+        self.loop_continue_w = nn.Parameter(torch.zeros(max_recur_loops - 1, model_dim, dtype=torch.float32))
+        self.loop_continue_b = nn.Parameter(torch.zeros(max_recur_loops - 1, dtype=torch.float32))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=True)
         if self.lm_head is not None:
@@ -784,7 +788,9 @@ class GPT(nn.Module):
         self,
         input_ids: Tensor,
         target_ids: Tensor,
-        recur_aux_loss_weight: float = 0.5,
+        recur_aux_loss_weight: float = 0.6,
+        gate_aux_loss_weight: float = 0.05,
+        gate_improve_margin: float = 0.01,
     ) -> tuple[Tensor, Tensor, Tensor, dict]:
 
         x_base = self.tok_emb(input_ids)
@@ -792,6 +798,7 @@ class GPT(nn.Module):
         targets = target_ids.reshape(-1)
 
         all_logits: list[Tensor] = []
+        continue_logits: list[Tensor] = []
 
         x = x_base
         loops_to_run = self.max_recur_loops
@@ -813,12 +820,20 @@ class GPT(nn.Module):
             logits = self._to_logits(x)
             all_logits.append(logits)
 
+            if loop_idx < loops_to_run - 1:
+                pooled = x.mean(dim=1)  # [B, dim]
+                cont_logit = (pooled.float() * self.loop_continue_w[loop_idx][None, :]).sum(dim=1) + self.loop_continue_b[loop_idx]  # [B]
+                continue_logits.append(cont_logit)
+
         final_logits = all_logits[-1]
         final_lm_loss = F.cross_entropy(final_logits.float(), targets, reduction="mean")
 
-        recur_aux_lm_losses: list[Tensor] = []
-        for logits in all_logits[:-1]:
-            recur_aux_lm_losses.append(F.cross_entropy(logits.float(), targets, reduction="mean"))
+        # Scalar CE per loop for recur aux loss (unchanged semantics)
+        ce_per_loop_scalar: list[Tensor] = [
+            F.cross_entropy(logits.float(), targets, reduction="mean")
+            for logits in all_logits
+        ]
+        recur_aux_lm_losses = ce_per_loop_scalar[:-1]
 
         if recur_aux_lm_losses:
             weights = torch.tensor(
@@ -831,10 +846,51 @@ class GPT(nn.Module):
             total_lm = final_lm_loss + recur_aux_loss_weight * recur_aux_lm_mean
         else:
             total_lm = final_lm_loss
+
+        gate_aux_loss = torch.zeros_like(final_lm_loss)
+        gate_target_mean = torch.zeros((), device=final_lm_loss.device)
+        gate_pred_mean = torch.zeros((), device=final_lm_loss.device)
+        gate_acc = torch.zeros((), device=final_lm_loss.device)
+        ce_delta_mean = torch.zeros((), device=final_lm_loss.device)
+        ce_delta_std = torch.zeros((), device=final_lm_loss.device)
+
+        if continue_logits:
+            B = input_ids.size(0)
+            # Per-sequence CE for gate diagnostic only; does not affect training loss path
+            ce_per_loop_seq: list[Tensor] = [
+                F.cross_entropy(logits.float(), targets, reduction="none").view(B, -1).mean(dim=1)
+                for logits in all_logits
+            ]
+
+            continue_logits_t = torch.stack(continue_logits)  # [loops-1, B]
+
+            ce_curr = torch.stack(ce_per_loop_seq[:-1]).detach()  # [loops-1, B]
+            ce_next = torch.stack(ce_per_loop_seq[1:]).detach()   # [loops-1, B]
+
+            ce_delta = ce_curr - ce_next
+            ce_delta_mean = ce_delta.mean()
+            ce_delta_std = ce_delta.std()
+
+            continue_targets = (ce_delta > gate_improve_margin).to(dtype=continue_logits_t.dtype)  # [loops-1, B]
+
+            gate_aux_loss = F.binary_cross_entropy_with_logits(continue_logits_t.float(), continue_targets.float())
+            total_lm = total_lm + gate_aux_loss_weight * gate_aux_loss
+
+            continue_probs = torch.sigmoid(continue_logits_t.detach())
+            gate_target_mean = continue_targets.float().mean()
+            gate_pred_mean = continue_probs.mean()
+            gate_acc = ((continue_probs > 0.5) == (continue_targets > 0.5)).float().mean()
+
         total_loss = total_lm
 
         stats = {
             "final_lm_loss": final_lm_loss.detach(),
+            "gate_aux_loss": gate_aux_loss.detach(),
+            "gate_target_mean": gate_target_mean.detach(),
+            "gate_pred_mean": gate_pred_mean.detach(),
+            "gate_acc": gate_acc.detach(),
+            "ce_delta_mean": ce_delta_mean.detach(),
+            "ce_delta_std": ce_delta_std.detach(),
         }
         return final_lm_loss, torch.zeros_like(final_lm_loss), total_loss, stats
 
@@ -982,6 +1038,8 @@ def main() -> None:
     # loop_emb and loop_gate are control/scalar tensors → Adam
     scalar_params.extend(list(base_model.loop_emb.parameters()))
     scalar_params.append(base_model.loop_gate)
+    scalar_params.append(base_model.loop_continue_w)
+    scalar_params.append(base_model.loop_continue_b)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1088,6 +1146,8 @@ def main() -> None:
                     _floss, _, warmup_loss, _stats = model(
                         x, y,
                         recur_aux_loss_weight=args.recur_aux_loss_weight,
+                        gate_aux_loss_weight=args.gate_aux_loss_weight,
+                        gate_improve_margin=args.gate_improve_margin,
                     )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1160,6 +1220,8 @@ def main() -> None:
                 final_lm_loss, _, total_loss, _fwd_stats = model(
                     x, y,
                     recur_aux_loss_weight=args.recur_aux_loss_weight,
+                    gate_aux_loss_weight=args.gate_aux_loss_weight,
+                    gate_improve_margin=args.gate_improve_margin,
                 )
             train_final_loss += final_lm_loss.detach()
             (total_loss * grad_scale).backward()
@@ -1189,6 +1251,11 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_final_loss.item():.4f} "
+                f"gate_aux:{_fwd_stats['gate_aux_loss'].item():.4f} "
+                f"gate_tgt:{_fwd_stats['gate_target_mean'].item():.3f} "
+                f"gate_pred:{_fwd_stats['gate_pred_mean'].item():.3f} "
+                f"gate_acc:{_fwd_stats['gate_acc'].item():.3f} "
+                f"ce_delta:{_fwd_stats['ce_delta_mean'].item():.4f}±{_fwd_stats['ce_delta_std'].item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
