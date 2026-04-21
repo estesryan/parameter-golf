@@ -853,6 +853,12 @@ class GPT(nn.Module):
         gate_acc = torch.zeros((), device=final_lm_loss.device)
         ce_delta_mean = torch.zeros((), device=final_lm_loss.device)
         ce_delta_std = torch.zeros((), device=final_lm_loss.device)
+        num_transitions = self.max_recur_loops - 1
+        gate_target_per_loop = torch.zeros(num_transitions, device=final_lm_loss.device)
+        gate_pred_per_loop = torch.zeros(num_transitions, device=final_lm_loss.device)
+        gate_acc_per_loop = torch.zeros(num_transitions, device=final_lm_loss.device)
+        ce_delta_mean_per_loop = torch.zeros(num_transitions, device=final_lm_loss.device)
+        ce_delta_std_per_loop = torch.zeros(num_transitions, device=final_lm_loss.device)
 
         if continue_logits:
             B = input_ids.size(0)
@@ -881,6 +887,12 @@ class GPT(nn.Module):
             gate_pred_mean = continue_probs.mean()
             gate_acc = ((continue_probs > 0.5) == (continue_targets > 0.5)).float().mean()
 
+            gate_target_per_loop = continue_targets.float().mean(dim=1)
+            gate_pred_per_loop = continue_probs.mean(dim=1)
+            gate_acc_per_loop = ((continue_probs > 0.5) == (continue_targets > 0.5)).float().mean(dim=1)
+            ce_delta_mean_per_loop = ce_delta.mean(dim=1)
+            ce_delta_std_per_loop = ce_delta.std(dim=1)
+
         total_loss = total_lm
 
         stats = {
@@ -891,6 +903,11 @@ class GPT(nn.Module):
             "gate_acc": gate_acc.detach(),
             "ce_delta_mean": ce_delta_mean.detach(),
             "ce_delta_std": ce_delta_std.detach(),
+            "gate_target_per_loop": gate_target_per_loop.detach(),
+            "gate_pred_per_loop": gate_pred_per_loop.detach(),
+            "gate_acc_per_loop": gate_acc_per_loop.detach(),
+            "ce_delta_mean_per_loop": ce_delta_mean_per_loop.detach(),
+            "ce_delta_std_per_loop": ce_delta_std_per_loop.detach(),
         }
         return final_lm_loss, torch.zeros_like(final_lm_loss), total_loss, stats
 
@@ -1249,6 +1266,15 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            g_tgt = _fwd_stats["gate_target_per_loop"]
+            g_pred = _fwd_stats["gate_pred_per_loop"]
+            g_acc = _fwd_stats["gate_acc_per_loop"]
+            d_mean = _fwd_stats["ce_delta_mean_per_loop"]
+            d_std = _fwd_stats["ce_delta_std_per_loop"]
+            per_loop_str = " ".join(
+                f"gate_l{i}:tgt={g_tgt[i].item():.3f},pred={g_pred[i].item():.3f},acc={g_acc[i].item():.3f},delta={d_mean[i].item():.4f}±{d_std[i].item():.4f}"
+                for i in range(g_tgt.shape[0])
+            )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_final_loss.item():.4f} "
                 f"gate_aux:{_fwd_stats['gate_aux_loss'].item():.4f} "
@@ -1256,7 +1282,8 @@ def main() -> None:
                 f"gate_pred:{_fwd_stats['gate_pred_mean'].item():.3f} "
                 f"gate_acc:{_fwd_stats['gate_acc'].item():.3f} "
                 f"ce_delta:{_fwd_stats['ce_delta_mean'].item():.4f}±{_fwd_stats['ce_delta_std'].item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                + (per_loop_str + " " if per_loop_str else "")
+                + f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
