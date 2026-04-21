@@ -104,11 +104,11 @@ class Hyperparameters:
     # scale stays fp32 and is handled correctly by the passthrough quantization path.
     # (Omitting it does not route it to Muon — it is 1D so it falls into scalar Adam —
     # but it would lose fp32 passthrough treatment in the int8 export.)
-    refinement_steps = int(os.environ.get("REFINEMENT_STEPS", 1))
-    refinement_hidden_mult = int(os.environ.get("REFINEMENT_HIDDEN_MULT", 1))
-    refinement_aux_loss_weight = float(os.environ.get("REFINEMENT_AUX_LOSS_WEIGHT", 0.0))
-    refinement_use_logit_feedback = bool(int(os.environ.get("REFINEMENT_USE_LOGIT_FEEDBACK", 0)))
-    refinement_feedback_scale = float(os.environ.get("REFINEMENT_FEEDBACK_SCALE", 0.05))
+    refinement_steps = int(os.environ.get("REFINEMENT_STEPS", 2))
+    refinement_hidden_mult = int(os.environ.get("REFINEMENT_HIDDEN_MULT", 2))
+    refinement_aux_loss_weight = float(os.environ.get("REFINEMENT_AUX_LOSS_WEIGHT", 0.05))
+    refinement_use_logit_feedback = bool(int(os.environ.get("REFINEMENT_USE_LOGIT_FEEDBACK", 1)))
+    refinement_feedback_scale = float(os.environ.get("REFINEMENT_FEEDBACK_SCALE", 0.02))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
