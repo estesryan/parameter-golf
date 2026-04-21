@@ -3,15 +3,7 @@
     {
       "name": "sp_bpe_1536",
       "dataset_suffix": "sp1536",
-      "vocab_size": 1536,
-      "trainer_overrides": {
-        "model_type": "bpe",
-        "input_sentence_size": 1000000,
-        "shuffle_input_sentence": true,
-        "remove_extra_whitespaces": true,
-        "character_coverage": 0.9995,
-        "max_sentence_length": 16384
-      }
+      "vocab_size": 1536
     }
   ]
 }

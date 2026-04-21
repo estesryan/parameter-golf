@@ -1,17 +1,9 @@
 {
   "tokenizers": [
     {
-      "name": "sp_bpe_2048_2m",
-      "dataset_suffix": "sp2048_2m",
-      "vocab_size": 2048,
-      "trainer_overrides": {
-        "model_type": "bpe",
-        "input_sentence_size": 1000000,
-        "shuffle_input_sentence": true,
-        "remove_extra_whitespaces": true,
-        "character_coverage": 0.9995,
-        "max_sentence_length": 16384
-      }
+      "name": "sp_bpe_2048",
+      "dataset_suffix": "sp2048",
+      "vocab_size": 2048
     }
   ]
 }
