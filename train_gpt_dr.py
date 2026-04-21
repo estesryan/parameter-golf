@@ -69,13 +69,13 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 4))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 576))
+    num_layers = int(os.environ.get("NUM_LAYERS", 5))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
-    max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 3))
-    recur_num_layers = int(os.environ.get("RECUR_NUM_LAYERS", 1))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.75))
+    max_recur_loops = int(os.environ.get("MAX_RECUR_LOOPS", 2))
+    recur_num_layers = int(os.environ.get("RECUR_NUM_LAYERS", 2))
     recur_mlp_mult = float(os.environ.get("RECUR_MLP_MULT", 1.0))
     recur_aux_loss_weight = float(os.environ.get("RECUR_AUX_LOSS_WEIGHT", 0.6))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
@@ -740,7 +740,7 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=True)
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
