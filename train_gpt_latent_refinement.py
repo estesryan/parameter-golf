@@ -1,16 +1,31 @@
 """
-Minimal LLaMA-style transformer training script for small-scale language modeling.
+Causal GPT training script with latent iterative refinement.
 
-This implementation uses a pre-norm decoder-only architecture with RMSNorm, RoPE
-positional embeddings, grouped-query attention (GQA), and SwiGLU feedforward
-layers. The model is intentionally simple and efficient, avoiding recurrence,
-skip connections, and other experimental modifications in favor of a standard,
-well-behaved transformer stack. Training is fully causal with standard
-cross-entropy loss, uses tied token embeddings, and is optimized for GPU
-execution via PyTorch 2.x compile and Flash Attention (scaled dot-product
-attention). The script includes a Muon-based optimizer setup, streaming token
-loader, tokenizer-agnostic validation (bits-per-byte), and post-training int8
-quantization with zlib compression for compact model export.
+Baseline formulation:
+    tokens → transformer → logits → cross-entropy
+
+This implementation extends the baseline with an internal refinement phase:
+    tokens → transformer → hidden states → refinement steps → logits → cross-entropy
+
+After the causal transformer processes the input sequence, it produces one hidden
+state per token position. Instead of immediately projecting these hidden states
+to logits, the model applies a small number of additional refinement steps.
+
+Each refinement step consists of lightweight, positionwise transformations that:
+    - operate independently on each token position
+    - introduce no cross-token communication
+    - preserve strict causal semantics (no future-token leakage)
+    - remain compatible with flash attention and torch.compile
+
+The refined hidden states are then projected to logits, and training proceeds
+using standard next-token cross-entropy without modification.
+
+Conceptually, this introduces a form of:
+    "latent iterative reasoning inside a standard causal LM"
+
+The model performs multiple internal "thinking" passes over its representations
+before emitting predictions, increasing effective compute depth without adding
+additional attention passes or altering the training objective.
 """
 
 from __future__ import annotations
@@ -39,6 +54,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
+# Default Simple Baseline run:
+# - 9 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# - vocab size 1024, sequence length 1024, tied embeddings
+# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -59,18 +79,36 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 256))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.0))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 4))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Refinement hyperparameters.
+    # Safe escalation order: REFINEMENT_STEPS=2 → REFINEMENT_HIDDEN_MULT=2
+    #   → REFINEMENT_AUX_LOSS_WEIGHT=0.05 → REFINEMENT_USE_LOGIT_FEEDBACK=1.
+    # Larger REFINEMENT_STEPS/REFINEMENT_HIDDEN_MULT increase parameter count and FLOPS.
+    # REFINEMENT_AUX_LOSS_WEIGHT > 0 increases effective gradient scale; keep ≤ 0.1.
+    # REFINEMENT_USE_LOGIT_FEEDBACK adds compute and a second gradient path through embeddings.
+    # "refinement_scale" must remain in CONTROL_TENSOR_NAME_PATTERNS so the per-channel
+    # scale stays fp32 and is handled correctly by the passthrough quantization path.
+    # (Omitting it does not route it to Muon — it is 1D so it falls into scalar Adam —
+    # but it would lose fp32 passthrough treatment in the int8 export.)
+    refinement_steps = int(os.environ.get("REFINEMENT_STEPS", 1))
+    refinement_hidden_mult = int(os.environ.get("REFINEMENT_HIDDEN_MULT", 1))
+    refinement_aux_loss_weight = float(os.environ.get("REFINEMENT_AUX_LOSS_WEIGHT", 0.0))
+    refinement_use_logit_feedback = bool(int(os.environ.get("REFINEMENT_USE_LOGIT_FEEDBACK", 0)))
+    refinement_feedback_scale = float(os.environ.get("REFINEMENT_FEEDBACK_SCALE", 0.05))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -287,7 +325,16 @@ def eval_val(
 # Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
 # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
-CONTROL_TENSOR_NAME_PATTERNS: tuple[str, ...] = ()
+# If overriding CONTROL_TENSOR_NAME_PATTERNS via env var, preserve "refinement_scale"
+# so the per-channel refinement scale stays fp32 and passes through the int8 export correctly.
+CONTROL_TENSOR_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "CONTROL_TENSOR_NAME_PATTERNS",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,refinement_scale",
+    ).split(",")
+    if pattern
+)
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -554,6 +601,7 @@ class CausalSelfAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         rope_base: float,
+        qk_gain_init: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -571,6 +619,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -583,6 +632,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -596,16 +646,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    # relu^2 MLP from the original modded-nanogpt setup
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = int(dim * 2.7)
-        self.w1 = CastedLinear(dim, hidden, bias=False)
-        self.w2 = CastedLinear(dim, hidden, bias=False)
-        self.w3 = CastedLinear(hidden, dim, bias=False)
-        self.w3._zero_init = True
+        hidden = mlp_mult * dim
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
 
 
 class Block(nn.Module):
@@ -614,18 +665,43 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
+        mlp_mult: int,
         rope_base: float,
+        qk_gain_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base)
-        self.mlp = MLP(dim)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.mlp(self.mlp_norm(x))
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
+
+
+class RefinementBlock(nn.Module):
+    # Positionwise residual MLP applied after the transformer stack.
+    # No attention, no sequence mixing — causality is preserved automatically.
+    # Mirrors the existing MLP style: RMSNorm → expand → relu² → project → scaled residual.
+    def __init__(self, dim: int, hidden: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
+        self.refinement_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, h: Tensor) -> Tensor:
+        x = torch.relu(self.fc(self.norm(h)))
+        return h + self.refinement_scale.to(dtype=h.dtype)[None, None, :] * self.proj(x.square())
 
 
 class GPT(nn.Module):
@@ -636,42 +712,111 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
+        mlp_mult: int,
+        tie_embeddings: bool,
         tied_embed_init_std: float,
+        logit_softcap: float,
         rope_base: float,
+        qk_gain_init: float,
+        refinement_steps: int,
+        refinement_hidden_mult: int,
+        refinement_aux_loss_weight: float,
+        refinement_use_logit_feedback: bool,
+        refinement_feedback_scale: float,
     ):
         super().__init__()
+        if logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
+        self.logit_softcap = logit_softcap
+        self.refinement_aux_loss_weight = refinement_aux_loss_weight
+        self.refinement_use_logit_feedback = refinement_use_logit_feedback
+        self.refinement_feedback_scale = refinement_feedback_scale
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
                     model_dim,
                     num_heads,
                     num_kv_heads,
+                    mlp_mult,
                     rope_base,
+                    qk_gain_init,
                 )
                 for i in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        refinement_hidden = refinement_hidden_mult * model_dim
+        self.refinement = nn.ModuleList(
+            [RefinementBlock(model_dim, refinement_hidden) for _ in range(refinement_steps)]
+        )
+        if self.lm_head is not None:
+            self.lm_head._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
-        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.tie_embeddings:
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def compute_logits(self, hidden_flat: Tensor) -> Tensor:
+        if self.tie_embeddings:
+            logits_proj = F.linear(hidden_flat, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(hidden_flat)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
 
-        for block in self.blocks:
-            x = block(x)
+        # First half stores skips; second half reuses them in reverse order.
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        h = self.final_norm(x)  # [B, S, D] — kept 3D for refinement
         targets = target_ids.reshape(-1)
-        logits = F.linear(x, self.tok_emb.weight)
+
+        if self.refinement_aux_loss_weight > 0.0:
+            aux_loss = h.new_zeros(())
+            for block in self.refinement:
+                h = block(h)
+                if self.refinement_use_logit_feedback:
+                    _tmp = self.compute_logits(h.reshape(-1, h.size(-1)))
+                    _fb = (_tmp.softmax(dim=-1).to(dtype=h.dtype)) @ self.tok_emb.weight.to(dtype=h.dtype)
+                    h = h + self.refinement_feedback_scale * _fb.reshape_as(h)
+                _tmp = self.compute_logits(h.reshape(-1, h.size(-1)))
+                aux_loss = aux_loss + F.cross_entropy(_tmp.float(), targets, reduction="mean")
+            logits = self.compute_logits(h.reshape(-1, h.size(-1)))
+            main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+            return main_loss + self.refinement_aux_loss_weight * aux_loss
+
+        for block in self.refinement:
+            h = block(h)
+            if self.refinement_use_logit_feedback:
+                _tmp = self.compute_logits(h.reshape(-1, h.size(-1)))
+                _fb = (_tmp.softmax(dim=-1).to(dtype=h.dtype)) @ self.tok_emb.weight.to(dtype=h.dtype)
+                h = h + self.refinement_feedback_scale * _fb.reshape_as(h)
+
+        logits = self.compute_logits(h.reshape(-1, h.size(-1)))
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -780,8 +925,17 @@ def main() -> None:
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
+        mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init,
+        refinement_steps=args.refinement_steps,
+        refinement_hidden_mult=args.refinement_hidden_mult,
+        refinement_aux_loss_weight=args.refinement_aux_loss_weight,
+        refinement_use_logit_feedback=args.refinement_use_logit_feedback,
+        refinement_feedback_scale=args.refinement_feedback_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -792,9 +946,10 @@ def main() -> None:
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
+    # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.blocks.named_parameters()) + list(base_model.refinement.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -805,6 +960,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -827,6 +984,14 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.lm_head is not None:
+        optimizer_head = torch.optim.Adam(
+            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -835,6 +1000,7 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
@@ -843,6 +1009,12 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        f"refinement_steps:{args.refinement_steps} refinement_hidden_mult:{args.refinement_hidden_mult} "
+        f"refinement_aux_loss_weight:{args.refinement_aux_loss_weight} "
+        f"refinement_use_logit_feedback:{args.refinement_use_logit_feedback} "
+        f"refinement_feedback_scale:{args.refinement_feedback_scale}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
