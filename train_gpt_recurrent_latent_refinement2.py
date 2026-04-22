@@ -708,7 +708,7 @@ class RefinementBlock(nn.Module):
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
-        self.refinement_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.refinement_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, h: Tensor) -> Tensor:
         x = torch.relu(self.fc(self.norm(h)))
