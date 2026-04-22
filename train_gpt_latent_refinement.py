@@ -1,5 +1,5 @@
 """
-Causal GPT training script with latent iterative refinement.
+Causal GPT training script with latent iterative refinement (Experimental)
 
 Baseline formulation:
     tokens → transformer → logits → cross-entropy
