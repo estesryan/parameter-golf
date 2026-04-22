@@ -13,7 +13,7 @@
         "normalization_rule_name": "nmt_nfkc",
         "add_dummy_prefix": false,
         "hard_vocab_limit": false,
-        "max_sentence_length": 32768,
+        "max_sentence_length": 8192,
         "train_extremely_large_corpus": true
       }
     }
