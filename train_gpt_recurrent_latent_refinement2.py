@@ -773,7 +773,7 @@ class GPT(nn.Module):
         # Learned step embeddings let each recurrent iteration specialize while sharing weights.
         # Initialized with small random values so each refinement step can specialize early while keeping updates near-identity at initialization.
         self.refinement_step_emb = nn.Parameter(torch.empty(refinement_steps, model_dim))
-        nn.init.normal_(self.refinement_step_emb, mean=0.0, std=0.02)
+        nn.init.zeros_(self.refinement_step_emb)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
