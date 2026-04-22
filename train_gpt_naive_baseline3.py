@@ -64,6 +64,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    refinement_steps = int(os.environ.get("REFINEMENT_STEPS", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -83,22 +84,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.01))
-    sigreg_num_proj = int(os.environ.get("SIGREG_NUM_PROJ", 32))
-    latent_pred_weight = float(os.environ.get("LATENT_PRED_WEIGHT", 0.1))
-
-def sigreg_loss(h: Tensor, num_proj: int) -> Tensor:
-    h_flat = h.reshape(-1, h.size(-1)).float()
-    v = torch.randn(h_flat.size(1), num_proj, device=h.device, dtype=torch.float32)
-    v = F.normalize(v, dim=0)
-    p = h_flat @ v
-    mean_penalty = (p.mean(dim=0).square()).mean()
-    var_penalty = (p.var(dim=0, unbiased=False).sub(1.0).square()).mean()
-    return mean_penalty + var_penalty
-
 
 # -----------------------------
-# MUON OPTIMIZER
+# MUON OPTIMIZER 
 # -----------------------------
 # 
 # As borrowed from modded-nanogpt
@@ -267,8 +255,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss, _ = model(x, y)
-                batch_loss = batch_loss.detach()
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -657,6 +644,18 @@ class Block(nn.Module):
         return x
 
 
+class RefinementBlock(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.mlp = MLP(dim, mlp_mult)
+        self.scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # near-identity residual
+        return x + self.scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.norm(x))
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -671,6 +670,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        refinement_steps: int = 2,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -696,11 +696,12 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        self.refinement = RefinementBlock(model_dim, mlp_mult)
+        self.refinement_steps = refinement_steps
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        self.latent_predictor = CastedLinear(model_dim, model_dim, bias=False)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -710,7 +711,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward_hidden(self, input_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -725,22 +726,20 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        return self.final_norm(x)  # [B, S, D]
+        # refinement loop (shared weights)
+        for _ in range(self.refinement_steps):
+            x = self.refinement(x)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor]:
-        h = self.forward_hidden(input_ids)
-        x = h.reshape(-1, h.size(-1))
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-
-        return ce_loss, h
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -854,6 +853,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        refinement_steps=args.refinement_steps,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -865,18 +865,18 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - matrix params in transformer blocks + refinement block use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    refinement_named_params = list(base_model.refinement.named_parameters())
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in block_named_params + refinement_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    matrix_params.append(base_model.latent_predictor.weight)
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in block_named_params + refinement_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
@@ -928,8 +928,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(f"sigreg_weight:{args.sigreg_weight} sigreg_num_proj:{args.sigreg_num_proj}")
-    log0(f"latent_pred_weight:{args.latent_pred_weight}")
+    log0(f"refinement_steps:{args.refinement_steps}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -967,8 +966,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_ce_loss, _ = model(x, y)
-                    warmup_loss = warmup_ce_loss
+                    warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1036,20 +1034,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                ce_loss, hidden_states = model(x, y)
-                reg_loss = sigreg_loss(hidden_states, args.sigreg_num_proj)
-                h = hidden_states  # [B, S, D]
-                z_t = h[:, :-1, :]
-                z_tp1 = h[:, 1:, :]
-                z_t_flat = z_t.reshape(-1, z_t.size(-1))
-                z_tp1_flat = z_tp1.reshape(-1, z_tp1.size(-1))
-                z_pred = model.latent_predictor(z_t_flat)
-                latent_loss = F.mse_loss(z_pred, z_tp1_flat, reduction="mean")
-                loss = (
-                    ce_loss
-                    + args.latent_pred_weight * latent_loss
-                    + args.sigreg_weight * reg_loss
-                )
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
