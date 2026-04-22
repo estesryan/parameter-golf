@@ -1,5 +1,6 @@
 """
-Naive baseline GPT training script.
+Naive baseline GPT training script. Uses a tiny top-1 MoE relu^2 feed-forward layer
+in place of the dense MLP in each transformer block.
 """
 
 from __future__ import annotations
@@ -64,6 +65,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", 2))
+    moe_top_k = int(os.environ.get("MOE_TOP_K", 1))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -601,11 +604,10 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
-class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+class ExpertMLP(nn.Module):
+    # Single relu^2 expert used inside the top-1 MoE feed-forward layer.
+    def __init__(self, dim: int, hidden: int):
         super().__init__()
-        hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -613,6 +615,36 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
+
+
+class MLP(nn.Module):
+    # Tiny top-1 MoE relu^2 FFN. Routing is top-1 via argmax.
+    # Implementation uses dense evaluation + one-hot selection for compile compatibility.
+    def __init__(self, dim: int, mlp_mult: int, num_experts: int, top_k: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        hidden = mlp_mult * dim
+        self.router = CastedLinear(dim, num_experts, bias=False)
+        self.experts = nn.ModuleList([ExpertMLP(dim, hidden) for _ in range(num_experts)])
+
+    # NOTE:
+    # Uses dense expert evaluation with one-hot top-1 selection for compile compatibility.
+    # Preserves top-1 routing semantics but does not provide sparse compute savings.
+    def forward(self, x: Tensor) -> Tensor:
+        B, S, D = x.shape
+        flat = x.reshape(-1, D)  # [N, D]
+
+        router_logits = self.router(flat)  # [N, E]
+        expert_idx = torch.argmax(router_logits, dim=-1)  # [N]
+
+        gates = F.one_hot(expert_idx, num_classes=self.num_experts).to(dtype=flat.dtype)  # [N, E]
+
+        # dense evaluation for compile safety
+        expert_outs = torch.stack([expert(flat) for expert in self.experts], dim=1)  # [N, E, D]
+
+        out = (expert_outs * gates.unsqueeze(-1)).sum(dim=1)  # [N, D]
+        return out.reshape(B, S, D)
 
 
 class Block(nn.Module):
@@ -624,12 +656,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        moe_num_experts: int,
+        moe_top_k: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, moe_num_experts, moe_top_k)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -657,6 +691,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        moe_num_experts: int,
+        moe_top_k: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -678,6 +714,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    moe_num_experts=moe_num_experts,
+                    moe_top_k=moe_top_k,
                 )
                 for i in range(num_layers)
             ]
@@ -821,6 +859,11 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    if args.moe_top_k != 1:
+        raise ValueError("This tiny MoE patch supports only MOE_TOP_K=1")
+    if args.moe_num_experts < 2:
+        raise ValueError("MOE_NUM_EXPERTS must be at least 2")
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -833,6 +876,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -906,6 +951,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"moe_num_experts:{args.moe_num_experts} moe_top_k:{args.moe_top_k}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
