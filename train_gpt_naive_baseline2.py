@@ -1,44 +1,5 @@
 """
-Causal GPT training script with recurrent latent refinement (v3).
-
-Baseline formulation:
-    tokens → transformer → logits → cross-entropy
-
-This implementation extends the baseline with a recurrent refinement phase:
-    tokens → transformer → hidden states → [shared refinement block × N steps] → logits → cross-entropy
-
-After the causal transformer processes the input sequence, it produces one hidden
-state per token position. Instead of immediately projecting these hidden states
-to logits, the model applies a shared refinement block recurrently for N steps.
-
-The shared recurrent design means:
-    - parameter count does not scale with refinement_steps
-    - compute scales with refinement_steps (recurrent depth without added parameters)
-    - each step is conditioned on a learned step embedding so steps can specialize
-      while still sharing the same operator weights
-
-Each refinement step:
-    - adds a learned step embedding to the hidden state (positionwise)
-    - applies the shared RefinementBlock (positionwise residual MLP)
-    - optionally adds bounded logit feedback (positionwise)
-    - optionally accumulates a latent transition prediction auxiliary loss
-      (MSE: predicted next refinement state vs actual next refinement state)
-
-All refinement operations are strictly positionwise — no cross-token communication,
-no future-token access, full causal safety preserved.
-
-Default configuration (stable defaults):
-    REFINEMENT_STEPS=2, REFINEMENT_HIDDEN_MULT=1
-    REFINEMENT_AUX_LOSS_WEIGHT=0.02 (maximum aux weight; effective contribution is self-paced via EMA-gated scaling during training)
-    REFINEMENT_USE_LOGIT_FEEDBACK=0 (off by default for stability)
-    REFINEMENT_FEEDBACK_SCALE=0.005 (kept small for when feedback is enabled)
-
-Logit feedback is disabled by default. Refinement must learn a stable representation
-before feedback is introduced. Enable via REFINEMENT_USE_LOGIT_FEEDBACK=1 only after
-the refinement dynamics are stable.
-
-Final objective: standard next-token cross-entropy, unchanged.
-
+Naive baseline GPT training script.
 """
 
 from __future__ import annotations
@@ -67,6 +28,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
+# Default Simple Baseline run:
+# - 9 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# - vocab size 1024, sequence length 1024, tied embeddings
+# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -101,24 +68,6 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Recurrent refinement hyperparameters (stable defaults — refinement must learn before it is trusted).
-    # Shared block applied recurrently: parameters constant, compute scales with steps.
-    # Step embeddings allow per-step specialization while sharing operator weights.
-    # Aux loss sets the maximum weight (0.02); actual contribution is self-paced
-    # via EMA-gated scaling in the training loop to avoid early optimization interference.
-    # Logit feedback is off by default — early-training noise makes it destabilizing.
-    # Enable feedback via REFINEMENT_USE_LOGIT_FEEDBACK=1 only after refinement dynamics
-    # are stable and the CE-only path is competitive.
-    # "refinement_scale" must remain in CONTROL_TENSOR_NAME_PATTERNS so the per-channel
-    # scale stays fp32 and passes through the int8 export correctly.
-    # (Omitting it does not route it to Muon — it is 1D so it falls into scalar Adam —
-    # but it would lose fp32 passthrough treatment in the int8 export.)
-    refinement_steps = int(os.environ.get("REFINEMENT_STEPS", 2))
-    refinement_hidden_mult = int(os.environ.get("REFINEMENT_HIDDEN_MULT", 1))
-    refinement_aux_loss_weight = float(os.environ.get("REFINEMENT_AUX_LOSS_WEIGHT", 0.02))
-    refinement_use_logit_feedback = bool(int(os.environ.get("REFINEMENT_USE_LOGIT_FEEDBACK", 0)))
-    refinement_feedback_scale = float(os.environ.get("REFINEMENT_FEEDBACK_SCALE", 0.005))
-
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -134,11 +83,23 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.01))
+    sigreg_num_proj = int(os.environ.get("SIGREG_NUM_PROJ", 32))
+
+def sigreg_loss(h: Tensor, num_proj: int) -> Tensor:
+    h_flat = h.reshape(-1, h.size(-1)).float()
+    v = torch.randn(h_flat.size(1), num_proj, device=h.device, dtype=torch.float32)
+    v = F.normalize(v, dim=0)
+    p = h_flat @ v
+    mean_penalty = (p.mean(dim=0).square()).mean()
+    var_penalty = (p.var(dim=0, unbiased=False).sub(1.0).square()).mean()
+    return mean_penalty + var_penalty
+
 
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
-#
+# 
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
@@ -218,7 +179,7 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP
+# TOKENIZER-AGNOSTIC EVALUATION SETUP 
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -305,8 +266,8 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_main_loss, _ = model(x, y)
-                batch_loss = batch_main_loss.detach()
+                batch_loss, _ = model(x, y)
+                batch_loss = batch_loss.detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -335,13 +296,11 @@ def eval_val(
 # Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
 # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
-# If overriding CONTROL_TENSOR_NAME_PATTERNS via env var, preserve "refinement_scale"
-# so the per-channel refinement scale stays fp32 and passes through the int8 export correctly.
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,refinement_scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -475,7 +434,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING
+# DATA LOADING 
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -697,24 +656,6 @@ class Block(nn.Module):
         return x
 
 
-class RefinementBlock(nn.Module):
-    # Shared positionwise residual MLP applied recurrently after the transformer stack.
-    # No attention, no sequence mixing — causality is preserved automatically.
-    # Mirrors the existing MLP style: RMSNorm → expand → relu² → project → scaled residual.
-    # Zero-init projection ensures identity at init; refinement_scale gates the contribution.
-    def __init__(self, dim: int, hidden: int):
-        super().__init__()
-        self.norm = RMSNorm()
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
-        self.refinement_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-
-    def forward(self, h: Tensor) -> Tensor:
-        x = torch.relu(self.fc(self.norm(h)))
-        return h + self.refinement_scale.to(dtype=h.dtype)[None, None, :] * self.proj(x.square())
-
-
 class GPT(nn.Module):
     def __init__(
         self,
@@ -729,24 +670,13 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        refinement_steps: int,
-        refinement_hidden_mult: int,
-        refinement_aux_loss_weight: float,
-        refinement_use_logit_feedback: bool,
-        refinement_feedback_scale: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if refinement_steps < 1:
-            raise ValueError(f"refinement_steps must be >= 1, got {refinement_steps}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.refinement_steps = refinement_steps
-        self.refinement_aux_loss_weight = refinement_aux_loss_weight
-        self.refinement_use_logit_feedback = refinement_use_logit_feedback
-        self.refinement_feedback_scale = refinement_feedback_scale
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -767,13 +697,6 @@ class GPT(nn.Module):
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        # Single shared block applied recurrently — parameter count is constant w.r.t. steps.
-        refinement_hidden = refinement_hidden_mult * model_dim
-        self.refinement_block = RefinementBlock(model_dim, refinement_hidden)
-        # Learned step embeddings let each recurrent iteration specialize while sharing weights.
-        # Zero-initialized so refinement starts from the baseline path and per-step specialization is learned only when useful.
-        self.refinement_step_emb = nn.Parameter(torch.empty(refinement_steps, model_dim))
-        nn.init.zeros_(self.refinement_step_emb)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
@@ -785,16 +708,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def compute_logits(self, hidden_flat: Tensor) -> Tensor:
-        if self.tie_embeddings:
-            logits_proj = F.linear(hidden_flat, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(hidden_flat)
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor | None]:
+    def forward_hidden(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -809,46 +723,22 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        h = self.final_norm(x)  # [B, S, D] — kept 3D for refinement
+        return self.final_norm(x)  # [B, S, D]
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor]:
+        h = self.forward_hidden(input_ids)
+        x = h.reshape(-1, h.size(-1))
         targets = target_ids.reshape(-1)
 
-        use_aux = self.refinement_aux_loss_weight > 0.0
-        aux_loss = h.new_zeros(()) if use_aux else None
-        h_prev = None
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
 
-        # Recurrent latent refinement: shared block applied for refinement_steps iterations.
-        # Each step adds a learned step embedding before the shared operator so steps can
-        # specialize while sharing weights. All operations are strictly positionwise —
-        # no cross-token interaction, no future-token access, causality fully preserved.
-        # auxiliary loss trains the refinement operator as a latent transition model (predicting
-        # the next-step hidden state); final CE supervises token prediction.
-        for t in range(self.refinement_steps):
-            h_step = h + self.refinement_step_emb[t][None, None, :].to(dtype=h.dtype)
-            h = self.refinement_block(h_step)
-            if self.refinement_use_logit_feedback:
-                # Off by default — logit feedback adds early-training noise before refinement converges.
-                # Bounded: tanh clamps the update to [-1, 1] before scaling to prevent state drift.
-                _tmp = self.compute_logits(h.reshape(-1, h.size(-1)))
-                _fb = (_tmp.softmax(dim=-1).to(dtype=h.dtype)) @ self.tok_emb.weight.to(dtype=h.dtype)
-                h = h + self.refinement_feedback_scale * torch.tanh(_fb.reshape_as(h))
-            if use_aux and h_prev is not None:
-                # predict next latent state from previous state
-                pred_next = self.refinement_block(
-                    h_prev + self.refinement_step_emb[t][None, None, :].to(dtype=h_prev.dtype)
-                )
-                step_mse = F.mse_loss(pred_next, h.detach(), reduction="mean")
-                aux_loss = aux_loss + step_mse
-            h_prev = h.clone()
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
-        # Final objective: standard next-token cross-entropy, unchanged.
-        # EMA-gated aux weighting is maintained in the training loop, not inside the compiled model forward pass.
-        logits = self.compute_logits(h.reshape(-1, h.size(-1)))
-        main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        aux_transition_loss = None
-        if use_aux and aux_loss is not None:
-            norm = max(self.refinement_steps - 1, 1)
-            aux_transition_loss = aux_loss / norm
-        return main_loss, aux_transition_loss
+        return ce_loss, h
 
 
 # -----------------------------
@@ -962,11 +852,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        refinement_steps=args.refinement_steps,
-        refinement_hidden_mult=args.refinement_hidden_mult,
-        refinement_aux_loss_weight=args.refinement_aux_loss_weight,
-        refinement_use_logit_feedback=args.refinement_use_logit_feedback,
-        refinement_feedback_scale=args.refinement_feedback_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -976,15 +861,11 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR / TIED_EMBED_LR
+    # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - 2D matrix params in transformer blocks and the shared refinement block use MATRIX_LR via Muon
-    # - vectors/scalars/control tensors use SCALAR_LR via Adam
-    # - refinement_step_emb goes to scalar Adam (small embedding table, not a weight matrix)
-    block_named_params = (
-        list(base_model.blocks.named_parameters())
-        + list(base_model.refinement_block.named_parameters())
-    )
+    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - vectors/scalars use SCALAR_LR via Adam
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -997,8 +878,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    # Step embeddings are a small [refinement_steps, model_dim] conditioning table — Adam, not Muon.
-    scalar_params.append(base_model.refinement_step_emb)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1046,14 +925,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        f"recurrent_refinement_steps:{args.refinement_steps} refinement_hidden_mult:{args.refinement_hidden_mult} "
-        f"refinement_aux_loss_weight:{args.refinement_aux_loss_weight} "
-        f"refinement_use_logit_feedback:{args.refinement_use_logit_feedback} "
-        f"refinement_feedback_scale:{args.refinement_feedback_scale} "
-        f"step_conditioning:on "
-        f"logit_feedback:{'on' if args.refinement_use_logit_feedback else 'off (default for stability)'}"
-    )
+    log0(f"sigreg_weight:{args.sigreg_weight} sigreg_num_proj:{args.sigreg_num_proj}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1091,8 +963,8 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_main_loss, _ = model(x, y)
-                    warmup_loss = warmup_main_loss
+                    warmup_ce_loss, _ = model(x, y)
+                    warmup_loss = warmup_ce_loss
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1110,11 +982,6 @@ def main() -> None:
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
-
-    # EMA state for self-paced aux loss scaling (Python-side, not inside the compiled model).
-    refinement_aux_ema: Tensor | None = None
-    refinement_aux_ema_decay = 0.95
-    refinement_aux_tau = 0.02
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1165,22 +1032,9 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                main_loss, aux_transition_loss = model(x, y)
-            loss = main_loss
-            # Self-paced aux: transition loss is ramped in based on EMA of prediction error.
-            # Early training relies on CE only; aux activates when latent transitions become predictable.
-            if aux_transition_loss is not None:
-                mse_val = aux_transition_loss.detach()
-                if refinement_aux_ema is None:
-                    refinement_aux_ema = mse_val
-                else:
-                    refinement_aux_ema = (
-                        refinement_aux_ema_decay * refinement_aux_ema
-                        + (1.0 - refinement_aux_ema_decay) * mse_val
-                    )
-                aux_scale = (refinement_aux_tau - refinement_aux_ema) / refinement_aux_tau
-                aux_scale = torch.clamp(aux_scale, 0.0, 1.0)
-                loss = main_loss + aux_scale * args.refinement_aux_loss_weight * aux_transition_loss
+                ce_loss, hidden_states = model(x, y)
+                reg_loss = sigreg_loss(hidden_states, args.sigreg_num_proj)
+                loss = ce_loss + args.sigreg_weight * reg_loss
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
