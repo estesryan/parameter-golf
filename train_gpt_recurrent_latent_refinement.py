@@ -21,7 +21,7 @@ Each refinement step:
     - adds a learned step embedding to the hidden state (positionwise)
     - applies the shared RefinementBlock (positionwise residual MLP)
     - optionally adds bounded logit feedback (positionwise)
-    - optionally accumulates an intermediate CE auxiliary loss
+    - optionally accumulates a latent consistency auxiliary loss (MSE between successive states)
 
 All refinement operations are strictly positionwise — no cross-token communication,
 no future-token access, full causal safety preserved.
@@ -809,12 +809,14 @@ class GPT(nn.Module):
 
         use_aux = self.refinement_aux_loss_weight > 0.0
         aux_loss = h.new_zeros(()) if use_aux else None
+        h_prev = None
 
         # Recurrent latent refinement: shared block applied for refinement_steps iterations.
         # Each step adds a learned step embedding before the shared operator so steps can
         # specialize while sharing weights. All operations are strictly positionwise —
         # no cross-token interaction, no future-token access, causality fully preserved.
-        # Refinement must learn a stable representation before aux pressure or feedback is useful.
+        # Final CE supervises prediction; auxiliary loss encourages smooth latent evolution
+        # across refinement steps. Intermediate steps are not directly forced to be predictive.
         for t in range(self.refinement_steps):
             h_step = h + self.refinement_step_emb[t][None, None, :].to(dtype=h.dtype)
             h = self.refinement_block(h_step)
@@ -824,16 +826,16 @@ class GPT(nn.Module):
                 _tmp = self.compute_logits(h.reshape(-1, h.size(-1)))
                 _fb = (_tmp.softmax(dim=-1).to(dtype=h.dtype)) @ self.tok_emb.weight.to(dtype=h.dtype)
                 h = h + self.refinement_feedback_scale * torch.tanh(_fb.reshape_as(h))
-            if use_aux:
-                _tmp = self.compute_logits(h.reshape(-1, h.size(-1)))
-                aux_loss = aux_loss + F.cross_entropy(_tmp.float(), targets, reduction="mean")
+            if use_aux and h_prev is not None:
+                aux_loss = aux_loss + F.mse_loss(h, h_prev.detach(), reduction="mean")
+            h_prev = h.clone()
 
         # Final objective: standard next-token cross-entropy, unchanged.
         logits = self.compute_logits(h.reshape(-1, h.size(-1)))
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         if use_aux and aux_loss is not None:
-            # Aux loss averaged across steps so REFINEMENT_AUX_LOSS_WEIGHT is step-count-invariant.
-            return main_loss + self.refinement_aux_loss_weight * (aux_loss / self.refinement_steps)
+            norm = max(self.refinement_steps - 1, 1)
+            return main_loss + self.refinement_aux_loss_weight * (aux_loss / norm)
         return main_loss
 
 
