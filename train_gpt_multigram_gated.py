@@ -1,5 +1,5 @@
 """
-Multilag bigram + shared-basis trigram residual transformer.
+Multilag bigram + shared-basis trigram residual transformer (Experimental).
 
 Motivated by the null result in train_gpt_markov.py — where a convolutional
 front-end failed to improve over the baseline despite strong short-range MI
