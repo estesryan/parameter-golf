@@ -4,28 +4,16 @@ Causal GPT training script with latent iterative refinement.
 Baseline formulation:
     tokens → transformer → logits → cross-entropy
 
-This implementation extends the baseline with an internal refinement phase:
-    tokens → transformer → hidden states → refinement steps → logits → cross-entropy
+This implementation extends the baseline with a shared latent refinement phase:
+    tokens → transformer → refinement (×N) → final norm → logits → cross-entropy
 
-After the causal transformer processes the input sequence, it produces one hidden
-state per token position. Instead of immediately projecting these hidden states
-to logits, the model applies a small number of additional refinement steps.
+After the causal transformer stack, a single shared RefinementBlock is applied
+recurrently N times (controlled by REFINEMENT_STEPS). Refinement happens before
+final layer normalization and the logit projection.
 
-Each refinement step consists of lightweight, positionwise transformations that:
-    - operate independently on each token position
-    - introduce no cross-token communication
-    - preserve strict causal semantics (no future-token leakage)
-    - remain compatible with flash attention and torch.compile
-
-The refined hidden states are then projected to logits, and training proceeds
-using standard next-token cross-entropy without modification.
-
-Conceptually, this introduces a form of:
-    "latent iterative reasoning inside a standard causal LM"
-
-The model performs multiple internal "thinking" passes over its representations
-before emitting predictions, increasing effective compute depth without adding
-additional attention passes or altering the training objective.
+The refinement block is positionwise — no cross-token communication, strict
+causal safety preserved. REFINEMENT_STEPS increases compute depth; parameters
+scale only with REFINEMENT_HIDDEN_MULT (block width), not step count.
 """
 
 from __future__ import annotations
@@ -97,7 +85,8 @@ class Hyperparameters:
     # Refinement hyperparameters.
     # Safe escalation order: REFINEMENT_STEPS=2 → REFINEMENT_HIDDEN_MULT=2
     #   → REFINEMENT_AUX_LOSS_WEIGHT=0.05 → REFINEMENT_USE_LOGIT_FEEDBACK=1.
-    # Larger REFINEMENT_STEPS/REFINEMENT_HIDDEN_MULT increase parameter count and FLOPS.
+    # REFINEMENT_STEPS increases compute depth only — block is shared, so params do not scale.
+    # REFINEMENT_HIDDEN_MULT increases the shared block's width (and parameter count).
     # REFINEMENT_AUX_LOSS_WEIGHT > 0 increases effective gradient scale; keep ≤ 0.1.
     # REFINEMENT_USE_LOGIT_FEEDBACK adds compute and a second gradient path through embeddings.
     # "refinement_scale" must remain in CONTROL_TENSOR_NAME_PATTERNS so the per-channel
@@ -688,8 +677,8 @@ class Block(nn.Module):
 
 
 class RefinementBlock(nn.Module):
-    # Positionwise residual MLP applied after the transformer stack.
-    # No attention, no sequence mixing — causality is preserved automatically.
+    # Shared positionwise residual MLP applied recurrently after the transformer stack and
+    # before final normalization. No attention, no sequence mixing — causal safety preserved.
     # Mirrors the existing MLP style: RMSNorm → expand → relu² → project → scaled residual.
     def __init__(self, dim: int, hidden: int):
         super().__init__()
@@ -754,9 +743,8 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         refinement_hidden = refinement_hidden_mult * model_dim
-        self.refinement = nn.ModuleList(
-            [RefinementBlock(model_dim, refinement_hidden) for _ in range(refinement_steps)]
-        )
+        self.refinement = RefinementBlock(model_dim, refinement_hidden)
+        self.refinement_steps = refinement_steps
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
@@ -792,30 +780,35 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        h = self.final_norm(x)  # [B, S, D] — kept 3D for refinement
         targets = target_ids.reshape(-1)
 
+        # Refinement runs on unnormalized x; final_norm is applied after all steps.
         if self.refinement_aux_loss_weight > 0.0:
-            aux_loss = h.new_zeros(())
-            for block in self.refinement:
-                h = block(h)
+            aux_loss = x.new_zeros(())
+            for _ in range(self.refinement_steps):
+                x = self.refinement(x)
                 if self.refinement_use_logit_feedback:
-                    _tmp = self.compute_logits(h.reshape(-1, h.size(-1)))
-                    _fb = (_tmp.softmax(dim=-1).to(dtype=h.dtype)) @ self.tok_emb.weight.to(dtype=h.dtype)
-                    h = h + self.refinement_feedback_scale * _fb.reshape_as(h)
-                _tmp = self.compute_logits(h.reshape(-1, h.size(-1)))
+                    _h = self.final_norm(x)
+                    _tmp = self.compute_logits(_h.reshape(-1, _h.size(-1)))
+                    _fb = (_tmp.softmax(dim=-1).to(dtype=x.dtype)) @ self.tok_emb.weight.to(dtype=x.dtype)
+                    x = x + self.refinement_feedback_scale * _fb.reshape_as(x)
+                _h = self.final_norm(x)
+                _tmp = self.compute_logits(_h.reshape(-1, _h.size(-1)))
                 aux_loss = aux_loss + F.cross_entropy(_tmp.float(), targets, reduction="mean")
+            h = self.final_norm(x)
             logits = self.compute_logits(h.reshape(-1, h.size(-1)))
             main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
             return main_loss + self.refinement_aux_loss_weight * aux_loss
 
-        for block in self.refinement:
-            h = block(h)
+        for _ in range(self.refinement_steps):
+            x = self.refinement(x)
             if self.refinement_use_logit_feedback:
-                _tmp = self.compute_logits(h.reshape(-1, h.size(-1)))
-                _fb = (_tmp.softmax(dim=-1).to(dtype=h.dtype)) @ self.tok_emb.weight.to(dtype=h.dtype)
-                h = h + self.refinement_feedback_scale * _fb.reshape_as(h)
+                _h = self.final_norm(x)
+                _tmp = self.compute_logits(_h.reshape(-1, _h.size(-1)))
+                _fb = (_tmp.softmax(dim=-1).to(dtype=x.dtype)) @ self.tok_emb.weight.to(dtype=x.dtype)
+                x = x + self.refinement_feedback_scale * _fb.reshape_as(x)
 
+        h = self.final_norm(x)
         logits = self.compute_logits(h.reshape(-1, h.size(-1)))
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
