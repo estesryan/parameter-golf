@@ -29,13 +29,15 @@ no future-token access, full causal safety preserved.
 
 Default configuration (stable defaults):
     REFINEMENT_STEPS=2, REFINEMENT_HIDDEN_MULT=1
-    REFINEMENT_AUX_LOSS_WEIGHT=0.02 (small — aux must not overpower base CE)
+    REFINEMENT_AUX_LOSS_WEIGHT=0.02 (maximum aux weight; effective contribution is self-paced via EMA-gated scaling during training)
     REFINEMENT_USE_LOGIT_FEEDBACK=0 (off by default for stability)
     REFINEMENT_FEEDBACK_SCALE=0.005 (kept small for when feedback is enabled)
 
 Logit feedback is disabled by default. Refinement must learn a stable representation
 before feedback is introduced. Enable via REFINEMENT_USE_LOGIT_FEEDBACK=1 only after
 the refinement dynamics are stable.
+
+Final objective: standard next-token cross-entropy, unchanged.
 
 """
 
@@ -102,9 +104,11 @@ class Hyperparameters:
     # Recurrent refinement hyperparameters (stable defaults — refinement must learn before it is trusted).
     # Shared block applied recurrently: parameters constant, compute scales with steps.
     # Step embeddings allow per-step specialization while sharing operator weights.
-    # Aux loss is intentionally small (0.02) to avoid overpowering base CE.
+    # Aux loss sets the maximum weight (0.02); actual contribution is self-paced
+    # via EMA-gated scaling in the training loop to avoid early optimization interference.
     # Logit feedback is off by default — early-training noise makes it destabilizing.
-    # Enable feedback via REFINEMENT_USE_LOGIT_FEEDBACK=1 after base loss stabilizes.
+    # Enable feedback via REFINEMENT_USE_LOGIT_FEEDBACK=1 only after refinement dynamics
+    # are stable and the CE-only path is competitive.
     # "refinement_scale" must remain in CONTROL_TENSOR_NAME_PATTERNS so the per-channel
     # scale stays fp32 and passes through the int8 export correctly.
     # (Omitting it does not route it to Muon — it is 1D so it falls into scalar Adam —
@@ -1163,6 +1167,8 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 main_loss, aux_transition_loss = model(x, y)
             loss = main_loss
+            # Self-paced aux: transition loss is ramped in based on EMA of prediction error.
+            # Early training relies on CE only; aux activates when latent transitions become predictable.
             if aux_transition_loss is not None:
                 mse_val = aux_transition_loss.detach()
                 if refinement_aux_ema is None:
