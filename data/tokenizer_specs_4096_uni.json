@@ -1,14 +1,14 @@
 {
   "tokenizers": [
     {
-      "name": "sp_unigram_4096_short",
-      "dataset_suffix": "sp4096_uni_short",
+      "name": "sp_unigram_4096",
+      "dataset_suffix": "sp4096_uni",
       "vocab_size": 4096,
-      "model_prefix": "fineweb_4096_unigram_short",
+      "model_prefix": "fineweb_4096_unigram",
       "trainer_overrides": {
         "model_type": "unigram",
         "character_coverage": 0.999,
-        "byte_fallback": false,
+        "byte_fallback": true,
         "split_digits": true,
         "normalization_rule_name": "nmt_nfkc",
         "add_dummy_prefix": false,

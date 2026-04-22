@@ -8,7 +8,7 @@ Command:
 
 PYTHONUNBUFFERED=1 python3 data/download_hf_docs_and_tokenize_ext.py \
   --output-root ./data \
-  --tokenizer-config ./data/tokenizer_specs_4096.json \
+  --tokenizer-config ./data/tokenizer_specs_4096_uni.json \
   --tokenizer-train-docs 1000000 \
   --train-shards 15
 
@@ -34,7 +34,7 @@ SIDECAR_FILENAME = "docs_selected.source_manifest.json"
 VERSION = "10B"
 NUM_VAL_DOCS = 50_000
 SHARD_SIZE = 10**8
-APPEND_EOS = True
+APPEND_EOS = False
 DATAFILE_MAGIC = 20240520
 DATAFILE_VERSION = 1
 DEFAULT_REPO_ID = os.environ.get("MATCHED_FINEWEB_REPO_ID", "willdepueoai/parameter-golf")
