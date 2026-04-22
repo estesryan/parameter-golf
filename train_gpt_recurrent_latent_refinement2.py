@@ -110,7 +110,7 @@ class Hyperparameters:
     # (Omitting it does not route it to Muon — it is 1D so it falls into scalar Adam —
     # but it would lose fp32 passthrough treatment in the int8 export.)
     refinement_steps = int(os.environ.get("REFINEMENT_STEPS", 2))
-    refinement_hidden_mult = int(os.environ.get("REFINEMENT_HIDDEN_MULT", 2))
+    refinement_hidden_mult = int(os.environ.get("REFINEMENT_HIDDEN_MULT", 1))
     refinement_aux_loss_weight = float(os.environ.get("REFINEMENT_AUX_LOSS_WEIGHT", 0.02))
     refinement_use_logit_feedback = bool(int(os.environ.get("REFINEMENT_USE_LOGIT_FEEDBACK", 0)))
     refinement_feedback_scale = float(os.environ.get("REFINEMENT_FEEDBACK_SCALE", 0.005))
