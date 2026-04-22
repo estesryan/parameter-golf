@@ -771,7 +771,7 @@ class GPT(nn.Module):
         refinement_hidden = refinement_hidden_mult * model_dim
         self.refinement_block = RefinementBlock(model_dim, refinement_hidden)
         # Learned step embeddings let each recurrent iteration specialize while sharing weights.
-        # Initialized with small random values so each refinement step can specialize early while keeping updates near-identity at initialization.
+        # Zero-initialized so refinement starts from the baseline path and per-step specialization is learned only when useful.
         self.refinement_step_emb = nn.Parameter(torch.empty(refinement_steps, model_dim))
         nn.init.zeros_(self.refinement_step_emb)
         if self.lm_head is not None:
