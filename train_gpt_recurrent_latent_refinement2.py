@@ -828,7 +828,9 @@ class GPT(nn.Module):
                 h = h + self.refinement_feedback_scale * torch.tanh(_fb.reshape_as(h))
             if use_aux and h_prev is not None:
                 # predict next latent state from previous state
-                pred_next = self.refinement_block(h_prev)
+                pred_next = self.refinement_block(
+                    h_prev + self.refinement_step_emb[t][None, None, :].to(dtype=h_prev.dtype)
+                )
                 aux_loss = aux_loss + F.mse_loss(pred_next, h.detach(), reduction="mean")
             h_prev = h.clone()
 
