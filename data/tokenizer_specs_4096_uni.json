@@ -8,13 +8,11 @@
       "trainer_overrides": {
         "model_type": "unigram",
         "character_coverage": 0.999,
-        "byte_fallback": true,
+        "byte_fallback": false,
         "split_digits": true,
         "normalization_rule_name": "nmt_nfkc",
         "add_dummy_prefix": false,
-        "hard_vocab_limit": false,
-        "max_sentence_length": 3072,
-        "train_extremely_large_corpus": true
+        "hard_vocab_limit": false
       }
     }
   ]
