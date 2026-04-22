@@ -85,6 +85,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.01))
     sigreg_num_proj = int(os.environ.get("SIGREG_NUM_PROJ", 32))
+    latent_pred_weight = float(os.environ.get("LATENT_PRED_WEIGHT", 0.1))
 
 def sigreg_loss(h: Tensor, num_proj: int) -> Tensor:
     h_flat = h.reshape(-1, h.size(-1)).float()
@@ -699,6 +700,7 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.latent_predictor = CastedLinear(model_dim, model_dim, bias=False)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -871,6 +873,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    matrix_params.append(base_model.latent_predictor.weight)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -926,6 +929,7 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
     log0(f"sigreg_weight:{args.sigreg_weight} sigreg_num_proj:{args.sigreg_num_proj}")
+    log0(f"latent_pred_weight:{args.latent_pred_weight}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1034,7 +1038,18 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 ce_loss, hidden_states = model(x, y)
                 reg_loss = sigreg_loss(hidden_states, args.sigreg_num_proj)
-                loss = ce_loss + args.sigreg_weight * reg_loss
+                h = hidden_states  # [B, S, D]
+                z_t = h[:, :-1, :]
+                z_tp1 = h[:, 1:, :]
+                z_t_flat = z_t.reshape(-1, z_t.size(-1))
+                z_tp1_flat = z_tp1.reshape(-1, z_tp1.size(-1))
+                z_pred = model.latent_predictor(z_t_flat)
+                latent_loss = F.mse_loss(z_pred, z_tp1_flat, reduction="mean")
+                loss = (
+                    ce_loss
+                    + args.latent_pred_weight * latent_loss
+                    + args.sigreg_weight * reg_loss
+                )
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
