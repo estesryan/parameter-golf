@@ -21,13 +21,14 @@ Each refinement step:
     - adds a learned step embedding to the hidden state (positionwise)
     - applies the shared RefinementBlock (positionwise residual MLP)
     - optionally adds bounded logit feedback (positionwise)
-    - optionally accumulates a latent transition prediction auxiliary loss (MSE: pred h_t vs actual h_t)
+    - optionally accumulates a latent transition prediction auxiliary loss
+      (MSE: predicted next refinement state vs actual next refinement state)
 
 All refinement operations are strictly positionwise — no cross-token communication,
 no future-token access, full causal safety preserved.
 
 Default configuration (stable defaults):
-    REFINEMENT_STEPS=2, REFINEMENT_HIDDEN_MULT=2
+    REFINEMENT_STEPS=2, REFINEMENT_HIDDEN_MULT=1
     REFINEMENT_AUX_LOSS_WEIGHT=0.02 (small — aux must not overpower base CE)
     REFINEMENT_USE_LOGIT_FEEDBACK=0 (off by default for stability)
     REFINEMENT_FEEDBACK_SCALE=0.005 (kept small for when feedback is enabled)
@@ -36,7 +37,6 @@ Logit feedback is disabled by default. Refinement must learn a stable representa
 before feedback is introduced. Enable via REFINEMENT_USE_LOGIT_FEEDBACK=1 once the
 model has converged on a reasonable base loss.
 
-Final objective: standard next-token cross-entropy, unchanged.
 """
 
 from __future__ import annotations
