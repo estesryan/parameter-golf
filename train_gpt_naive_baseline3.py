@@ -64,7 +64,6 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
-    refinement_steps = int(os.environ.get("REFINEMENT_STEPS", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -603,17 +602,16 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.w1 = CastedLinear(dim, hidden, bias=False)
+        self.w2 = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        return self.proj(self.w1(x) * torch.sigmoid(self.w2(x)))
 
 
 class Block(nn.Module):
@@ -644,18 +642,6 @@ class Block(nn.Module):
         return x
 
 
-class RefinementBlock(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
-        super().__init__()
-        self.norm = RMSNorm()
-        self.mlp = MLP(dim, mlp_mult)
-        self.scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-
-    def forward(self, x: Tensor) -> Tensor:
-        # near-identity residual
-        return x + self.scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.norm(x))
-
-
 class GPT(nn.Module):
     def __init__(
         self,
@@ -670,7 +656,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        refinement_steps: int = 2,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -696,8 +681,6 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        self.refinement = RefinementBlock(model_dim, mlp_mult)
-        self.refinement_steps = refinement_steps
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -725,10 +708,6 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-
-        # refinement loop (shared weights)
-        for _ in range(self.refinement_steps):
-            x = self.refinement(x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -853,7 +832,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        refinement_steps=args.refinement_steps,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -865,18 +843,17 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks + refinement block use MATRIX_LR via Muon
+    # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    refinement_named_params = list(base_model.refinement.named_parameters())
     matrix_params = [
         p
-        for name, p in block_named_params + refinement_named_params
+        for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params + refinement_named_params
+        for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
@@ -928,7 +905,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(f"refinement_steps:{args.refinement_steps}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
