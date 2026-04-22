@@ -1,10 +1,10 @@
 {
   "tokenizers": [
     {
-      "name": "sp_unigram_4096",
-      "dataset_suffix": "sp4096_uni",
+      "name": "sp_unigram_4096_eos",
+      "dataset_suffix": "sp4096_uni_eos",
       "vocab_size": 4096,
-      "model_prefix": "fineweb_4096_unigram",
+      "model_prefix": "fineweb_4096_unigram_eos",
       "trainer_overrides": {
         "model_type": "unigram",
         "character_coverage": 0.999,
