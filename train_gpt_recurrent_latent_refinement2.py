@@ -34,8 +34,8 @@ Default configuration (stable defaults):
     REFINEMENT_FEEDBACK_SCALE=0.005 (kept small for when feedback is enabled)
 
 Logit feedback is disabled by default. Refinement must learn a stable representation
-before feedback is introduced. Enable via REFINEMENT_USE_LOGIT_FEEDBACK=1 once the
-model has converged on a reasonable base loss.
+before feedback is introduced. Enable via REFINEMENT_USE_LOGIT_FEEDBACK=1 only after
+the refinement dynamics are stable.
 
 """
 
@@ -301,7 +301,8 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_main_loss, _ = model(x, y)
+                batch_loss = batch_main_loss.detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -789,7 +790,7 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(hidden_flat)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor | None]:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -831,16 +832,19 @@ class GPT(nn.Module):
                 pred_next = self.refinement_block(
                     h_prev + self.refinement_step_emb[t][None, None, :].to(dtype=h_prev.dtype)
                 )
-                aux_loss = aux_loss + F.mse_loss(pred_next, h.detach(), reduction="mean")
+                step_mse = F.mse_loss(pred_next, h.detach(), reduction="mean")
+                aux_loss = aux_loss + step_mse
             h_prev = h.clone()
 
         # Final objective: standard next-token cross-entropy, unchanged.
+        # EMA-gated aux weighting is maintained in the training loop, not inside the compiled model forward pass.
         logits = self.compute_logits(h.reshape(-1, h.size(-1)))
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        aux_transition_loss = None
         if use_aux and aux_loss is not None:
             norm = max(self.refinement_steps - 1, 1)
-            return main_loss + self.refinement_aux_loss_weight * (aux_loss / norm)
-        return main_loss
+            aux_transition_loss = aux_loss / norm
+        return main_loss, aux_transition_loss
 
 
 # -----------------------------
@@ -1083,7 +1087,8 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_main_loss, _ = model(x, y)
+                    warmup_loss = warmup_main_loss
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1101,6 +1106,11 @@ def main() -> None:
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
+
+    # EMA state for self-paced aux loss scaling (Python-side, not inside the compiled model).
+    refinement_aux_ema: Tensor | None = None
+    refinement_aux_ema_decay = 0.95
+    refinement_aux_tau = 0.02
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1151,7 +1161,20 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                main_loss, aux_transition_loss = model(x, y)
+            loss = main_loss
+            if aux_transition_loss is not None:
+                mse_val = aux_transition_loss.detach()
+                if refinement_aux_ema is None:
+                    refinement_aux_ema = mse_val
+                else:
+                    refinement_aux_ema = (
+                        refinement_aux_ema_decay * refinement_aux_ema
+                        + (1.0 - refinement_aux_ema_decay) * mse_val
+                    )
+                aux_scale = (refinement_aux_tau - refinement_aux_ema) / refinement_aux_tau
+                aux_scale = torch.clamp(aux_scale, 0.0, 1.0)
+                loss = main_loss + aux_scale * args.refinement_aux_loss_weight * aux_transition_loss
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
