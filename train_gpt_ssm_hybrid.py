@@ -66,6 +66,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     ssm_layers = os.environ.get("SSM_LAYERS", "3,4")
     ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 128))
+    ssm_kernel_len = int(os.environ.get("SSM_KERNEL_LEN", 256))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -624,10 +625,11 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class SelectiveSSM(nn.Module):
-    def __init__(self, dim: int, state_dim: int):
+    def __init__(self, dim: int, state_dim: int, kernel_len: int = 256):
         super().__init__()
         self.dim = dim
         self.state_dim = state_dim
+        self.kernel_len = kernel_len
 
         hidden = state_dim
         self.in_proj = CastedLinear(dim, 2 * hidden, bias=False)
@@ -651,16 +653,17 @@ class SelectiveSSM(nn.Module):
         # All weights are non-negative and at most 1, so no overflow at any T or u magnitude.
         # Avoids inverse powers entirely — the cumsum-of-growing-terms formulation is unfixable.
         neg_log_a = F.softplus(self.log_decay.float())  # [H], positive
-        k = torch.arange(T, device=x.device, dtype=torch.float32)
-        kernel = torch.exp(-neg_log_a[:, None] * k[None, :])  # [H, T], all in (0, 1]
+        K = min(self.kernel_len, T)
+        k = torch.arange(K, device=x.device, dtype=torch.float32)
+        kernel = torch.exp(-neg_log_a[:, None] * k[None, :])  # [H, K], all in (0, 1]
 
-        # Depthwise causal conv1d: h[b,t,h] = sum_{k=0}^{t} kernel[h,k] * u[b,t-k,h]
+        # Depthwise causal conv1d: h[b,t,h] = sum_{k=0}^{min(t,K-1)} kernel[h,k] * u[b,t-k,h]
         u_t = u.float().permute(0, 2, 1)               # [B, H, T]
         h_t = F.conv1d(
-            F.pad(u_t, (T - 1, 0)),                    # [B, H, 2T-1]
-            kernel.flip(-1).unsqueeze(1),               # [H, 1, T]
+            F.pad(u_t, (K - 1, 0)),                    # [B, H, T+K-1]
+            kernel.flip(-1).unsqueeze(1),              # [H, 1, K]
             groups=H,
-        )                                               # [B, H, T]
+        )                                              # [B, H, T]
         h = h_t.permute(0, 2, 1)                       # [B, T, H]
 
         y = torch.tanh(h) * torch.sigmoid(g.float())
@@ -669,11 +672,11 @@ class SelectiveSSM(nn.Module):
 
 
 class SSMBlock(nn.Module):
-    def __init__(self, dim: int, state_dim: int, mlp_mult: int):
+    def __init__(self, dim: int, state_dim: int, mlp_mult: int, kernel_len: int = 256):
         super().__init__()
         self.norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.ssm = SelectiveSSM(dim, state_dim)
+        self.ssm = SelectiveSSM(dim, state_dim, kernel_len)
         self.mlp = MLP(dim, mlp_mult)
         self.ssm_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -726,6 +729,7 @@ class GPT(nn.Module):
         mlp_mult: int,
         ssm_layers: str,
         ssm_state_dim: int,
+        ssm_kernel_len: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -752,6 +756,7 @@ class GPT(nn.Module):
                         model_dim,
                         ssm_state_dim,
                         mlp_mult,
+                        ssm_kernel_len,
                     )
                 )
             else:
@@ -914,7 +919,7 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         ssm_layers=args.ssm_layers,
         ssm_state_dim=args.ssm_state_dim,
-
+        ssm_kernel_len=args.ssm_kernel_len,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
