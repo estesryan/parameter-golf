@@ -646,17 +646,18 @@ class SelectiveSSM(nn.Module):
         z = self.in_proj(x)
         u, g = z.chunk(2, dim=-1)
 
-        # a in (0, 1), one per channel
-        a = torch.sigmoid(self.log_decay).clamp(max=0.999).to(dtype=x.dtype)[None, None, :]
+        # Compute SSM in float32: in bfloat16, a^{-T} overflows for T=1024 when a<0.92,
+        # producing 0*inf=NaN in the cumsum. Clamp a above exp(-88/T)~0.918 to keep
+        # inv_a_pows within float32 range.
+        a = torch.sigmoid(self.log_decay.float()).clamp(min=0.92, max=0.9999)[None, None, :]
 
         t = torch.arange(T, device=x.device, dtype=torch.float32)[None, :, None]
-        t = t.to(dtype=x.dtype)
         a_pows = torch.pow(a, t)
-        inv_a_pows = torch.exp(-t * torch.log(a.clamp_min(1e-4)))
+        inv_a_pows = torch.pow(a, -t)
 
-        h = a_pows * torch.cumsum(u * inv_a_pows, dim=1)
-        y = torch.tanh(h) * torch.sigmoid(g)
-        y = self.out_proj(y)
+        h = a_pows * torch.cumsum(u.float() * inv_a_pows, dim=1)
+        y = torch.tanh(h) * torch.sigmoid(g.float())
+        y = self.out_proj(y.to(dtype=x.dtype))
 
         return y + self.D.to(dtype=x.dtype)[None, None, :] * x
 
