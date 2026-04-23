@@ -689,15 +689,15 @@ class SSMBlock(nn.Module):
     def __init__(self, dim: int, state_dim: int, ssm_mlp_mult: int, num_groups: int):
         super().__init__()
         self.norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
         self.ssm = SelectiveSSM(dim, state_dim, num_groups)
         self.has_mlp = ssm_mlp_mult > 0
         if self.has_mlp:
+            self.mlp_norm = RMSNorm()
             self.mlp = MLP(dim, ssm_mlp_mult)
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         else:
             self.mlp = None
         self.ssm_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
