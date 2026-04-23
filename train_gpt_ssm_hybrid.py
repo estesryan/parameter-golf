@@ -66,6 +66,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     ssm_layers = os.environ.get("SSM_LAYERS", "3,4")
     ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 128))
+    ssm_conv_kernel = int(os.environ.get("SSM_CONV_KERNEL", 5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -624,47 +625,44 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class SelectiveSSM(nn.Module):
-    def __init__(self, dim: int, state_dim: int):
+    def __init__(self, dim: int, state_dim: int, conv_kernel: int):
         super().__init__()
         self.dim = dim
         self.state_dim = state_dim
 
-        self.in_proj = CastedLinear(dim, 2 * state_dim, bias=False)
-        self.out_proj = CastedLinear(state_dim, dim, bias=False)
-        self.out_proj._zero_init = True
+        hidden = state_dim
 
-        self.A_log = nn.Parameter(torch.zeros(state_dim))
+        self.in_proj = CastedLinear(dim, 2 * hidden, bias=False)
+        self.dwconv = nn.Conv1d(
+            hidden,
+            hidden,
+            kernel_size=conv_kernel,
+            groups=hidden,
+            padding=conv_kernel - 1,
+            bias=False,
+        )
+        self.out_proj = CastedLinear(hidden, dim, bias=False)
+        self.out_proj._zero_init = True
         self.D = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, D = x.shape
-
         z = self.in_proj(x)
-        u, v = z.chunk(2, dim=-1)
-
-        A = torch.exp(-torch.exp(self.A_log)).to(dtype=x.dtype)[None, :]
-
-        h = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
-        outputs = []
-
-        for t in range(T):
-            ut = u[:, t, :]
-            vt = v[:, t, :]
-            h = h * A + ut
-            yt = h * torch.sigmoid(vt)
-            outputs.append(yt)
-
-        y = torch.stack(outputs, dim=1)
+        u, g = z.chunk(2, dim=-1)
+        u = u.transpose(1, 2)
+        u = self.dwconv(u)[..., :T]
+        u = u.transpose(1, 2)
+        y = u * torch.sigmoid(g)
         y = self.out_proj(y)
         return y + self.D.to(dtype=x.dtype)[None, None, :] * x
 
 
 class SSMBlock(nn.Module):
-    def __init__(self, dim: int, state_dim: int, mlp_mult: int):
+    def __init__(self, dim: int, state_dim: int, conv_kernel: int, mlp_mult: int):
         super().__init__()
         self.norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.ssm = SelectiveSSM(dim, state_dim)
+        self.ssm = SelectiveSSM(dim, state_dim, conv_kernel)
         self.mlp = MLP(dim, mlp_mult)
         self.ssm_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -717,6 +715,7 @@ class GPT(nn.Module):
         mlp_mult: int,
         ssm_layers: str,
         ssm_state_dim: int,
+        ssm_conv_kernel: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -742,6 +741,7 @@ class GPT(nn.Module):
                     SSMBlock(
                         model_dim,
                         ssm_state_dim,
+                        ssm_conv_kernel,
                         mlp_mult,
                     )
                 )
@@ -905,6 +905,7 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         ssm_layers=args.ssm_layers,
         ssm_state_dim=args.ssm_state_dim,
+        ssm_conv_kernel=args.ssm_conv_kernel,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
