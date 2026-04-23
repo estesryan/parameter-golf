@@ -642,23 +642,29 @@ class SelectiveSSM(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         _, T, _ = x.shape
+        H = self.state_dim
 
         z = self.in_proj(x)
         u, g = z.chunk(2, dim=-1)
 
-        # neg_log_a = -log(a) > 0. Scaled by 85/T so that neg_log_a * T <= 85,
-        # keeping decay_inv = exp(t * neg_log_a) within float32 range for any T.
-        # No clamp needed: the bound is structural, and gradients flow freely.
-        neg_log_a = F.softplus(self.log_decay.float()) * (85.0 / T)  # [H]
+        # Causal convolution with exponentially decaying kernel: kernel[h,k] = a_h^k in (0,1].
+        # All weights are non-negative and at most 1, so no overflow at any T or u magnitude.
+        # Avoids inverse powers entirely — the cumsum-of-growing-terms formulation is unfixable.
+        neg_log_a = F.softplus(self.log_decay.float())  # [H], positive
+        k = torch.arange(T, device=x.device, dtype=torch.float32)
+        kernel = torch.exp(-neg_log_a[:, None] * k[None, :])  # [H, T], all in (0, 1]
 
-        t = torch.arange(T, device=x.device, dtype=torch.float32)[None, :, None]  # [1,T,1]
-        decay_fwd = torch.exp(t * (-neg_log_a)[None, None, :])  # a^t, always in (0,1]
-        decay_inv = torch.exp(t * neg_log_a[None, None, :])     # a^{-t}, bounded by exp(85)
+        # Depthwise causal conv1d: h[b,t,h] = sum_{k=0}^{t} kernel[h,k] * u[b,t-k,h]
+        u_t = u.float().permute(0, 2, 1)               # [B, H, T]
+        h_t = F.conv1d(
+            F.pad(u_t, (T - 1, 0)),                    # [B, H, 2T-1]
+            kernel.flip(-1).unsqueeze(1),               # [H, 1, T]
+            groups=H,
+        )                                               # [B, H, T]
+        h = h_t.permute(0, 2, 1)                       # [B, T, H]
 
-        h = decay_fwd * torch.cumsum(u.float() * decay_inv, dim=1)
         y = torch.tanh(h) * torch.sigmoid(g.float())
         y = self.out_proj(y.to(dtype=x.dtype))
-
         return y + self.D.to(dtype=x.dtype)[None, None, :] * x
 
 
