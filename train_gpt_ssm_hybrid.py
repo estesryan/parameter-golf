@@ -646,16 +646,16 @@ class SelectiveSSM(nn.Module):
         z = self.in_proj(x)
         u, g = z.chunk(2, dim=-1)
 
-        # Compute SSM in float32: in bfloat16, a^{-T} overflows for T=1024 when a<0.92,
-        # producing 0*inf=NaN in the cumsum. Clamp a above exp(-88/T)~0.918 to keep
-        # inv_a_pows within float32 range.
-        a = torch.sigmoid(self.log_decay.float()).clamp(min=0.92, max=0.9999)[None, None, :]
+        # neg_log_a = -log(a) > 0. Scaled by 85/T so that neg_log_a * T <= 85,
+        # keeping decay_inv = exp(t * neg_log_a) within float32 range for any T.
+        # No clamp needed: the bound is structural, and gradients flow freely.
+        neg_log_a = F.softplus(self.log_decay.float()) * (85.0 / T)  # [H]
 
-        t = torch.arange(T, device=x.device, dtype=torch.float32)[None, :, None]
-        a_pows = torch.pow(a, t)
-        inv_a_pows = torch.pow(a, -t)
+        t = torch.arange(T, device=x.device, dtype=torch.float32)[None, :, None]  # [1,T,1]
+        decay_fwd = torch.exp(t * (-neg_log_a)[None, None, :])  # a^t, always in (0,1]
+        decay_inv = torch.exp(t * neg_log_a[None, None, :])     # a^{-t}, bounded by exp(85)
 
-        h = a_pows * torch.cumsum(u.float() * inv_a_pows, dim=1)
+        h = decay_fwd * torch.cumsum(u.float() * decay_inv, dim=1)
         y = torch.tanh(h) * torch.sigmoid(g.float())
         y = self.out_proj(y.to(dtype=x.dtype))
 
