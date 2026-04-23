@@ -662,14 +662,18 @@ class SelectiveSSM(nn.Module):
         a = a[:, :, :, None]                        # [B, T, G, 1]
 
         log_a = torch.log(a.clamp_min(1e-6))
-        log_p = torch.cumsum(log_a, dim=1)
+        # Inductor's split-scan kernel requires exactly 2 tile dims (batch, scan).
+        # Flatten higher-rank tensors to [B*G, T] / [B*G*Hg, T] before scanning.
+        log_a_flat = log_a.squeeze(-1).permute(0, 2, 1).reshape(B * G, T)
+        log_p_flat = torch.cumsum(log_a_flat, dim=1)
+        log_p_max_flat = torch.cummax(log_p_flat, dim=1).values
+        exp_flat = torch.exp(log_p_flat - log_p_max_flat)
+        inv_exp_flat = 1.0 / exp_flat
+        exp_term = exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
+        inv_exp_term = inv_exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
 
-        log_p_max = torch.cummax(log_p, dim=1).values
-
-        exp_term = torch.exp(log_p - log_p_max)
-        inv_exp_term = 1.0 / exp_term
-
-        s = torch.cumsum(u * inv_exp_term, dim=1)
+        u_scaled_flat = (u * inv_exp_term).permute(0, 2, 3, 1).reshape(B * G * Hg, T)
+        s = torch.cumsum(u_scaled_flat, dim=1).reshape(B, G, Hg, T).permute(0, 3, 1, 2)
 
         h = exp_term * s
         h = h.reshape(B, T, H)
