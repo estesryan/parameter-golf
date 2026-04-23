@@ -669,9 +669,12 @@ class SelectiveSSM(nn.Module):
         log_p_flat = torch.cumsum(log_a_flat, dim=1)
         log_p_max_flat = torch.cummax(log_p_flat, dim=1).values
         exp_flat = torch.exp(log_p_flat - log_p_max_flat)
-        # 1/exp_flat overflows fp32 for long sequences (a≈0.9, T=1024 → exp(107)).
-        # Clamp the exponent: clamped terms are multiplied back by exp_flat≈0 anyway.
-        inv_exp_flat = torch.exp((log_p_max_flat - log_p_flat).clamp(max=80.0))
+        # Clamped positions contribute exp_flat≈0 to h anyway, so clamping is lossless.
+        # The cumsum of u*inv_exp has ~T terms each up to exp(clamp), so we need:
+        #   T * exp(clamp) * |u_safety| < fp32_max  →  clamp < log(fp32_max/T) - log(u_safety)
+        # 20 nats safety margin (~5e8 headroom for |u| beyond RMSNorm-normalized scale).
+        clamp_max = math.log(torch.finfo(torch.float32).max / T) - 20.0
+        inv_exp_flat = torch.exp((log_p_max_flat - log_p_flat).clamp(max=clamp_max))
         exp_term = exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
         inv_exp_term = inv_exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
 
