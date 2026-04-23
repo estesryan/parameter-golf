@@ -60,8 +60,8 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     ssm_mlp_mult = int(os.environ.get("SSM_MLP_MULT", 2))
-    ssm_layers = os.environ.get("SSM_LAYERS", "3,4")
-    ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 128))
+    ssm_layers = os.environ.get("SSM_LAYERS", "8")
+    ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 64))
     ssm_kernel_len = int(os.environ.get("SSM_KERNEL_LEN", 256))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -621,49 +621,47 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class SelectiveSSM(nn.Module):
-    def __init__(self, dim: int, state_dim: int, kernel_len: int = 256):
+    def __init__(self, dim: int, state_dim: int):
         super().__init__()
         self.dim = dim
         self.state_dim = state_dim
-        self.kernel_len = kernel_len
 
-        hidden = state_dim
-        self.in_proj = CastedLinear(dim, 2 * hidden, bias=False)
-        self.out_proj = CastedLinear(hidden, dim, bias=False)
+        H = state_dim
+
+        # Input projections
+        self.in_proj = CastedLinear(dim, 3 * H, bias=False)  # u, g, a
+        self.out_proj = CastedLinear(H, dim, bias=False)
         self.out_proj._zero_init = True
 
-        # decay parameter; mapped into (0, 1)
-        self.log_decay = nn.Parameter(torch.zeros(hidden))
-
-        # skip connection term
+        # Residual skip
         self.D = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        _, T, _ = x.shape
+        B, T, _ = x.shape
         H = self.state_dim
 
-        z = self.in_proj(x)
-        u, g = z.chunk(2, dim=-1)
+        z = self.in_proj(x)                     # [B, T, 3H]
+        u, g, a = z.chunk(3, dim=-1)           # each [B, T, H]
 
-        # Causal convolution with exponentially decaying kernel: kernel[h,k] = a_h^k in (0,1].
-        # All weights are non-negative and at most 1, so no overflow at any T or u magnitude.
-        # Avoids inverse powers entirely — the cumsum-of-growing-terms formulation is unfixable.
-        neg_log_a = F.softplus(self.log_decay.float())  # [H], positive
-        K = min(self.kernel_len, T)
-        k = torch.arange(K, device=x.device, dtype=torch.float32)
-        kernel = torch.exp(-neg_log_a[:, None] * k[None, :])  # [H, K], all in (0, 1]
+        # Input-dependent decay in (0,1)
+        a = torch.sigmoid(a.float()) * 0.99
 
-        # Depthwise causal conv1d: h[b,t,h] = sum_{k=0}^{min(t,K-1)} kernel[h,k] * u[b,t-k,h]
-        u_t = u.float().permute(0, 2, 1)               # [B, H, T]
-        h_t = F.conv1d(
-            F.pad(u_t, (K - 1, 0)),                    # [B, H, T+K-1]
-            kernel.flip(-1).unsqueeze(1),              # [H, 1, K]
-            groups=H,
-        )                                              # [B, H, T]
-        h = h_t.permute(0, 2, 1)                       # [B, T, H]
+        u = u.float()
+        g = torch.sigmoid(g.float())
 
-        y = torch.tanh(h) * torch.sigmoid(g.float())
+        # Scan (recurrent state)
+        h = torch.zeros(B, H, device=x.device, dtype=torch.float32)
+        outputs = []
+
+        for t in range(T):
+            h = a[:, t] * h + u[:, t]
+            outputs.append(h)
+
+        h = torch.stack(outputs, dim=1)        # [B, T, H]
+
+        y = torch.tanh(h) * g
         y = self.out_proj(y.to(dtype=x.dtype))
+
         return y + self.D.to(dtype=x.dtype)[None, None, :] * x
 
 
@@ -672,7 +670,7 @@ class SSMBlock(nn.Module):
         super().__init__()
         self.norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.ssm = SelectiveSSM(dim, state_dim, kernel_len)
+        self.ssm = SelectiveSSM(dim, state_dim)
         self.has_mlp = ssm_mlp_mult > 0
         if self.has_mlp:
             self.mlp = MLP(dim, ssm_mlp_mult)
