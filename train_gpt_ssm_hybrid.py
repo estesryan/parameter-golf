@@ -64,6 +64,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    ssm_mlp_mult = int(os.environ.get("SSM_MLP_MULT", 2))
     ssm_layers = os.environ.get("SSM_LAYERS", "3,4")
     ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 128))
     ssm_kernel_len = int(os.environ.get("SSM_KERNEL_LEN", 256))
@@ -672,12 +673,16 @@ class SelectiveSSM(nn.Module):
 
 
 class SSMBlock(nn.Module):
-    def __init__(self, dim: int, state_dim: int, mlp_mult: int, kernel_len: int = 256):
+    def __init__(self, dim: int, state_dim: int, ssm_mlp_mult: int, kernel_len: int = 256):
         super().__init__()
         self.norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.ssm = SelectiveSSM(dim, state_dim, kernel_len)
-        self.mlp = MLP(dim, mlp_mult)
+        self.has_mlp = ssm_mlp_mult > 0
+        if self.has_mlp:
+            self.mlp = MLP(dim, ssm_mlp_mult)
+        else:
+            self.mlp = None
         self.ssm_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -687,7 +692,8 @@ class SSMBlock(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         ssm_out = self.ssm(self.norm(x))
         x = x + self.ssm_scale.to(dtype=x.dtype)[None, None, :] * ssm_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if self.has_mlp:
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
     
 class Block(nn.Module):
@@ -727,6 +733,7 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        ssm_mlp_mult: int,
         ssm_layers: str,
         ssm_state_dim: int,
         ssm_kernel_len: int,
@@ -755,7 +762,7 @@ class GPT(nn.Module):
                     SSMBlock(
                         model_dim,
                         ssm_state_dim,
-                        mlp_mult,
+                        ssm_mlp_mult,
                         ssm_kernel_len,
                     )
                 )
@@ -917,6 +924,7 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        ssm_mlp_mult=args.ssm_mlp_mult,
         ssm_layers=args.ssm_layers,
         ssm_state_dim=args.ssm_state_dim,
         ssm_kernel_len=args.ssm_kernel_len,
