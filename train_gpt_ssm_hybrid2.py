@@ -650,20 +650,32 @@ class SelectiveSSM(nn.Module):
         ug = self.ug_proj(x)
         u, g = ug.chunk(2, dim=-1)
 
-        a = self.a_proj(x)
-        a = torch.sigmoid(a.float()) * 0.99
+        a = self.a_proj(x.mean(dim=1, keepdim=True))
+        a = a.expand(-1, T, -1)
+        # Keep decay in a numerically safe range near 1 so chunked products stay stable.
+        a = 0.9 + 0.09 * torch.sigmoid(a.float())
 
         u = u.float().view(B, T, G, Hg)
         g = torch.sigmoid(g.float())
 
-        h = torch.zeros(B, G, Hg, device=x.device, dtype=torch.float32)
-        outputs = []
+        chunk_size = 64
+        h0 = torch.zeros(B, G, Hg, device=x.device, dtype=torch.float32)
+        out_chunks = []
 
-        for t in range(T):
-            h = a[:, t, :, None] * h + u[:, t]
-            outputs.append(h)
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            a_chunk = a[:, start:end, :, None]          # [B, C, G, 1]
+            u_chunk = u[:, start:end]                   # [B, C, G, Hg]
 
-        h = torch.stack(outputs, dim=1).reshape(B, T, H)
+            p = torch.cumprod(a_chunk, dim=1)           # [B, C, G, 1]
+            p_safe = p.clamp_min(1e-6)
+            s = torch.cumsum(u_chunk / p_safe, dim=1)
+            h_chunk = p * (h0[:, None] + s)
+
+            h0 = h_chunk[:, -1]
+            out_chunks.append(h_chunk)
+
+        h = torch.cat(out_chunks, dim=1).reshape(B, T, H)
 
         y = torch.tanh(h) * g
         y = self.out_proj(y.to(dtype=x.dtype))
