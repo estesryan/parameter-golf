@@ -653,29 +653,27 @@ class SelectiveSSM(nn.Module):
         a = self.a_proj(x.mean(dim=1, keepdim=True))
         a = a.expand(-1, T, -1)
         # Keep decay in a numerically safe range near 1 so chunked products stay stable.
-        a = 0.9 + 0.09 * torch.sigmoid(a.float())
+        a = torch.sigmoid(a.float())
+        a = 1.0 - 0.1 * (1.0 - a)   # maps to ~[0.9, 1.0) but with better gradient spread
 
         u = u.float().view(B, T, G, Hg)
         g = torch.sigmoid(g.float())
 
-        chunk_size = 64
-        h0 = torch.zeros(B, G, Hg, device=x.device, dtype=torch.float32)
-        out_chunks = []
+        a = a[:, :, :, None]                        # [B, T, G, 1]
 
-        for start in range(0, T, chunk_size):
-            end = min(start + chunk_size, T)
-            a_chunk = a[:, start:end, :, None]          # [B, C, G, 1]
-            u_chunk = u[:, start:end]                   # [B, C, G, Hg]
+        log_a = torch.log(a.clamp_min(1e-6))
+        log_p = torch.cumsum(log_a, dim=1)
 
-            p = torch.cumprod(a_chunk, dim=1)           # [B, C, G, 1]
-            p_safe = p.clamp_min(1e-6)
-            s = torch.cumsum(u_chunk / p_safe, dim=1)
-            h_chunk = p * (h0[:, None] + s)
+        # subtract running max for stability
+        log_p_max = torch.cummax(log_p, dim=1).values
 
-            h0 = h_chunk[:, -1]
-            out_chunks.append(h_chunk)
+        exp_term = torch.exp(log_p - log_p_max)
+        inv_exp_term = 1.0 / exp_term
 
-        h = torch.cat(out_chunks, dim=1).reshape(B, T, H)
+        s = torch.cumsum(u * inv_exp_term, dim=1)
+
+        h = exp_term * s
+        h = h.reshape(B, T, H)
 
         y = torch.tanh(h) * g
         y = self.out_proj(y.to(dtype=x.dtype))
