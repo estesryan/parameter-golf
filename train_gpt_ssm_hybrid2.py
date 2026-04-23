@@ -61,6 +61,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     ssm_mlp_mult = int(os.environ.get("SSM_MLP_MULT", 2))
     ssm_layers = os.environ.get("SSM_LAYERS", "8")
+    no_attn_layers = os.environ.get("NO_ATTN_LAYERS", "")
     ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 64))
     ssm_num_groups = int(os.environ.get("SSM_NUM_GROUPS", 8))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -82,10 +83,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-
-    # Late latent refinement (optional; default off).
-    latent_refine_steps = int(os.environ.get("LATENT_REFINE_STEPS", 0))
-    latent_refine_mlp_mult = int(os.environ.get("LATENT_REFINE_MLP_MULT", 1))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -624,17 +621,6 @@ class MLP(nn.Module):
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
-class LatentRefiner(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
-        super().__init__()
-        self.norm = RMSNorm()
-        self.mlp = MLP(dim, mlp_mult)
-        self.scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-
-    def forward(self, x: Tensor) -> Tensor:
-        return x + self.scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.norm(x))
-
-
 class SelectiveSSM(nn.Module):
     def __init__(self, dim: int, state_dim: int, num_groups: int = 8):
         super().__init__()
@@ -733,8 +719,10 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_attention: bool = True,
     ):
         super().__init__()
+        self.use_attention = use_attention
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -746,8 +734,9 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        if self.use_attention:
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -770,8 +759,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        latent_refine_steps: int = 0,
-        latent_refine_mlp_mult: int = 1,
+        no_attn_layers: str = "",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -779,13 +767,13 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.latent_refine_steps = latent_refine_steps
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         ssm_layer_set = parse_layer_set(ssm_layers)
+        no_attn_layer_set = parse_layer_set(no_attn_layers)
         blocks = []
         for i in range(num_layers):
             if i in ssm_layer_set:
@@ -806,10 +794,10 @@ class GPT(nn.Module):
                         mlp_mult,
                         rope_base,
                         qk_gain_init,
+                        use_attention=i not in no_attn_layer_set,
                     )
                 )
         self.blocks = nn.ModuleList(blocks)
-        self.latent_refiner = LatentRefiner(model_dim, latent_refine_mlp_mult) if latent_refine_steps > 0 else None
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -838,8 +826,6 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        if self.latent_refine_steps > 0 and self.latent_refiner is not None:
-            x = self.latent_refiner(x)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -967,8 +953,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        latent_refine_steps=args.latent_refine_steps,
-        latent_refine_mlp_mult=args.latent_refine_mlp_mult,
+        no_attn_layers=args.no_attn_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -995,10 +980,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    if base_model.latent_refiner is not None:
-        refiner_named = list(base_model.latent_refiner.named_parameters())
-        matrix_params += [p for n, p in refiner_named if p.ndim == 2 and not any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)]
-        scalar_params += [p for n, p in refiner_named if p.ndim < 2 or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
