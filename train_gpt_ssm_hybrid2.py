@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import sentencepiece as spm
 import torch
+import torch._dynamo
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -641,6 +642,7 @@ class SelectiveSSM(nn.Module):
 
         self.D = nn.Parameter(torch.ones(dim))
 
+    @torch._dynamo.disable
     def forward(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape
         H = self.state_dim
@@ -662,9 +664,11 @@ class SelectiveSSM(nn.Module):
         a = a[:, :, :, None]                        # [B, T, G, 1]
 
         log_a = torch.log(a.clamp_min(1e-6))
-        log_p = torch.cumsum(log_a, dim=1)
 
-        # subtract running max for stability
+        # force graph break to avoid Triton scan fusion crash
+        log_p = torch.cumsum(log_a, dim=1)
+        log_p = log_p + 0.0
+
         log_p_max = torch.cummax(log_p, dim=1).values
 
         exp_term = torch.exp(log_p - log_p_max)
