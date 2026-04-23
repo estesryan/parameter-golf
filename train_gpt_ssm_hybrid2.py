@@ -62,7 +62,7 @@ class Hyperparameters:
     ssm_mlp_mult = int(os.environ.get("SSM_MLP_MULT", 2))
     ssm_layers = os.environ.get("SSM_LAYERS", "8")
     ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 64))
-    ssm_kernel_len = int(os.environ.get("SSM_KERNEL_LEN", 256))
+    ssm_num_groups = int(os.environ.get("SSM_NUM_GROUPS", 8))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -621,56 +621,61 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class SelectiveSSM(nn.Module):
-    def __init__(self, dim: int, state_dim: int):
+    def __init__(self, dim: int, state_dim: int, num_groups: int = 8):
         super().__init__()
         self.dim = dim
         self.state_dim = state_dim
+        self.num_groups = num_groups
 
         H = state_dim
+        G = num_groups
+        if H % G != 0:
+            raise ValueError("state_dim must be divisible by num_groups")
+        self.group_state_dim = H // G
 
-        # Input projections
-        self.in_proj = CastedLinear(dim, 3 * H, bias=False)  # u, g, a
+        self.ug_proj = CastedLinear(dim, 2 * H, bias=False)
+        self.a_proj = CastedLinear(dim, G, bias=False)
+
         self.out_proj = CastedLinear(H, dim, bias=False)
         self.out_proj._zero_init = True
 
-        # Residual skip
         self.D = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape
         H = self.state_dim
+        G = self.num_groups
+        Hg = self.group_state_dim
 
-        z = self.in_proj(x)                     # [B, T, 3H]
-        u, g, a = z.chunk(3, dim=-1)           # each [B, T, H]
+        ug = self.ug_proj(x)
+        u, g = ug.chunk(2, dim=-1)
 
-        # Input-dependent decay in (0,1)
+        a = self.a_proj(x)
         a = torch.sigmoid(a.float()) * 0.99
 
-        u = u.float()
+        u = u.float().view(B, T, G, Hg)
         g = torch.sigmoid(g.float())
 
-        # Scan (recurrent state)
-        h = torch.zeros(B, H, device=x.device, dtype=torch.float32)
+        h = torch.zeros(B, G, Hg, device=x.device, dtype=torch.float32)
         outputs = []
 
         for t in range(T):
-            h = a[:, t] * h + u[:, t]
+            h = a[:, t, :, None] * h + u[:, t]
             outputs.append(h)
 
-        h = torch.stack(outputs, dim=1)        # [B, T, H]
+        h = torch.stack(outputs, dim=1).reshape(B, T, H)
 
         y = torch.tanh(h) * g
         y = self.out_proj(y.to(dtype=x.dtype))
-
         return y + self.D.to(dtype=x.dtype)[None, None, :] * x
 
 
 class SSMBlock(nn.Module):
-    def __init__(self, dim: int, state_dim: int, ssm_mlp_mult: int, kernel_len: int = 256):
+    def __init__(self, dim: int, state_dim: int, ssm_mlp_mult: int, num_groups: int):
         super().__init__()
         self.norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.ssm = SelectiveSSM(dim, state_dim)
+        self.ssm = SelectiveSSM(dim, state_dim, num_groups)
         self.has_mlp = ssm_mlp_mult > 0
         if self.has_mlp:
             self.mlp = MLP(dim, ssm_mlp_mult)
@@ -729,7 +734,7 @@ class GPT(nn.Module):
         ssm_mlp_mult: int,
         ssm_layers: str,
         ssm_state_dim: int,
-        ssm_kernel_len: int,
+        ssm_num_groups: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -756,7 +761,7 @@ class GPT(nn.Module):
                         model_dim,
                         ssm_state_dim,
                         ssm_mlp_mult,
-                        ssm_kernel_len,
+                        ssm_num_groups,
                     )
                 )
             else:
@@ -920,7 +925,7 @@ def main() -> None:
         ssm_mlp_mult=args.ssm_mlp_mult,
         ssm_layers=args.ssm_layers,
         ssm_state_dim=args.ssm_state_dim,
-        ssm_kernel_len=args.ssm_kernel_len,
+        ssm_num_groups=args.ssm_num_groups,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
