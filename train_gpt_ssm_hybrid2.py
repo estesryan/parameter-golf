@@ -668,7 +668,9 @@ class SelectiveSSM(nn.Module):
         log_p_flat = torch.cumsum(log_a_flat, dim=1)
         log_p_max_flat = torch.cummax(log_p_flat, dim=1).values
         exp_flat = torch.exp(log_p_flat - log_p_max_flat)
-        inv_exp_flat = 1.0 / exp_flat
+        # 1/exp_flat overflows fp32 for long sequences (a≈0.9, T=1024 → exp(107)).
+        # Clamp the exponent: clamped terms are multiplied back by exp_flat≈0 anyway.
+        inv_exp_flat = torch.exp((log_p_max_flat - log_p_flat).clamp(max=80.0))
         exp_term = exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
         inv_exp_term = inv_exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
 
