@@ -60,9 +60,9 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     ssm_mlp_mult = int(os.environ.get("SSM_MLP_MULT", 2))
-    ssm_layers = os.environ.get("SSM_LAYERS", "3,4")
-    ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 128))
-    ssm_kernel_len = int(os.environ.get("SSM_KERNEL_LEN", 256))
+    ssm_layers = os.environ.get("SSM_LAYERS", "8")
+    ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 64))
+    ssm_num_groups = int(os.environ.get("SSM_NUM_GROUPS", 8))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -621,65 +621,83 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class SelectiveSSM(nn.Module):
-    def __init__(self, dim: int, state_dim: int, kernel_len: int = 256):
+    def __init__(self, dim: int, state_dim: int, num_groups: int = 8):
         super().__init__()
         self.dim = dim
         self.state_dim = state_dim
-        self.kernel_len = kernel_len
+        self.num_groups = num_groups
 
-        hidden = state_dim
-        self.in_proj = CastedLinear(dim, 2 * hidden, bias=False)
-        self.out_proj = CastedLinear(hidden, dim, bias=False)
+        H = state_dim
+        G = num_groups
+        if H % G != 0:
+            raise ValueError("state_dim must be divisible by num_groups")
+        self.group_state_dim = H // G
+
+        self.ug_proj = CastedLinear(dim, 2 * H, bias=False)
+        self.a_proj = CastedLinear(dim, G, bias=False)
+
+        self.out_proj = CastedLinear(H, dim, bias=False)
         self.out_proj._zero_init = True
 
-        # decay parameter; mapped into (0, 1)
-        self.log_decay = nn.Parameter(torch.zeros(hidden))
-
-        # skip connection term
         self.D = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        _, T, _ = x.shape
+        B, T, _ = x.shape
         H = self.state_dim
+        G = self.num_groups
+        Hg = self.group_state_dim
 
-        z = self.in_proj(x)
-        u, g = z.chunk(2, dim=-1)
+        ug = self.ug_proj(x)
+        u, g = ug.chunk(2, dim=-1)
 
-        # Causal convolution with exponentially decaying kernel: kernel[h,k] = a_h^k in (0,1].
-        # All weights are non-negative and at most 1, so no overflow at any T or u magnitude.
-        # Avoids inverse powers entirely — the cumsum-of-growing-terms formulation is unfixable.
-        neg_log_a = F.softplus(self.log_decay.float())  # [H], positive
-        K = min(self.kernel_len, T)
-        k = torch.arange(K, device=x.device, dtype=torch.float32)
-        kernel = torch.exp(-neg_log_a[:, None] * k[None, :])  # [H, K], all in (0, 1]
+        a = self.a_proj(x.mean(dim=1, keepdim=True))
+        a = a.expand(-1, T, -1)
+        # Keep decay in a numerically safe range near 1 so chunked products stay stable.
+        a = torch.sigmoid(a.float())
+        a = 1.0 - 0.1 * (1.0 - a)   # maps to ~[0.9, 1.0) but with better gradient spread
 
-        # Depthwise causal conv1d: h[b,t,h] = sum_{k=0}^{min(t,K-1)} kernel[h,k] * u[b,t-k,h]
-        u_t = u.float().permute(0, 2, 1)               # [B, H, T]
-        h_t = F.conv1d(
-            F.pad(u_t, (K - 1, 0)),                    # [B, H, T+K-1]
-            kernel.flip(-1).unsqueeze(1),              # [H, 1, K]
-            groups=H,
-        )                                              # [B, H, T]
-        h = h_t.permute(0, 2, 1)                       # [B, T, H]
+        u = u.float().view(B, T, G, Hg)
+        g = torch.sigmoid(g.float())
 
-        y = torch.tanh(h) * torch.sigmoid(g.float())
+        a = a[:, :, :, None]                        # [B, T, G, 1]
+
+        log_a = torch.log(a.clamp_min(1e-6))
+        # Inductor's split-scan kernel requires exactly 2 tile dims (batch, scan).
+        # Flatten higher-rank tensors to [B*G, T] / [B*G*Hg, T] before scanning.
+        log_a_flat = log_a.squeeze(-1).permute(0, 2, 1).reshape(B * G, T)
+        log_p_flat = torch.cumsum(log_a_flat, dim=1)
+        log_p_max_flat = torch.cummax(log_p_flat, dim=1).values
+        exp_flat = torch.exp(log_p_flat - log_p_max_flat)
+        # 1/exp_flat overflows fp32 for long sequences (a≈0.9, T=1024 → exp(107)).
+        # Clamp the exponent: clamped terms are multiplied back by exp_flat≈0 anyway.
+        inv_exp_flat = torch.exp((log_p_max_flat - log_p_flat).clamp(max=80.0))
+        exp_term = exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
+        inv_exp_term = inv_exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
+
+        u_scaled_flat = (u * inv_exp_term).permute(0, 2, 3, 1).reshape(B * G * Hg, T)
+        s = torch.cumsum(u_scaled_flat, dim=1).reshape(B, G, Hg, T).permute(0, 3, 1, 2)
+
+        h = exp_term * s
+        h = h.reshape(B, T, H)
+
+        y = torch.tanh(h) * g
         y = self.out_proj(y.to(dtype=x.dtype))
         return y + self.D.to(dtype=x.dtype)[None, None, :] * x
 
 
 class SSMBlock(nn.Module):
-    def __init__(self, dim: int, state_dim: int, ssm_mlp_mult: int, kernel_len: int = 256):
+    def __init__(self, dim: int, state_dim: int, ssm_mlp_mult: int, num_groups: int):
         super().__init__()
         self.norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
-        self.ssm = SelectiveSSM(dim, state_dim, kernel_len)
+        self.ssm = SelectiveSSM(dim, state_dim, num_groups)
         self.has_mlp = ssm_mlp_mult > 0
         if self.has_mlp:
+            self.mlp_norm = RMSNorm()
             self.mlp = MLP(dim, ssm_mlp_mult)
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         else:
             self.mlp = None
         self.ssm_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -731,7 +749,7 @@ class GPT(nn.Module):
         ssm_mlp_mult: int,
         ssm_layers: str,
         ssm_state_dim: int,
-        ssm_kernel_len: int,
+        ssm_num_groups: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -758,7 +776,7 @@ class GPT(nn.Module):
                         model_dim,
                         ssm_state_dim,
                         ssm_mlp_mult,
-                        ssm_kernel_len,
+                        ssm_num_groups,
                     )
                 )
             else:
@@ -922,7 +940,7 @@ def main() -> None:
         ssm_mlp_mult=args.ssm_mlp_mult,
         ssm_layers=args.ssm_layers,
         ssm_state_dim=args.ssm_state_dim,
-        ssm_kernel_len=args.ssm_kernel_len,
+        ssm_num_groups=args.ssm_num_groups,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -933,7 +951,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
