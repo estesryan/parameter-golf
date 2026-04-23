@@ -734,9 +734,11 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x))
         if self.use_attention:
-            attn_out = self.attn(self.attn_norm(x))
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        else:
+            x = x + 0.0 * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
