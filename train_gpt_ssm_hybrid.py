@@ -64,7 +64,7 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3))
     ssm_mlp_mult = float(os.environ.get("SSM_MLP_MULT", 2))
-    ssm_layers = os.environ.get("SSM_LAYERS", "7")
+    ssm_layers = os.environ.get("SSM_LAYERS", "6")
     no_attn_layers = os.environ.get("NO_ATTN_LAYERS", "3,5")
     ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 64))
     ssm_num_groups = int(os.environ.get("SSM_NUM_GROUPS", 8))
