@@ -58,8 +58,8 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
-    ssm_mlp_mult = int(os.environ.get("SSM_MLP_MULT", 2))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2))
+    ssm_mlp_mult = float(os.environ.get("SSM_MLP_MULT", 2))
     ssm_layers = os.environ.get("SSM_LAYERS", "8")
     no_attn_layers = os.environ.get("NO_ATTN_LAYERS", "")
     ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 64))
@@ -610,9 +610,9 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = max(64, int(round(mlp_mult * dim / 64)) * 64)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -690,7 +690,7 @@ class SelectiveSSM(nn.Module):
 
 
 class SSMBlock(nn.Module):
-    def __init__(self, dim: int, state_dim: int, ssm_mlp_mult: int, num_groups: int):
+    def __init__(self, dim: int, state_dim: int, ssm_mlp_mult: float, num_groups: int):
         super().__init__()
         self.norm = RMSNorm()
         self.ssm = SelectiveSSM(dim, state_dim, num_groups)
@@ -719,7 +719,7 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         rope_base: float,
         qk_gain_init: float,
         use_attention: bool = True,
@@ -752,8 +752,8 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
-        ssm_mlp_mult: int,
+        mlp_mult: float,
+        ssm_mlp_mult: float,
         ssm_layers: str,
         ssm_state_dim: int,
         ssm_num_groups: int,
