@@ -58,14 +58,14 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 2048))
-    num_layers = int(os.environ.get("NUM_LAYERS", 8))
+    num_layers = int(os.environ.get("NUM_LAYERS", 7))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 2.5))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3))
     ssm_mlp_mult = float(os.environ.get("SSM_MLP_MULT", 2))
     ssm_layers = os.environ.get("SSM_LAYERS", "7")
-    no_attn_layers = os.environ.get("NO_ATTN_LAYERS", "3,6")
+    no_attn_layers = os.environ.get("NO_ATTN_LAYERS", "3,5")
     ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 64))
     ssm_num_groups = int(os.environ.get("SSM_NUM_GROUPS", 8))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
