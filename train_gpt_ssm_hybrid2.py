@@ -309,6 +309,8 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 LM_HEAD_INT6 = bool(int(os.environ.get("LM_HEAD_INT6", "1")))
+EXPORT_ONLY = bool(int(os.environ.get("EXPORT_ONLY", "0")))
+EXPORT_CHECKPOINT_PATH = os.environ.get("EXPORT_CHECKPOINT_PATH", "")
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -348,7 +350,7 @@ def pack_int6(q: Tensor) -> Tensor:
     if pad:
         flat = torch.cat([flat, torch.zeros(pad, dtype=torch.int8)])
 
-    u = (flat.to(torch.int16) + 32).to(torch.uint32).reshape(-1, 4)
+    u = (flat.to(torch.int16) + 32).to(torch.int32).reshape(-1, 4)
 
     packed24 = (
         (u[:, 0])
@@ -368,7 +370,7 @@ def unpack_int6(packed: Tensor, shape: tuple[int, ...]) -> Tensor:
     for s in shape:
         numel *= s
 
-    b = packed.reshape(-1, 3).to(torch.uint32)
+    b = packed.reshape(-1, 3).to(torch.int32)
 
     packed24 = (
         b[:, 0]
@@ -1039,6 +1041,71 @@ def main() -> None:
     has_unused_params = bool(parse_layer_set(args.no_attn_layers))
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=has_unused_params) if distributed else compiled_model
 
+    if EXPORT_ONLY:
+        if not EXPORT_CHECKPOINT_PATH:
+            raise ValueError("EXPORT_CHECKPOINT_PATH must be set when EXPORT_ONLY=1")
+        ckpt = torch.load(EXPORT_CHECKPOINT_PATH, map_location="cpu")
+        base_model.load_state_dict(ckpt, strict=True)
+        log0("export_only: loaded checkpoint and skipped training")
+
+        if master_process:
+            torch.save(base_model.state_dict(), "final_model.pt")
+            model_bytes = os.path.getsize("final_model.pt")
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model: {model_bytes} bytes")
+            log0(f"Code size: {code_bytes} bytes")
+            log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+        quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+        quant_buf = io.BytesIO()
+        torch.save(quant_obj, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        cctx = zstd.ZstdCompressor(level=22)
+        quant_blob = cctx.compress(quant_raw)
+        quant_raw_bytes = len(quant_raw)
+        if master_process:
+            with open("final_model.int8.ptz", "wb") as f:
+                f.write(quant_blob)
+            quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+            code_bytes = len(code.encode("utf-8"))
+            ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+            log0(
+                f"Serialized model int8+zstd: {quant_file_bytes} bytes "
+                f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            )
+            log0(f"Total submission size int8+zstd: {quant_file_bytes + code_bytes} bytes")
+
+        if distributed:
+            dist.barrier()
+        with open("final_model.int8.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(zstd.ZstdDecompressor().decompress(quant_blob_disk)), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zstd_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_int8_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+        if distributed:
+            dist.destroy_process_group()
+        return
+
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
@@ -1269,6 +1336,8 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zstd artifact and validate the round-tripped weights.
+
+    torch.save(base_model.state_dict(), "last_model_before_export.pt")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
