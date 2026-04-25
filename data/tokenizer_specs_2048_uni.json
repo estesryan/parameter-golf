@@ -3,15 +3,15 @@
     {
       "name": "sp_unigram_2048_eos",
       "dataset_suffix": "sp2048_uni_eos",
-      "vocab_size": 2048,
+      "vocab_size": 1536,
       "model_prefix": "fineweb_2048_unigram_eos",
       "trainer_overrides": {
         "model_type": "unigram",
-        "character_coverage": 0.999,
+        "character_coverage": 0.995,
         "byte_fallback": true,
         "split_digits": true,
         "normalization_rule_name": "nmt_nfkc",
-        "add_dummy_prefix": false,
+        "add_dummy_prefix": true,
         "hard_vocab_limit": false
       }
     }
