@@ -1,0 +1,19 @@
+{
+  "tokenizers": [
+    {
+      "name": "sp_unigram_1536_eos",
+      "dataset_suffix": "sp1536_uni_eos",
+      "vocab_size": 1536,
+      "model_prefix": "fineweb_1536_unigram_eos",
+      "trainer_overrides": {
+        "model_type": "unigram",
+        "character_coverage": 0.995,
+        "byte_fallback": true,
+        "split_digits": true,
+        "normalization_rule_name": "nmt_nfkc",
+        "add_dummy_prefix": true,
+        "hard_vocab_limit": false
+      }
+    }
+  ]
+}
