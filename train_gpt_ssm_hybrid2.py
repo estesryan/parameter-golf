@@ -308,7 +308,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-LM_HEAD_INT6 = bool(int(os.environ.get("LM_HEAD_INT6", "1")))
+MLP_INT6 = bool(int(os.environ.get("MLP_INT6", "1")))
 EXPORT_ONLY = bool(int(os.environ.get("EXPORT_ONLY", "0")))
 EXPORT_CHECKPOINT_PATH = os.environ.get("EXPORT_CHECKPOINT_PATH", "")
 
@@ -437,7 +437,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        if LM_HEAD_INT6 and name == "lm_head.weight" and t.ndim == 2:
+        if MLP_INT6 and t.ndim == 2 and (
+            name.endswith(".mlp.fc.weight")
+            or name.endswith(".mlp.proj.weight")
+        ):
             packed, s = quantize_float_tensor_int6_per_row(t)
             quantized[name] = packed
             scales[name] = s
