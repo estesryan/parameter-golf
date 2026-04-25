@@ -7,7 +7,7 @@
       "model_prefix": "fineweb_2048_unigram_eos",
       "trainer_overrides": {
         "model_type": "unigram",
-        "character_coverage": 1.0,
+        "character_coverage": 0.995,
         "byte_fallback": true,
         "split_digits": false,
         "normalization_rule_name": "nmt_nfkc",
