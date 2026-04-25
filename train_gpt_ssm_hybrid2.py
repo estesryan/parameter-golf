@@ -308,7 +308,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-LM_HEAD_INT4 = bool(int(os.environ.get("LM_HEAD_INT4", "1")))
+LM_HEAD_INT6 = bool(int(os.environ.get("LM_HEAD_INT6", "1")))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -342,33 +342,60 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def pack_int4(q: Tensor) -> Tensor:
+def pack_int6(q: Tensor) -> Tensor:
     flat = q.reshape(-1)
-    if flat.numel() % 2 != 0:
-        flat = torch.cat([flat, torch.zeros(1, dtype=torch.int8)])
-    u = (flat.to(torch.int16) + 8).to(torch.uint8)
-    return (u[0::2] | (u[1::2] << 4)).contiguous()
+    pad = (4 - flat.numel() % 4) % 4
+    if pad:
+        flat = torch.cat([flat, torch.zeros(pad, dtype=torch.int8)])
 
-def unpack_int4(packed: Tensor, shape: tuple[int, ...]) -> Tensor:
-    lo = (packed & 0x0F).to(torch.int8) - 8
-    hi = ((packed >> 4) & 0x0F).to(torch.int8) - 8
-    flat = torch.stack([lo, hi], dim=1).reshape(-1)
+    u = (flat.to(torch.int16) + 32).to(torch.uint32).reshape(-1, 4)
+
+    packed24 = (
+        (u[:, 0])
+        | (u[:, 1] << 6)
+        | (u[:, 2] << 12)
+        | (u[:, 3] << 18)
+    )
+
+    b0 = (packed24 & 0xFF).to(torch.uint8)
+    b1 = ((packed24 >> 8) & 0xFF).to(torch.uint8)
+    b2 = ((packed24 >> 16) & 0xFF).to(torch.uint8)
+
+    return torch.stack([b0, b1, b2], dim=1).reshape(-1).contiguous()
+
+def unpack_int6(packed: Tensor, shape: tuple[int, ...]) -> Tensor:
     numel = 1
     for s in shape:
         numel *= s
-    return flat[:numel].reshape(shape)
 
-def quantize_float_tensor_int4_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    b = packed.reshape(-1, 3).to(torch.uint32)
+
+    packed24 = (
+        b[:, 0]
+        | (b[:, 1] << 8)
+        | (b[:, 2] << 16)
+    )
+
+    u0 = packed24 & 0x3F
+    u1 = (packed24 >> 6) & 0x3F
+    u2 = (packed24 >> 12) & 0x3F
+    u3 = (packed24 >> 18) & 0x3F
+
+    flat = torch.stack([u0, u1, u2, u3], dim=1).reshape(-1).to(torch.int16) - 32
+
+    return flat[:numel].to(torch.int8).reshape(shape)
+
+def quantize_float_tensor_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     clip_abs = (
         torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
         if t32.numel()
         else torch.empty((t32.shape[0],), dtype=torch.float32)
     )
-    scale = (clip_abs / 7.0).clamp_min(1.0 / 7.0)
     clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-    q = torch.clamp(torch.round(clipped / scale[:, None]), -8, 7).to(torch.int8).contiguous()
-    return pack_int4(q), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)
+    q = torch.clamp(torch.round(clipped / scale[:, None]), -32, 31).to(torch.int8).contiguous()
+    return pack_int6(q), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -408,12 +435,12 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        if LM_HEAD_INT4 and name == "lm_head.weight" and t.ndim == 2:
-            packed, s = quantize_float_tensor_int4_per_row(t)
+        if LM_HEAD_INT6 and name == "lm_head.weight" and t.ndim == 2:
+            packed, s = quantize_float_tensor_int6_per_row(t)
             quantized[name] = packed
             scales[name] = s
             dtypes[name] = str(t.dtype).removeprefix("torch.")
-            qmeta[name] = {"scheme": "int4_per_row", "shape": tuple(t.shape)}
+            qmeta[name] = {"scheme": "int6_per_row", "shape": tuple(t.shape)}
             stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
             continue
         q, s = quantize_float_tensor(t)
@@ -444,9 +471,9 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "int4_per_row":
+        if qmeta.get(name, {}).get("scheme") == "int6_per_row":
             shape = tuple(qmeta[name]["shape"])
-            unpacked = unpack_int4(q, shape)
+            unpacked = unpack_int6(q, shape)
             out[name] = (unpacked.float() * s.to(dtype=torch.float32)[:, None]).to(dtype=dtype).contiguous()
             continue
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
