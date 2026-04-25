@@ -457,7 +457,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "mixed_int8_int6_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -1067,20 +1067,20 @@ def main() -> None:
         quant_blob = cctx.compress(quant_raw)
         quant_raw_bytes = len(quant_raw)
         if master_process:
-            with open("final_model.int8.ptz", "wb") as f:
+            with open("final_model.quant.ptz", "wb") as f:
                 f.write(quant_blob)
-            quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+            quant_file_bytes = os.path.getsize("final_model.quant.ptz")
             code_bytes = len(code.encode("utf-8"))
             ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
             log0(
-                f"Serialized model int8+zstd: {quant_file_bytes} bytes "
+                f"Serialized model mixed-quant+zstd: {quant_file_bytes} bytes "
                 f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
             )
-            log0(f"Total submission size int8+zstd: {quant_file_bytes + code_bytes} bytes")
+            log0(f"Total submission size mixed-quant+zstd: {quant_file_bytes + code_bytes} bytes")
 
         if distributed:
             dist.barrier()
-        with open("final_model.int8.ptz", "rb") as f:
+        with open("final_model.quant.ptz", "rb") as f:
             quant_blob_disk = f.read()
         quant_state = torch.load(io.BytesIO(zstd.ZstdDecompressor().decompress(quant_blob_disk)), map_location="cpu")
         base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
@@ -1100,10 +1100,10 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_int8_zstd_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"final_mixed_quant_zstd_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
         )
-        log0(f"final_int8_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        log0(f"final_mixed_quant_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
         if distributed:
             dist.destroy_process_group()
@@ -1358,20 +1358,20 @@ def main() -> None:
     quant_blob = cctx.compress(quant_raw)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.quant.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize("final_model.quant.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zstd: {quant_file_bytes} bytes "
+            f"Serialized model mixed-quant+zstd: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zstd: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size mixed-quant+zstd: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.quant.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zstd.ZstdDecompressor().decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
@@ -1391,10 +1391,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zstd_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_mixed_quant_zstd_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_mixed_quant_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
