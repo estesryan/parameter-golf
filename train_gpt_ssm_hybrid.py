@@ -4,9 +4,9 @@ Extends the baseline transformer with selective state-space modeling, sparse att
 heterogeneous feedforward allocation, and selective mixed-bit quantization to maximize BPB efficiency under fixed wallclock constraints.
 
 Key innovations / architectural changes over baseline:
-- Selective late-stage SSM layer:
-  replaces the attention sublayer in the final transformer stage with a lightweight selective state-space model
-  for linear-time global sequence refinement.
+- Selective SSM layers:
+  replaces entire transformer blocks (attention + MLP) at configurable layer indices with lightweight
+  SSM blocks for linear-time global sequence refinement.
 
 - Sparse attention scheduling:
   attention is selectively disabled in chosen intermediate layers to reduce effective compute and increase training throughput,
