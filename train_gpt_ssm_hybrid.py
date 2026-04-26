@@ -765,16 +765,17 @@ class SelectiveSSM(nn.Module):
 
         a = a[:, :, :, None]                        # [B, T, G, 1]
 
+        # a is in [0.9, 1.0), so we can work directly in linear space.
+        # p[t] = a[0]*a[1]*...*a[t] = exp(cumsum(log(a)))
+        # Since log(a) <= 0, log_p_flat is non-positive, exp(log_p_flat) <= 1.
+        # No normalization needed — values are already bounded.
         log_a = torch.log(a.clamp_min(1e-6))
-        # Inductor's split-scan kernel requires exactly 2 tile dims (batch, scan).
-        # Flatten higher-rank tensors to [B*G, T] / [B*G*Hg, T] before scanning.
         log_a_flat = log_a.squeeze(-1).permute(0, 2, 1).reshape(B * G, T)
         log_p_flat = torch.cumsum(log_a_flat, dim=1)
-        log_p_max = log_p_flat.detach().cummax(dim=1).values
-        log_p_stable = log_p_flat - log_p_max
-        clamp_max = 20.0
-        exp_term = torch.exp(log_p_stable.clamp(min=-clamp_max, max=0.0))
-        inv_exp_term = torch.exp((-log_p_stable).clamp(max=clamp_max))
+        # Clamp to prevent underflow on very long sequences
+        log_p_flat = log_p_flat.clamp(min=-20.0)
+        exp_term = torch.exp(log_p_flat)
+        inv_exp_term = torch.exp(-log_p_flat)
         exp_term = exp_term.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
         inv_exp_term = inv_exp_term.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
 
