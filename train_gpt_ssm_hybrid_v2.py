@@ -3,6 +3,10 @@ Hybrid Transformer–SSM language model optimized for parameter-efficient compre
 Extends the baseline transformer with selective state-space modeling, sparse attention ablation,
 heterogeneous feedforward allocation, and selective mixed-bit quantization to maximize BPB efficiency under fixed wallclock constraints.
 
+Version 2: 
+The SSM decay gate went from a single fixed value per sequence (mean-pooled) to a per-token input-dependent value, 
+making it genuinely selective, with cummax replaced by a clamped cumsum to avoid the Triton compiler issue.
+
 Key innovations / architectural changes over baseline:
 - Selective SSM layers:
   replaces entire transformer blocks (attention + MLP) at configurable layer indices with lightweight
