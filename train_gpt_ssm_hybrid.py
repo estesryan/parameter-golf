@@ -769,16 +769,11 @@ class SelectiveSSM(nn.Module):
         # Flatten higher-rank tensors to [B*G, T] / [B*G*Hg, T] before scanning.
         log_a_flat = log_a.squeeze(-1).permute(0, 2, 1).reshape(B * G, T)
         log_p_flat = torch.cumsum(log_a_flat, dim=1)
-        log_p_max_flat = torch.cummax(log_p_flat, dim=1).values
-        exp_flat = torch.exp(log_p_flat - log_p_max_flat)
-        # Clamped positions contribute exp_flat≈0 to h anyway, so clamping is lossless.
-        # The cumsum of u*inv_exp has ~T terms each up to exp(clamp), so we need:
-        #   T * exp(clamp) * |u_safety| < fp32_max  →  clamp < log(fp32_max/T) - log(u_safety)
-        # 20 nats safety margin (~5e8 headroom for |u| beyond RMSNorm-normalized scale).
         clamp_max = math.log(torch.finfo(torch.float32).max / T) - 20.0
-        inv_exp_flat = torch.exp((log_p_max_flat - log_p_flat).clamp(max=clamp_max))
-        exp_term = exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
-        inv_exp_term = inv_exp_flat.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
+        exp_term = torch.exp(log_p_flat.clamp(max=clamp_max))
+        inv_exp_term = torch.exp(-log_p_flat.clamp(max=clamp_max))
+        exp_term = exp_term.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
+        inv_exp_term = inv_exp_term.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
 
         u_scaled_flat = (u * inv_exp_term).permute(0, 2, 3, 1).reshape(B * G * Hg, T)
         s = torch.cumsum(u_scaled_flat, dim=1).reshape(B, G, Hg, T).permute(0, 3, 1, 2)
