@@ -71,7 +71,7 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 100000))
+    iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
     warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.30))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
@@ -86,7 +86,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.25))
     ssm_mlp_mult = float(os.environ.get("SSM_MLP_MULT", 2))
     ssm_layers = os.environ.get("SSM_LAYERS", "7")
     no_attn_layers = os.environ.get("NO_ATTN_LAYERS", "3,6")
