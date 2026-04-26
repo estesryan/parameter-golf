@@ -1,5 +1,29 @@
 """
-Naive baseline GPT training script.
+Hybrid Transformer–SSM language model optimized for parameter-efficient compression under a strict artifact budget.
+Extends the baseline transformer with selective state-space modeling, sparse attention ablation,
+heterogeneous feedforward allocation, and selective mixed-bit quantization to maximize BPB efficiency under fixed wallclock constraints.
+
+Key innovations / architectural changes over baseline:
+- Selective late-stage SSM layer:
+  replaces the attention sublayer in the final transformer stage with a lightweight selective state-space model
+  for linear-time global sequence refinement.
+
+- Sparse attention scheduling:
+  attention is selectively disabled in chosen intermediate layers to reduce effective compute and increase training throughput,
+  enabling more optimization steps under a fixed wallclock budget.
+
+- Heterogeneous feedforward allocation:
+  transformer and SSM blocks use different MLP expansion ratios, allocating parameter budget according to block function.
+
+- Numerically stabilized selective SSM scan:
+  bounded decay dynamics with stable prefix-scan accumulation for efficient long-range sequence mixing.
+
+- Selective mixed-bit quantization:
+  extends the baseline int8 export pipeline with per-row int6 quantization for selected large projection matrices
+  to reduce final artifact size while preserving model quality.
+
+- Artifact-aware architecture optimization:
+  model structure and quantization targets are jointly optimized for final compressed BPB performance rather than raw validation loss alone.
 """
 
 from __future__ import annotations
