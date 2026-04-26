@@ -739,6 +739,7 @@ class SelectiveSSM(nn.Module):
 
         self.ug_proj = CastedLinear(dim, 2 * H, bias=False)
         self.a_proj = CastedLinear(dim, G, bias=False)
+        nn.init.zeros_(self.a_proj.weight)
 
         self.out_proj = CastedLinear(H, dim, bias=False)
         self.out_proj._zero_init = True
@@ -769,9 +770,11 @@ class SelectiveSSM(nn.Module):
         # Flatten higher-rank tensors to [B*G, T] / [B*G*Hg, T] before scanning.
         log_a_flat = log_a.squeeze(-1).permute(0, 2, 1).reshape(B * G, T)
         log_p_flat = torch.cumsum(log_a_flat, dim=1)
-        clamp_max = math.log(torch.finfo(torch.float32).max / T) - 20.0
-        exp_term = torch.exp(log_p_flat.clamp(max=clamp_max))
-        inv_exp_term = torch.exp(-log_p_flat.clamp(max=clamp_max))
+        log_p_max = log_p_flat.detach().cummax(dim=1).values
+        log_p_stable = log_p_flat - log_p_max
+        clamp_max = 20.0
+        exp_term = torch.exp(log_p_stable.clamp(min=-clamp_max, max=0.0))
+        inv_exp_term = torch.exp((-log_p_stable).clamp(max=clamp_max))
         exp_term = exp_term.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
         inv_exp_term = inv_exp_term.reshape(B, G, T).permute(0, 2, 1).unsqueeze(-1)
 
