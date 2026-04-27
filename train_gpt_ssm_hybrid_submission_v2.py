@@ -46,10 +46,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp2048")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp4096")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_2048_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_4096_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -69,16 +69,16 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 2048))
-    num_layers = int(os.environ.get("NUM_LAYERS", 8))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.25))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2.75))
     ssm_mlp_mult = float(os.environ.get("SSM_MLP_MULT", 2))
-    ssm_layers = os.environ.get("SSM_LAYERS", "7")
-    no_attn_layers = os.environ.get("NO_ATTN_LAYERS", "3,6")
-    ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 128))
+    ssm_layers = os.environ.get("SSM_LAYERS", "8")
+    no_attn_layers = os.environ.get("NO_ATTN_LAYERS", "3,7")
+    ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 64))
     ssm_num_groups = int(os.environ.get("SSM_NUM_GROUPS", 8))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
