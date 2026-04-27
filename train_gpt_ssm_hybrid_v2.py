@@ -720,7 +720,7 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         #hidden = max(64, int(round(mlp_mult * dim / 64)) * 64)
-        hidden = max(128, int(round(mlp_mult * dim / 128)) * 128)
+        hidden = max(256, math.ceil(mlp_mult * dim / 256) * 256)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -926,13 +926,14 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
+
         for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            if i < self.num_skip_weights:
+                skip = skips[self.num_skip_weights - 1 - i]
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
