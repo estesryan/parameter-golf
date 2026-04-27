@@ -719,8 +719,7 @@ class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        #hidden = max(64, int(round(mlp_mult * dim / 64)) * 64)
-        hidden = max(256, math.ceil(mlp_mult * dim / 256) * 256)
+        hidden = max(64, int(round(mlp_mult * dim / 64)) * 64)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
