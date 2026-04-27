@@ -1,33 +1,17 @@
 """
-Hybrid Transformer–SSM language model optimized for parameter-efficient compression under a strict artifact budget.
-Extends the baseline transformer with selective state-space modeling, sparse attention ablation,
-heterogeneous feedforward allocation, and selective mixed-bit quantization to maximize BPB efficiency under fixed wallclock constraints.
+Hybrid Transformer-SSM language model for parameter-efficient language modeling.
 
-Version 2: 
-The SSM decay gate went from a single fixed value per sequence (mean-pooled) to a per-token input-dependent value, 
-making it genuinely selective, with cummax replaced by a clamped cumsum to avoid the Triton compiler issue.
-
-Key innovations / architectural changes over baseline:
-- Selective SSM layers:
-  replaces entire transformer blocks (attention + MLP) at configurable layer indices with lightweight
-  SSM blocks for linear-time global sequence refinement.
-
-- Sparse attention scheduling:
-  attention is selectively disabled in chosen intermediate layers to reduce effective compute and increase training throughput,
-  enabling more optimization steps under a fixed wallclock budget.
-
-- Heterogeneous feedforward allocation:
-  transformer and SSM blocks use different MLP expansion ratios, allocating parameter budget according to block function.
-
-- Numerically stabilized selective SSM scan:
-  bounded decay dynamics with stable prefix-scan accumulation for efficient long-range sequence mixing.
-
-- Selective mixed-bit quantization:
-  extends the baseline int8 export pipeline with per-row int6 quantization for selected large projection matrices
-  to reduce final artifact size while preserving model quality.
-
-- Artifact-aware architecture optimization:
-  model structure and quantization targets are jointly optimized for final compressed BPB performance rather than raw validation loss alone.
+Key changes over baseline:
+- Selective SSM layers: replaces transformer blocks at configurable indices with
+  lightweight SSM blocks for linear-time sequence refinement.
+- Sparse attention: attention disabled in selected layers to increase training
+  throughput under fixed wallclock budget.
+- Per-token SSM decay: input-dependent decay gates replacing mean-pooled decay
+  for genuine selectivity.
+- Heterogeneous MLP allocation: transformer and SSM blocks use different expansion
+  ratios to optimize parameter budget.
+- Mixed-bit quantization: int6 per-row quantization with zstd-22 compression.
+- Custom 4096-token BPE tokenizer tuned for FineWeb.
 """
 
 from __future__ import annotations
