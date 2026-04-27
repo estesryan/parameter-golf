@@ -78,7 +78,7 @@ class Hyperparameters:
     ssm_mlp_mult = float(os.environ.get("SSM_MLP_MULT", 2))
     ssm_layers = os.environ.get("SSM_LAYERS", "8")
     no_attn_layers = os.environ.get("NO_ATTN_LAYERS", "3,7")
-    ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 32))
+    ssm_state_dim = int(os.environ.get("SSM_STATE_DIM", 48))
     ssm_num_groups = int(os.environ.get("SSM_NUM_GROUPS", 8))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
