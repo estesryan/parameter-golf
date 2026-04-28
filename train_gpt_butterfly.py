@@ -528,12 +528,18 @@ class ButterflyLinear(nn.Module):
         for s in range(self.num_stages):
             stride = 1 << s
             num_groups = dim // (stride * 2)
-            W = self.factors[s]
-            if W.dtype != x.dtype:
-                W = W.to(dtype=x.dtype)
+            W = self.factors[s].to(dtype=x.dtype)
             W = W.reshape(num_groups, stride, 2, 2)
             x = x.reshape(*orig_shape[:-1], num_groups, 2, stride).transpose(-2, -1)
-            x = torch.matmul(x, W)
+            x0 = x[..., 0]
+            x1 = x[..., 1]
+            w00 = W[..., 0, 0]
+            w01 = W[..., 0, 1]
+            w10 = W[..., 1, 0]
+            w11 = W[..., 1, 1]
+            y0 = x0 * w00 + x1 * w01
+            y1 = x0 * w10 + x1 * w11
+            x = torch.stack((y0, y1), dim=-1)
             x = x.transpose(-2, -1).reshape(orig_shape)
         return x.contiguous()
 
