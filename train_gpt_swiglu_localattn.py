@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from flash_attn import flash_attn_func
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -579,8 +580,6 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
         self.local_window = local_window
-        self._mask_seq_len: int = 0
-        self.register_buffer("_local_mask", None, persistent=False)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -593,25 +592,23 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q_fa = q.transpose(1, 2)
+        k_fa = k.transpose(1, 2)
+        v_fa = v.transpose(1, 2)
         if self.local_window is None:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=True,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
+            y = flash_attn_func(
+                q_fa, k_fa, v_fa,
+                dropout_p=0.0,
+                causal=True,
             )
         else:
-            if self._local_mask is None or self._mask_seq_len != seqlen:
-                idx = torch.arange(seqlen, device=x.device)
-                diff = idx[:, None] - idx[None, :]
-                band = (diff >= 0) & (diff < self.local_window)
-                m = torch.zeros(seqlen, seqlen, device=x.device, dtype=torch.float32)
-                m.masked_fill_(~band, float('-inf'))
-                self._local_mask = m[None, None, :, :]
-                self._mask_seq_len = seqlen
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=self._local_mask, is_causal=False,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
+            y = flash_attn_func(
+                q_fa, k_fa, v_fa,
+                dropout_p=0.0,
+                causal=True,
+                window_size=(self.local_window, 0),
             )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -780,7 +777,7 @@ def main() -> None:
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(True)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -908,7 +905,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0("architecture:swiglu_depth_scheduled_localattn")
+    log0("architecture:swiglu_depth_scheduled_flash_localattn")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
