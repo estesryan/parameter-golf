@@ -615,8 +615,7 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = int((mlp_mult * dim) * 2 / 3)
-        hidden = ((hidden + 63) // 64) * 64
+        hidden = mlp_mult * dim
         self.gate = CastedLinear(dim, hidden, bias=False)
         self.up = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
