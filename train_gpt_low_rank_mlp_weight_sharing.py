@@ -1,5 +1,5 @@
 """
-Low-rank MLP + MLP-only sharing
+MLP-only partial sharing
 """
 
 from __future__ import annotations
@@ -64,7 +64,6 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
-    mlp_rank = int(os.environ.get("MLP_RANK", 384))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -512,16 +511,6 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
-class LowRankLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, rank: int, bias: bool = False):
-        super().__init__()
-        self.a = CastedLinear(in_features, rank, bias=False)
-        self.b = CastedLinear(rank, out_features, bias=bias)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.b(self.a(x))
-
-
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -614,16 +603,12 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int, mlp_rank: int):
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        if mlp_rank <= 0:
-            raise ValueError("MLP_RANK must be positive")
-        if mlp_rank > min(dim, hidden):
-            raise ValueError("MLP_RANK must be <= min(dim, hidden)")
-        self.fc = LowRankLinear(dim, hidden, mlp_rank, bias=False)
-        self.proj = LowRankLinear(hidden, dim, mlp_rank, bias=False)
-        self.proj.b._zero_init = True
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
@@ -639,13 +624,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        mlp_rank: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult, mlp_rank)
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -673,7 +657,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        mlp_rank: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -690,7 +673,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_rank)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for _ in range(num_layers)
         ])
         self.blocks[2].mlp = self.blocks[1].mlp
@@ -847,7 +830,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        mlp_rank=args.mlp_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -915,8 +897,6 @@ def main() -> None:
     unique_block_params = sum(p.numel() for _, p in block_named_params)
     shared_block_params = n_params - unique_block_params
     log0(f"model_params:{n_params}")
-    log0("mlp_low_rank:enabled")
-    log0(f"mlp_rank:{args.mlp_rank}")
     log0("weight_sharing:mlp_only_partial_pairwise")
     log0(f"unique_block_params:{unique_block_params}")
     log0(f"shared_block_params:{shared_block_params}")
