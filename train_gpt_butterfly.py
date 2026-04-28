@@ -64,6 +64,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    butterfly_hidden_mult = float(os.environ.get("BUTTERFLY_HIDDEN_MULT", 1.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -635,9 +636,13 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, butterfly_hidden_mult: float = 1.0):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = int(round(butterfly_hidden_mult * dim))
+        if hidden <= 0:
+            raise ValueError("butterfly hidden size must be positive")
+        if hidden & (hidden - 1) != 0:
+            raise ValueError("butterfly hidden size must be a power of two")
         self.up = CastedLinear(dim, hidden, bias=False)
         self.mix = ButterflyLinear(hidden)
         self.down = CastedLinear(hidden, dim, bias=False)
@@ -658,12 +663,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        butterfly_hidden_mult: float = 1.0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, butterfly_hidden_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -691,6 +697,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        butterfly_hidden_mult: float = 1.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -712,6 +719,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    butterfly_hidden_mult,
                 )
                 for i in range(num_layers)
             ]
@@ -867,6 +875,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        butterfly_hidden_mult=args.butterfly_hidden_mult,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
