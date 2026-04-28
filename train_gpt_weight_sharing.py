@@ -1,5 +1,5 @@
 """
-MLP-only partial sharing
+MLP-only partial sharing (Experimental)
 """
 
 from __future__ import annotations
