@@ -64,7 +64,6 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
-    butterfly_hidden_mult = float(os.environ.get("BUTTERFLY_HIDDEN_MULT", 1.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -512,39 +511,6 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
-class ButterflyLinear(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        assert (dim & (dim - 1)) == 0, "dim must be a power of two"
-        self.dim = dim
-        self.num_stages = int(math.log2(dim))
-        self.factors = nn.ParameterList([
-            nn.Parameter(torch.randn(dim // 2, 2, 2) * 0.02)
-            for _ in range(self.num_stages)
-        ])
-
-    def forward(self, x: Tensor) -> Tensor:
-        orig_shape = x.shape
-        dim = self.dim
-        for s in range(self.num_stages):
-            stride = 1 << s
-            num_groups = dim // (stride * 2)
-            W = self.factors[s].to(dtype=x.dtype)
-            W = W.reshape(num_groups, stride, 2, 2)
-            x = x.reshape(*orig_shape[:-1], num_groups, stride, 2)
-            x0 = x[..., 0]
-            x1 = x[..., 1]
-            w00 = W[..., 0, 0]
-            w01 = W[..., 0, 1]
-            w10 = W[..., 1, 0]
-            w11 = W[..., 1, 1]
-            y0 = x0 * w00 + x1 * w01
-            y1 = x0 * w10 + x1 * w11
-            x = torch.stack((y0, y1), dim=-1)
-            x = x.reshape(orig_shape)
-        return x.contiguous()
-
-
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -636,22 +602,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int, butterfly_hidden_mult: float = 1.0):
+    # relu^2 MLP from the original modded-nanogpt setup
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = int(round(butterfly_hidden_mult * dim))
-        if hidden <= 0:
-            raise ValueError("butterfly hidden size must be positive")
-        if hidden & (hidden - 1) != 0:
-            raise ValueError("butterfly hidden size must be a power of two")
-        self.up = CastedLinear(dim, hidden, bias=False)
-        self.mix = ButterflyLinear(hidden)
-        self.down = CastedLinear(hidden, dim, bias=False)
-        self.down._zero_init = True
+        hidden = mlp_mult * dim
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.up(x))
-        x = self.mix(x)
-        return self.down(x.square())
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
 
 
 class Block(nn.Module):
@@ -663,13 +624,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        butterfly_hidden_mult: float = 1.0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult, butterfly_hidden_mult)
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -697,11 +657,12 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        butterfly_hidden_mult: float = 1.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if num_layers != 9:
+            raise ValueError("Partial weight sharing currently expects num_layers=9")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -710,20 +671,27 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                    butterfly_hidden_mult,
-                )
-                for i in range(num_layers)
-            ]
-        )
+
+        def _block():
+            return Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+
+        block_a = _block()
+        block_b = _block()
+        block_c = _block()
+        block_d = _block()
+        block_e = _block()
+        block_f = _block()
+        self.blocks = nn.ModuleList([
+            block_a,
+            block_b,
+            block_b,
+            block_c,
+            block_d,
+            block_d,
+            block_e,
+            block_f,
+            block_f,
+        ])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -875,7 +843,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        butterfly_hidden_mult=args.butterfly_hidden_mult,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -889,16 +856,22 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    seen = set()
+    block_named_params = []
+    for name, p in base_model.blocks.named_parameters():
+        if id(p) in seen:
+            continue
+        seen.add(id(p))
+        block_named_params.append((name, p))
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) and "mix.factors" not in name
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) or "mix.factors" in name
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -934,11 +907,12 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    butterfly_params = sum(p.numel() for name, p in base_model.named_parameters() if "mix.factors" in name)
+    unique_block_params = sum(p.numel() for _, p in block_named_params)
+    unique_model_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"butterfly_enabled:True")
-    log0(f"butterfly_params:{butterfly_params}")
-    log0(f"butterfly_optimizer:Adam")
+    log0("weight_sharing:partial_pairwise")
+    log0(f"unique_block_params:{unique_block_params}")
+    log0(f"unique_model_params:{unique_model_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
