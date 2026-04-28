@@ -68,6 +68,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    local_attn_pattern = os.environ.get("LOCAL_ATTN_PATTERN", "")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -496,6 +497,22 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 
+def parse_local_attn_pattern(pattern: str, num_layers: int) -> list[int | None]:
+    parts = [p.strip().lower() for p in pattern.split(",") if p.strip()]
+    if not parts:
+        return [None] * num_layers
+    parsed: list[int | None] = []
+    for p in parts:
+        if p in {"full", "none", "global"}:
+            parsed.append(None)
+        else:
+            window = int(p)
+            if window <= 0:
+                raise ValueError(f"LOCAL_ATTN_PATTERN windows must be positive, got {window}")
+            parsed.append(window)
+    return [parsed[i % len(parsed)] for i in range(num_layers)]
+
+
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
         super().__init__()
@@ -668,6 +685,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        local_attn_pattern: str,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,7 +698,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        _local_attn_pattern = [128, 256, None, 128, 256, None, 128, 256, None]
+        _local_attn_pattern = parse_local_attn_pattern(local_attn_pattern, num_layers)
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -846,6 +864,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        local_attn_pattern=args.local_attn_pattern,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -906,6 +925,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0("architecture:swiglu_depth_scheduled_flash_localattn")
+    log0(f"local_attn_pattern:{args.local_attn_pattern or 'full'}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
