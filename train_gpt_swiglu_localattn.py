@@ -61,7 +61,6 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    share_mlp_triplets = bool(int(os.environ.get("SHARE_MLP_TRIPLETS", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     local_attn_pattern = os.environ.get("LOCAL_ATTN_PATTERN", "")
@@ -682,7 +681,6 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         local_attn_pattern: str,
-        share_mlp_triplets: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -710,13 +708,6 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        if share_mlp_triplets:
-            num_triplets = (num_layers + 2) // 3
-            shared_mlps = nn.ModuleList(
-                [MLP(model_dim, mlp_mult) for _ in range(num_triplets)]
-            )
-            for i, block in enumerate(self.blocks):
-                block.mlp = shared_mlps[i // 3]
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -869,7 +860,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         local_attn_pattern=args.local_attn_pattern,
-        share_mlp_triplets=args.share_mlp_triplets,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -884,17 +874,16 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    seen: set[int] = set()
-    matrix_params = []
-    scalar_params = []
-    for name, p in block_named_params:
-        if id(p) in seen:
-            continue
-        seen.add(id(p))
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
-            matrix_params.append(p)
-        else:
-            scalar_params.append(p)
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -931,7 +920,6 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0("architecture:swiglu_depth_scheduled_flash_localattn")
-    log0(f"share_mlp_triplets:{args.share_mlp_triplets}")
     log0(f"local_attn_pattern:{args.local_attn_pattern or 'full'}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
