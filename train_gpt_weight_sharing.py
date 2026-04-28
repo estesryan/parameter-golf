@@ -661,8 +661,8 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if num_layers != 9:
-            raise ValueError("MLP-only sharing currently expects num_layers=9")
+        if num_layers != 7:
+            raise ValueError("MLP-only sharing currently expects num_layers=7")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -676,9 +676,14 @@ class GPT(nn.Module):
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for _ in range(num_layers)
         ])
+        # 7-layer MLP-only sharing layout:
+        # 0 unique
+        # 1/2 shared
+        # 3 unique
+        # 4/5 shared
+        # 6 unique
         self.blocks[2].mlp = self.blocks[1].mlp
         self.blocks[5].mlp = self.blocks[4].mlp
-        self.blocks[8].mlp = self.blocks[7].mlp
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
