@@ -307,9 +307,6 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 INT6_CLIP_PERCENTILE = float(os.environ.get("INT6_CLIP_PERCENTILE", 99.9))
 INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
 USE_INT6 = bool(int(os.environ.get("USE_INT6", "1")))
-USE_INT7 = bool(int(os.environ.get("USE_INT7", "1")))
-INT7_CLIP_PERCENTILE = float(os.environ.get("INT7_CLIP_PERCENTILE", 99.95))
-INT7_CLIP_Q = INT7_CLIP_PERCENTILE / 100.0
 EXPORT_ONLY = bool(int(os.environ.get("EXPORT_ONLY", "0")))
 EXPORT_CHECKPOINT_PATH = os.environ.get("EXPORT_CHECKPOINT_PATH", "final_model.pt")
 
@@ -379,68 +376,6 @@ def unpack_int6(packed: Tensor, shape: tuple[int, ...]) -> Tensor:
     flat = torch.stack([u0, u1, u2, u3], dim=1).reshape(-1).to(torch.int16) - 32
     return flat[:numel].to(torch.int8).reshape(shape)
 
-def pack_int7(q: Tensor) -> Tensor:
-    flat = q.reshape(-1)
-    pad = (8 - flat.numel() % 8) % 8
-    if pad:
-        flat = torch.cat([flat, torch.zeros(pad, dtype=torch.int8)])
-    u = (flat.to(torch.int64) + 64).reshape(-1, 8)
-    packed56 = (
-        u[:, 0]
-        | (u[:, 1] << 7)
-        | (u[:, 2] << 14)
-        | (u[:, 3] << 21)
-        | (u[:, 4] << 28)
-        | (u[:, 5] << 35)
-        | (u[:, 6] << 42)
-        | (u[:, 7] << 49)
-    )
-    b0 = (packed56 & 0xFF).to(torch.uint8)
-    b1 = ((packed56 >> 8) & 0xFF).to(torch.uint8)
-    b2 = ((packed56 >> 16) & 0xFF).to(torch.uint8)
-    b3 = ((packed56 >> 24) & 0xFF).to(torch.uint8)
-    b4 = ((packed56 >> 32) & 0xFF).to(torch.uint8)
-    b5 = ((packed56 >> 40) & 0xFF).to(torch.uint8)
-    b6 = ((packed56 >> 48) & 0xFF).to(torch.uint8)
-    return torch.stack([b0, b1, b2, b3, b4, b5, b6], dim=1).reshape(-1).contiguous()
-
-def unpack_int7(packed: Tensor, shape: tuple[int, ...]) -> Tensor:
-    numel = 1
-    for s in shape:
-        numel *= s
-    b = packed.reshape(-1, 7).to(torch.int64)
-    packed56 = (
-        b[:, 0]
-        | (b[:, 1] << 8)
-        | (b[:, 2] << 16)
-        | (b[:, 3] << 24)
-        | (b[:, 4] << 32)
-        | (b[:, 5] << 40)
-        | (b[:, 6] << 48)
-    )
-    u0 = packed56 & 0x7F
-    u1 = (packed56 >> 7) & 0x7F
-    u2 = (packed56 >> 14) & 0x7F
-    u3 = (packed56 >> 21) & 0x7F
-    u4 = (packed56 >> 28) & 0x7F
-    u5 = (packed56 >> 35) & 0x7F
-    u6 = (packed56 >> 42) & 0x7F
-    u7 = (packed56 >> 49) & 0x7F
-    flat = torch.stack([u0, u1, u2, u3, u4, u5, u6, u7], dim=1).reshape(-1) - 64
-    return flat[:numel].to(torch.int8).reshape(shape)
-
-def quantize_float_tensor_int7_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    clip_abs = (
-        torch.quantile(t32.abs(), INT7_CLIP_Q, dim=1)
-        if t32.numel()
-        else torch.empty((t32.shape[0],), dtype=torch.float32)
-    )
-    clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-    scale = (clip_abs / 63.0).clamp_min(1.0 / 63.0)
-    q = torch.clamp(torch.round(clipped / scale[:, None]), -64, 63).to(torch.int8).contiguous()
-    return pack_int7(q), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-
 def quantize_float_tensor_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     clip_abs = (
@@ -491,20 +426,18 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        if USE_INT6 and t.ndim == 2 and name.endswith(".attn.proj.weight"):
+        if USE_INT6 and t.ndim == 2 and (
+            name.endswith(".attn.proj.weight")
+            or name in {
+                "blocks.7.mlp.proj.weight",
+                "blocks.8.mlp.proj.weight",
+            }
+        ):
             packed, s = quantize_float_tensor_int6_per_row(t)
             quantized[name] = packed
             scales[name] = s
             dtypes[name] = str(t.dtype).removeprefix("torch.")
             qmeta[name] = {"scheme": "int6_per_row", "shape": tuple(t.shape)}
-            stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
-            continue
-        elif USE_INT7 and t.ndim == 2 and name.endswith(".mlp.proj.weight"):
-            packed, s = quantize_float_tensor_int7_per_row(t)
-            quantized[name] = packed
-            scales[name] = s
-            dtypes[name] = str(t.dtype).removeprefix("torch.")
-            qmeta[name] = {"scheme": "int7_per_row", "shape": tuple(t.shape)}
             stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
             continue
         q, s = quantize_float_tensor(t)
@@ -516,7 +449,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "mixed_int8_int7_int6_per_row_v1",
+        "__quant_format__": "mixed_int8_int6_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -538,11 +471,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         if qmeta.get(name, {}).get("scheme") == "int6_per_row":
             shape = tuple(qmeta[name]["shape"])
             unpacked = unpack_int6(q, shape)
-            out[name] = (unpacked.float() * s.to(dtype=torch.float32)[:, None]).to(dtype=dtype).contiguous()
-            continue
-        if qmeta.get(name, {}).get("scheme") == "int7_per_row":
-            shape = tuple(qmeta[name]["shape"])
-            unpacked = unpack_int7(q, shape)
             out[name] = (unpacked.float() * s.to(dtype=torch.float32)[:, None]).to(dtype=dtype).contiguous()
             continue
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
