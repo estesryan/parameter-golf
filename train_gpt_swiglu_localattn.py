@@ -304,6 +304,8 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT6_CLIP_PERCENTILE = float(os.environ.get("INT6_CLIP_PERCENTILE", 99.9))
+INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
 USE_INT6 = bool(int(os.environ.get("USE_INT6", "1")))
 EXPORT_ONLY = bool(int(os.environ.get("EXPORT_ONLY", "0")))
 EXPORT_CHECKPOINT_PATH = os.environ.get("EXPORT_CHECKPOINT_PATH", "final_model.pt")
@@ -377,7 +379,7 @@ def unpack_int6(packed: Tensor, shape: tuple[int, ...]) -> Tensor:
 def quantize_float_tensor_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     clip_abs = (
-        torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+        torch.quantile(t32.abs(), INT6_CLIP_Q, dim=1)
         if t32.numel()
         else torch.empty((t32.shape[0],), dtype=torch.float32)
     )
