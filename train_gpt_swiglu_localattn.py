@@ -1,5 +1,23 @@
 """
-GPT baseline with SwiGLU MLP and depth-scheduled local/full attention + sequence packing with random offsets
+Depth-scheduled local/global attention transformer optimized for parameter-efficient compression
+under strict artifact and wallclock constraints.
+
+Extends the baseline transformer with structured local/full attention alternation,
+sequence packing with randomized offsets, and selective mixed-bit quantization
+to improve tokenizer-agnostic BPB efficiency.
+
+Key innovations / architectural changes over baseline:
+- Depth-scheduled local/global attention:
+  alternates local attention windows with periodic full-attention layers
+  to improve compute efficiency while preserve global context propagation.
+
+- Sequence packing with randomized offsets:
+  randomizes sequence alignment each step to improve positional coverage
+  and reduce fixed-boundary training artifacts.
+
+- Selective mixed-bit quantization:
+  applies int6 quantization only to attention output projections
+  to reduce artifact size while minimizing validation degradation.
 """
 
 from __future__ import annotations
@@ -50,7 +68,7 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
-    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.30))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.75))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 327_680))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -72,7 +90,7 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.040))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.035))
@@ -305,7 +323,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-INT6_CLIP_PERCENTILE = float(os.environ.get("INT6_CLIP_PERCENTILE", 99.9))
+INT6_CLIP_PERCENTILE = float(os.environ.get("INT6_CLIP_PERCENTILE", 99.998))
 INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
 USE_INT6 = bool(int(os.environ.get("USE_INT6", "1")))
 EXPORT_ONLY = bool(int(os.environ.get("EXPORT_ONLY", "0")))
