@@ -385,7 +385,7 @@ def quantize_float_tensor_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     )
     clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
     scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)
-    q = torch.clamp(torch.round(clipped / scale[:, None]), -32, 31).to(torch.int8).contiguous()
+    q = torch.clamp(torch.round(clipped / scale[:, None]), -31, 31).to(torch.int8).contiguous()
     return pack_int6(q), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
