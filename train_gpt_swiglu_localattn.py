@@ -428,6 +428,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["num_float_tensors"] += 1
         if USE_INT6 and t.ndim == 2 and (
             name.endswith(".attn.proj.weight")
+            or name == "blocks.8.mlp.proj.weight"
         ):
             packed, s = quantize_float_tensor_int6_per_row(t)
             quantized[name] = packed
