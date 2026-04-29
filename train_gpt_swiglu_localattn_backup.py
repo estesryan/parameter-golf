@@ -14,7 +14,10 @@ import subprocess
 import sys
 import time
 import uuid
-import zlib
+try:
+    import zstandard as zstd
+except ImportError as e:
+    raise ImportError("zstandard is required: pip install zstandard") from e
 from pathlib import Path
 
 import numpy as np
@@ -277,7 +280,7 @@ def eval_val(
 # -----------------------------
 #
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
+# Instead, we get approximately the same model (with a small hit) by quantizing the model to mixed int8/int6 & zstd compressing.
 # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -301,6 +304,11 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT6_CLIP_PERCENTILE = float(os.environ.get("INT6_CLIP_PERCENTILE", 99.9))
+INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
+USE_INT6 = bool(int(os.environ.get("USE_INT6", "1")))
+EXPORT_ONLY = bool(int(os.environ.get("EXPORT_ONLY", "0")))
+EXPORT_CHECKPOINT_PATH = os.environ.get("EXPORT_CHECKPOINT_PATH", "final_model.pt")
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -333,6 +341,52 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
+
+def pack_int6(q: Tensor) -> Tensor:
+    flat = q.reshape(-1)
+    pad = (4 - flat.numel() % 4) % 4
+    if pad:
+        flat = torch.cat([flat, torch.zeros(pad, dtype=torch.int8)])
+    u = (flat.to(torch.int16) + 32).to(torch.int32).reshape(-1, 4)
+    packed24 = (
+        (u[:, 0])
+        | (u[:, 1] << 6)
+        | (u[:, 2] << 12)
+        | (u[:, 3] << 18)
+    )
+    b0 = (packed24 & 0xFF).to(torch.uint8)
+    b1 = ((packed24 >> 8) & 0xFF).to(torch.uint8)
+    b2 = ((packed24 >> 16) & 0xFF).to(torch.uint8)
+    return torch.stack([b0, b1, b2], dim=1).reshape(-1).contiguous()
+
+def unpack_int6(packed: Tensor, shape: tuple[int, ...]) -> Tensor:
+    numel = 1
+    for s in shape:
+        numel *= s
+    b = packed.reshape(-1, 3).to(torch.int32)
+    packed24 = (
+        b[:, 0]
+        | (b[:, 1] << 8)
+        | (b[:, 2] << 16)
+    )
+    u0 = packed24 & 0x3F
+    u1 = (packed24 >> 6) & 0x3F
+    u2 = (packed24 >> 12) & 0x3F
+    u3 = (packed24 >> 18) & 0x3F
+    flat = torch.stack([u0, u1, u2, u3], dim=1).reshape(-1).to(torch.int16) - 32
+    return flat[:numel].to(torch.int8).reshape(shape)
+
+def quantize_float_tensor_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    clip_abs = (
+        torch.quantile(t32.abs(), INT6_CLIP_Q, dim=1)
+        if t32.numel()
+        else torch.empty((t32.shape[0],), dtype=torch.float32)
+    )
+    clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+    scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)
+    q = torch.clamp(torch.round(clipped / scale[:, None]), -32, 31).to(torch.int8).contiguous()
+    return pack_int6(q), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -372,6 +426,20 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
+        if USE_INT6 and t.ndim == 2 and (
+            name.endswith(".attn.proj.weight")
+            or name in {
+                "blocks.7.mlp.proj.weight",
+                "blocks.8.mlp.proj.weight",
+            }
+        ):
+            packed, s = quantize_float_tensor_int6_per_row(t)
+            quantized[name] = packed
+            scales[name] = s
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            qmeta[name] = {"scheme": "int6_per_row", "shape": tuple(t.shape)}
+            stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
+            continue
         q, s = quantize_float_tensor(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
@@ -381,7 +449,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "mixed_int8_int6_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -400,6 +468,11 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
+        if qmeta.get(name, {}).get("scheme") == "int6_per_row":
+            shape = tuple(qmeta[name]["shape"])
+            unpacked = unpack_int6(q, shape)
+            out[name] = (unpacked.float() * s.to(dtype=torch.float32)[:, None]).to(dtype=dtype).contiguous()
+            continue
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             # Broadcast the saved row scale back across trailing dimensions.
@@ -868,6 +941,69 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
+    if EXPORT_ONLY:
+        ckpt = torch.load(EXPORT_CHECKPOINT_PATH, map_location="cpu")
+        base_model.load_state_dict(ckpt, strict=True)
+        log0("export_only: loaded checkpoint and skipped training")
+
+        if master_process:
+            torch.save(base_model.state_dict(), "final_model.pt")
+            model_bytes = os.path.getsize("final_model.pt")
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model: {model_bytes} bytes")
+            log0(f"Code size: {code_bytes} bytes")
+            log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+        quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+        quant_buf = io.BytesIO()
+        torch.save(quant_obj, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        cctx = zstd.ZstdCompressor(level=22)
+        quant_blob = cctx.compress(quant_raw)
+        quant_raw_bytes = len(quant_raw)
+        if master_process:
+            with open("final_model.quant.ptz", "wb") as f:
+                f.write(quant_blob)
+            quant_file_bytes = os.path.getsize("final_model.quant.ptz")
+            code_bytes = len(code.encode("utf-8"))
+            ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+            log0(
+                f"Serialized model mixed-quant+zstd: {quant_file_bytes} bytes "
+                f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            )
+            log0(f"Total submission size mixed-quant+zstd: {quant_file_bytes + code_bytes} bytes")
+
+        if distributed:
+            dist.barrier()
+        with open("final_model.quant.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(zstd.ZstdDecompressor().decompress(quant_blob_disk)), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_mixed_quant_zstd_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_mixed_quant_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+        if distributed:
+            dist.destroy_process_group()
+        return
+
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
@@ -1090,7 +1226,7 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # the compressed mixed-quant+zstd artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1104,25 +1240,26 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    cctx = zstd.ZstdCompressor(level=22)
+    quant_blob = cctx.compress(quant_raw)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.quant.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize("final_model.quant.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model mixed-quant+zstd: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size mixed-quant+zstd: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.quant.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(zstd.ZstdDecompressor().decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1140,10 +1277,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_mixed_quant_zstd_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_mixed_quant_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
