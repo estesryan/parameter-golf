@@ -1,6 +1,6 @@
 """
-Depth-scheduled local/global attention transformer optimized for parameter-efficient compression
-under strict artifact and wallclock constraints.
+Depth-scheduled local/global attention transformer with SwiGLU and randomized sequence packing,
+optimized for parameter-efficient compression under strict artifact and wallclock constraints.
 
 Extends the baseline transformer with structured local/full attention alternation,
 sequence packing with randomized offsets, and selective mixed-bit quantization
@@ -9,14 +9,18 @@ to improve tokenizer-agnostic BPB efficiency.
 Key innovations / architectural changes over baseline:
 - Depth-scheduled local/global attention:
   alternates local attention windows with periodic full-attention layers
-  to improve compute efficiency while preserve global context propagation.
+  to improve compute efficiency while preserving global context propagation.
 
 - Sequence packing with randomized offsets:
   randomizes sequence alignment each step to improve positional coverage
   and reduce fixed-boundary training artifacts.
 
+- SwiGLU feedforward blocks:
+  replaces standard MLP blocks with gated SwiGLU projections
+  for improved parameter efficiency and nonlinear capacity.
+
 - Selective mixed-bit quantization:
-  applies int6 quantization only to attention output projections
+  applies int6 quantization to selected attention projections
   to reduce artifact size while minimizing validation degradation.
 """
 
