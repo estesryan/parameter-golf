@@ -1,5 +1,5 @@
 """
-GPT baseline with SwiGLU MLP and depth-scheduled local/full attention.
+GPT baseline with SwiGLU MLP and depth-scheduled local/full attention + sequence packing with random offsets
 """
 
 from __future__ import annotations
@@ -553,7 +553,8 @@ class DistributedTokenLoader:
         per_rank_span = local_tokens + 1
         #chunk = self.stream.take(per_rank_span * self.world_size)
         # sequence packing with random offsets
-        offset = random.randint(0, seq_len - 1)
+        #offset = random.randint(0, seq_len - 1)
+        offset = random.randint(0, 511)
         chunk = self.stream.take(offset + per_rank_span * self.world_size)
         chunk = chunk[offset:]
         start = self.rank * per_rank_span
