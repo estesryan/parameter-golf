@@ -551,7 +551,11 @@ class DistributedTokenLoader:
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
+        #chunk = self.stream.take(per_rank_span * self.world_size)
+        # sequence packing with random offsets
+        offset = random.randint(0, seq_len - 1)
+        chunk = self.stream.take(offset + per_rank_span * self.world_size)
+        chunk = chunk[offset:]
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
