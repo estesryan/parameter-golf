@@ -49,7 +49,8 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.30))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 327_680))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -1064,6 +1065,7 @@ def main() -> None:
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"warmdown_iters:{args.warmdown_iters} warmdown_frac:{args.warmdown_frac} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
@@ -1081,7 +1083,16 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
+        if args.warmdown_iters < 0:
+            if max_wallclock_ms is None:
+                return 1.0
+            warmdown_start_ms = (1.0 - args.warmdown_frac) * max_wallclock_ms
+            if elapsed_ms < warmdown_start_ms:
+                return 1.0
+            warmdown_ms = max_wallclock_ms - warmdown_start_ms
+            remaining_ms = max_wallclock_ms - elapsed_ms
+            return max(0.0, remaining_ms / max(warmdown_ms, 1e-9))
+        if args.warmdown_iters == 0:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
