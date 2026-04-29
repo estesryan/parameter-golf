@@ -1,5 +1,23 @@
 """
-GPT baseline with SwiGLU MLP and depth-scheduled local/full attention.
+Depth-scheduled local/global attention transformer optimized for parameter-efficient compression
+under strict artifact and wallclock constraints.
+
+Extends the baseline transformer with structured local/full attention alternation,
+sequence packing with randomized offsets, and selective mixed-bit quantization
+to improve tokenizer-agnostic BPB efficiency.
+
+Key innovations / architectural changes over baseline:
+- Depth-scheduled local/global attention:
+  alternates local attention windows with periodic full-attention layers
+  to improve compute efficiency while preserve global context propagation.
+
+- Sequence packing with randomized offsets:
+  randomizes sequence alignment each step to improve positional coverage
+  and reduce fixed-boundary training artifacts.
+
+- Selective mixed-bit quantization:
+  applies int6 quantization only to attention output projections
+  to reduce artifact size while minimizing validation degradation.
 """
 
 from __future__ import annotations
@@ -49,7 +67,8 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", -1))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.75))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 327_680))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -71,7 +90,7 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.040))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.035))
@@ -304,7 +323,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-INT6_CLIP_PERCENTILE = float(os.environ.get("INT6_CLIP_PERCENTILE", 99.9))
+INT6_CLIP_PERCENTILE = float(os.environ.get("INT6_CLIP_PERCENTILE", 99.998))
 INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
 USE_INT6 = bool(int(os.environ.get("USE_INT6", "1")))
 EXPORT_ONLY = bool(int(os.environ.get("EXPORT_ONLY", "0")))
@@ -550,7 +569,17 @@ class DistributedTokenLoader:
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
+        #chunk = self.stream.take(per_rank_span * self.world_size)
+        # sequence packing with random offsets
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            offset = random.randint(0, seq_len - 1) if self.rank == 0 else 0
+            offset_t = torch.tensor(offset, dtype=torch.long, device=self.device)
+            torch.distributed.broadcast(offset_t, src=0)
+            offset = int(offset_t.item())
+        else:
+            offset = random.randint(0, seq_len - 1)
+        chunk = self.stream.take(offset + per_rank_span * self.world_size)
+        chunk = chunk[offset:]
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
@@ -1064,6 +1093,7 @@ def main() -> None:
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"warmdown_iters:{args.warmdown_iters} warmdown_frac:{args.warmdown_frac} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
@@ -1081,7 +1111,16 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
+        if args.warmdown_iters < 0:
+            if max_wallclock_ms is None:
+                return 1.0
+            warmdown_start_ms = (1.0 - args.warmdown_frac) * max_wallclock_ms
+            if elapsed_ms < warmdown_start_ms:
+                return 1.0
+            warmdown_ms = max_wallclock_ms - warmdown_start_ms
+            remaining_ms = max_wallclock_ms - elapsed_ms
+            return max(0.0, remaining_ms / max(warmdown_ms, 1e-9))
+        if args.warmdown_iters == 0:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
